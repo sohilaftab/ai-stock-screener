@@ -1,0 +1,72 @@
+name: AI Stock Screener Automation
+
+on:
+  schedule:
+    # 09:08 AM IST (Pre-Market Final IEP) -> 03:38 UTC (Mon-Fri)
+    - cron: '38 3 * * 1-5'
+    # 10:30 AM IST (Morning Volume Breakout) -> 05:00 UTC (Mon-Fri)
+    - cron: '0 5 * * 1-5'
+    # 01:30 PM IST (Afternoon Volume Breakout) -> 08:00 UTC (Mon-Fri)
+    - cron: '0 8 * * 1-5'
+    # 04:15 PM IST (EOD Delivery > 60% Scan) -> 10:45 UTC (Mon-Fri)
+    - cron: '45 10 * * 1-5'
+
+  # Allows manual one-click testing from the GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Screening mode to run manually'
+        required: true
+        default: 'intraday'
+        type: choice
+        options:
+          - premarket
+          - intraday
+          - eod
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Cache HuggingFace FinBERT Model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-finbert-v1
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Determine Execution Mode & Run Screener
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TZ: 'Asia/Kolkata'
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ github.event.inputs.mode }}"
+          else
+            HOUR=$(date +%H)
+            if [ "$HOUR" -eq 9 ]; then
+              MODE="premarket"
+            elif [ "$HOUR" -ge 15 ]; then
+              MODE="eod"
+            else
+              MODE="intraday"
+            fi
+          fi
+          echo "Executing screener in mode: $MODE"
+          python main.py --mode "$MODE"
