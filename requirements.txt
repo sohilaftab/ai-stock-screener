@@ -2,6 +2,7 @@
 torch
 transformers
 requests
+curl_cffi
 yfinance
 pandas
 feedparser

@@ -2,27 +2,34 @@ name: AI Stock Screener Automation
 
 on:
   schedule:
-    # 09:08 AM IST (Pre-Market Final IEP) -> 03:38 UTC (Mon-Fri)
-    - cron: '38 3 * * 1-5'
-    # 10:30 AM IST (Morning Volume Breakout) -> 05:00 UTC (Mon-Fri)
+    # 08:30 AM IST (Before 9 AM Morning Research & Watchlist) -> 03:00 UTC (Mon-Fri)
+    - cron: '0 3 * * 1-5'
+    # 09:10 AM IST (Pre-Market Momentum Check & Virtual Trade Entry) -> 03:40 UTC (Mon-Fri)
+    - cron: '40 3 * * 1-5'
+    # 10:30 AM IST (Live Trade Management #1: Trail SL / Extend Target) -> 05:00 UTC (Mon-Fri)
     - cron: '0 5 * * 1-5'
-    # 01:30 PM IST (Afternoon Volume Breakout) -> 08:00 UTC (Mon-Fri)
-    - cron: '0 8 * * 1-5'
-    # 04:15 PM IST (EOD Delivery > 60% Scan) -> 10:45 UTC (Mon-Fri)
-    - cron: '45 10 * * 1-5'
+    # 12:15 PM IST (Live Trade Management #2: Mid-Day Check) -> 06:45 UTC (Mon-Fri)
+    - cron: '45 6 * * 1-5'
+    # 02:00 PM IST (Live Trade Management #3: Afternoon Check) -> 08:30 UTC (Mon-Fri)
+    - cron: '30 8 * * 1-5'
+    # 03:40 PM IST (EOD Settlement, Mistake Autopsy & Rs 1.5L Wallet Update) -> 10:10 UTC (Mon-Fri)
+    - cron: '10 10 * * 1-5'
 
-  # Allows manual one-click testing from the GitHub Actions tab
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Screening mode to run manually'
+        description: 'Autonomous phase to execute manually'
         required: true
-        default: 'intraday'
+        default: 'morning_prep'
         type: choice
         options:
-          - premarket
-          - intraday
+          - morning_prep
+          - premarket_update
+          - live_manage
           - eod
+
+permissions:
+  contents: write
 
 jobs:
   run-screener:
@@ -32,6 +39,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -50,7 +59,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Determine Execution Mode & Run Screener
+      - name: Determine Execution Mode & Run Autonomous Trader
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -60,13 +69,32 @@ jobs:
             MODE="${{ github.event.inputs.mode }}"
           else
             HOUR=$(date +%H)
-            if [ "$HOUR" -eq 9 ]; then
-              MODE="premarket"
-            elif [ "$HOUR" -ge 15 ]; then
+            MIN=$(date +%M)
+            TOTAL_MINS=$((10#$HOUR * 60 + 10#$MIN))
+            if [ "$TOTAL_MINS" -lt 545 ]; then
+              MODE="morning_prep"
+            elif [ "$TOTAL_MINS" -lt 580 ]; then
+              MODE="premarket_update"
+            elif [ "$TOTAL_MINS" -ge 930 ]; then
               MODE="eod"
             else
-              MODE="intraday"
+              MODE="live_manage"
             fi
           fi
-          echo "Executing screener in mode: $MODE"
+          echo "Executing autonomous trader in mode: $MODE"
           python main.py --mode "$MODE"
+
+      - name: Auto-Commit & Push Updated Portfolio, Ledger & AI Weights
+        run: |
+          git config --local user.name "PulseAI Autonomous Trader"
+          git config --local user.email "actions@github.com"
+          
+          for f in trade_history.json model_weights.json portfolio_state.json morning_watchlist.json; do
+            if [ -f "$f" ]; then git add "$f"; fi
+          done
+          
+          if ! git diff --staged --quiet; then
+            git commit -m "🤖 Auto-update ₹1.5L portfolio state, trade ledger & AI weights [skip ci]"
+            git pull --rebase origin main
+            git push origin main
+          fi

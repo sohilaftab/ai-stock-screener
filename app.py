@@ -7,349 +7,380 @@ from nse_client import NSEClient
 from market_data import MarketDataScanner
 from sentiment_engine import FinBERTSentimentEngine
 from telegram_notifier import TelegramNotifier
+from trade_engine import AdaptiveTradeEngine
 
 load_dotenv()
 
-# ==========================================
-# PAGE CONFIGURATION
-# ==========================================
 st.set_page_config(
-    page_title="AI NSE Stock Screener",
-    page_icon="📈",
+    page_title="PulseAI | ₹1.5L Autonomous Intraday Trader",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ==========================================
-# CACHED RESOURCES & DATA FETCHERS
-# ==========================================
-@st.cache_resource(show_spinner="Initializing NSE Session & Cookies...")
+st.markdown("""
+<style>
+    .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
+    .hero-banner {
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        color: white; padding: 20px 24px; border-radius: 14px;
+        margin-bottom: 18px; border: 1px solid #334155;
+    }
+    .stock-card {
+        background-color: #ffffff; border: 1px solid #e2e8f0;
+        border-radius: 12px; padding: 16px; margin-bottom: 12px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+    @media (prefers-color-scheme: dark) {
+        .stock-card { background-color: #1e293b; border-color: #334155; }
+    }
+    .badge-buy { background: #dcfce7; color: #166534; padding: 4px 12px; border-radius: 99px; font-weight: 700; font-size: 0.82rem; }
+    .badge-sell { background: #fee2e2; color: #991b1b; padding: 4px 12px; border-radius: 99px; font-weight: 700; font-size: 0.82rem; }
+    .step-box {
+        background: rgba(59, 130, 246, 0.08); border-left: 4px solid #3b82f6;
+        padding: 10px 14px; border-radius: 6px; font-size: 0.9rem; margin-bottom: 16px;
+    }
+    .level-box {
+        display: flex; justify-content: space-between; background: rgba(148, 163, 184, 0.12);
+        padding: 8px 12px; border-radius: 8px; margin: 8px 0; font-size: 0.85rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+@st.cache_resource(show_spinner="Connecting to NSE India...")
 def get_nse_client():
-    """Maintains a persistent NSE session across Streamlit reruns."""
     return NSEClient()
 
-@st.cache_resource(show_spinner="Loading Local ProsusAI/FinBERT Model into RAM...")
+
+@st.cache_resource(show_spinner="Initializing FinBERT Financial AI Model...")
 def get_sentiment_engine():
-    """Loads the Hugging Face FinBERT pipeline once into memory."""
     return FinBERTSentimentEngine()
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_universe():
-    """Caches the Nifty 200 ticker list for 1 hour."""
-    client = get_nse_client()
-    return client.get_nifty_universe_tickers()
+    return get_nse_client().get_nifty_universe_tickers()
 
-@st.cache_data(ttl=120, show_spinner="Fetching live NSE Pre-Market order book...")
+
+@st.cache_data(ttl=120, show_spinner="Scanning NSE Pre-Open Order Book...")
 def fetch_premarket_data(universe_key, min_gap, min_vol, top_n):
-    client = get_nse_client()
-    return client.get_pre_open_movers(
-        key=universe_key,
-        min_gap_pct=min_gap,
-        min_volume=min_vol,
-        top_n=top_n
+    return get_nse_client().get_pre_open_movers(
+        key=universe_key, min_gap_pct=min_gap, min_volume=min_vol, top_n=top_n
     )
 
-@st.cache_data(ttl=300, show_spinner="Scanning Nifty universe via Yahoo Finance batch API...")
+
+@st.cache_data(ttl=300, show_spinner="Scanning Nifty charts (EMA 20/50, ATR, RSI, Volume)...")
 def fetch_intraday_breakouts(vol_mult, min_price_chg, top_n):
     tickers = get_cached_universe()
     scanner = MarketDataScanner(tickers)
-    return scanner.scan_volume_breakouts(
-        vol_multiplier=vol_mult,
-        min_price_change_pct=min_price_chg,
-        top_n=top_n
+    result = scanner.scan_volume_breakouts(
+        vol_multiplier=vol_mult, min_price_change_pct=min_price_chg, top_n=top_n
     )
+    return result if isinstance(result, tuple) else (result, False)
+
 
 def enrich_with_finbert(df, symbol_col="symbol"):
-    """Runs FinBERT sentiment analysis on every ticker in a filtered DataFrame."""
     if df.empty:
         return df
-    
-    engine = get_sentiment_engine()
-    sentiments = []
-    confidences = []
-    headlines = []
 
-    progress_bar = st.progress(0, text="Running FinBERT NLP on Google News RSS feeds...")
+    engine = get_sentiment_engine()
+    sentiments, raw_labels, confidences, headlines, action_tags = [], [], [], [], []
+    progress = st.progress(0, text="🧠 FinBERT AI is reading the latest news headlines...")
     total = len(df)
 
     for idx, (_, row) in enumerate(df.iterrows()):
         sym = row[symbol_col]
         res = engine.analyze_stock_sentiment(sym)
-        
-        # Add visual badge to sentiment label
-        label = res["sentiment"]
-        if label == "POSITIVE":
-            badge = "🟢 POSITIVE"
-        elif label == "NEGATIVE":
-            badge = "🔴 NEGATIVE"
+        lbl = res["sentiment"]
+        conf = int(res["confidence"] * 100)
+        chg = row.get("change_pct", row.get("pChange", 0))
+
+        if lbl == "POSITIVE" and chg >= 0:
+            tag, badge = "🟢 Bullish News + Chart", "🟢 POSITIVE"
+        elif lbl == "NEGATIVE" and chg < 0:
+            tag, badge = "🔴 Bearish Breakdown", "🔴 NEGATIVE"
+        elif lbl == "NEGATIVE" and chg >= 0:
+            tag, badge = "⚠️ Price Up on Bad News", "🔴 NEGATIVE"
+        elif lbl == "POSITIVE" and chg < 0:
+            tag, badge = "👀 Dip on Positive News", "🟢 POSITIVE"
         else:
-            badge = "⚪ NEUTRAL"
+            tag, badge = "⚡ Chart & Volume Driven", "⚪ NEUTRAL"
 
+        raw_labels.append(lbl)
         sentiments.append(badge)
-        confidences.append(int(res["confidence"] * 100))
+        confidences.append(conf)
         headlines.append(res["top_headline"])
-        progress_bar.progress((idx + 1) / total, text=f"Analyzed news for {sym} ({idx + 1}/{total})")
+        action_tags.append(tag)
+        progress.progress((idx + 1) / total, text=f"🧠 Analyzing news for {sym} ({idx + 1}/{total})...")
 
-    progress_bar.empty()
+    progress.empty()
     enriched = df.copy()
-    enriched["AI Sentiment"] = sentiments
-    enriched["Confidence (%)"] = confidences
-    enriched["Catalyst Headline"] = headlines
+    enriched["raw_sentiment"] = raw_labels
+    enriched["AI Verdict"] = sentiments
+    enriched["Signal Takeaway"] = action_tags
+    enriched["AI Confidence"] = confidences
+    enriched["Why Is It Moving? (Latest News)"] = headlines
     return enriched
 
+
+trade_engine = AdaptiveTradeEngine()
+perf = trade_engine.get_performance_metrics()
+
 # ==========================================
-# SIDEBAR CONTROLS
+# SIDEBAR: ₹1,50,000 WALLET & AI BRAIN STATUS
 # ==========================================
 with st.sidebar:
-    st.title("⚙️ Screener Controls")
-    st.caption("Adjust real-time filtering parameters & AI settings.")
+    st.markdown("## 💼 ₹1.5L Autonomous Wallet")
+    st.metric("Current Portfolio Equity", f"₹{perf['current_equity']:,.2f}", f"₹{perf['total_pnl_inr']:+,.0f} ({perf['total_pnl_pct']:+.2f}%)")
+    c_cash, c_alloc = st.columns(2)
+    c_cash.metric("Available Cash", f"₹{perf['available_cash']:,.0f}")
+    c_alloc.metric("In Active Trades", f"₹{perf['allocated_capital']:,.0f}")
 
-    if st.button("🔄 Refresh Market Data Cache", use_container_width=True):
+    st.divider()
+    st.markdown(f"### 🧠 Self-Learning Brain (Gen #{trade_engine.weights['generation']})")
+    st.caption(f"Max Risk Per Trade: **{trade_engine.weights.get('risk_per_trade_pct', 1.0)}%** of capital")
+    st.progress(float(trade_engine.weights["volume_weight"]), text=f"📊 Volume Surge: {int(trade_engine.weights['volume_weight']*100)}%")
+    st.progress(float(trade_engine.weights["sentiment_weight"]), text=f"📰 FinBERT News AI: {int(trade_engine.weights['sentiment_weight']*100)}%")
+    st.progress(float(trade_engine.weights["premarket_weight"]), text=f"🌅 Pre-Market Flow: {int(trade_engine.weights['premarket_weight']*100)}%")
+    st.progress(float(trade_engine.weights["momentum_weight"]), text=f"📈 Chart (EMA/RSI/VWAP): {int(trade_engine.weights['momentum_weight']*100)}%")
+    st.caption(f"*{trade_engine.weights['learning_notes']}*")
+
+    st.divider()
+    preset = st.radio(
+        "🎯 Screening Strictness:",
+        options=["⚖️ Balanced (Recommended)", "🔥 High Conviction Only", "🌊 Show More Stocks"],
+        index=0
+    )
+    if "High Conviction" in preset:
+        intra_vol_mult, intra_min_chg, pre_min_gap, max_results = 1.8, 2.0, 2.5, 6
+    elif "Show More" in preset:
+        intra_vol_mult, intra_min_chg, pre_min_gap, max_results = 1.0, 0.5, 1.0, 12
+    else:
+        intra_vol_mult, intra_min_chg, pre_min_gap, max_results = 1.3, 1.2, 1.8, 8
+
+    if st.button("🔄 Refresh All Live Data", width="stretch", type="primary"):
         st.cache_data.clear()
+        for key in ["intraday_df", "premarket_df", "eod_df"]:
+            st.session_state.pop(key, None)
         st.rerun()
 
-    st.divider()
-    st.subheader("1. Pre-Market Filters (9:00–9:15 AM)")
-    pre_key = st.selectbox("NSE Segment", options=["FO", "NIFTY", "ALL"], index=0, help="FO = Futures & Options stocks (most liquid)")
-    pre_min_gap = st.slider("Min Gap % (Up or Down)", 0.5, 10.0, 2.0, 0.5)
-    pre_min_vol = st.number_input("Min Pre-Open Volume", min_value=5000, max_value=1000000, value=50000, step=10000)
-    pre_top_n = st.slider("Max Pre-Market Stocks to Analyze", 3, 20, 8)
-
-    st.divider()
-    st.subheader("2. Intraday Breakout Filters")
-    intra_vol_mult = st.slider("Volume Surge Multiplier (vs 20d Avg)", 1.0, 5.0, 1.5, 0.1)
-    intra_min_chg = st.slider("Min Intraday Price Change (%)", 0.5, 10.0, 1.5, 0.25)
-    intra_top_n = st.slider("Max Breakout Stocks to Analyze", 3, 25, 10)
-
-    st.divider()
-    st.subheader("3. EOD Delivery Filters")
-    eod_min_deliv = st.slider("Min Institutional Delivery (%)", 40.0, 90.0, 60.0, 5.0)
-
-    st.divider()
     notifier = TelegramNotifier()
-    tg_status = "🟢 Connected" if (notifier.bot_token and notifier.chat_id) else "🔴 Missing .env Keys"
-    st.markdown(f"**Telegram Bot Status:** {tg_status}")
 
 # ==========================================
-# MAIN DASHBOARD HEADER
+# HERO BANNER
 # ==========================================
-st.title("📈 AI-Driven NSE Stock Screener & FinBERT Terminal")
-st.markdown(
-    f"**Live Market Status:** `{datetime.now().strftime('%d %b %Y | %I:%M:%S %p IST')}`  •  "
-    "**Data Sources:** `NSE Hidden JSON API` + `Yahoo Finance v8` + `Google News RSS`  •  "
-    "**NLP Engine:** `ProsusAI/finbert`"
-)
+st.markdown(f"""
+<div class="hero-banner">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+        <div>
+            <h2 style="margin:0; color:white; font-size:1.55rem;">⚡ PulseAI — Autonomous ₹1,50,000 Intraday Portfolio Manager</h2>
+            <p style="margin:4px 0 0 0; color:#cbd5e1; font-size:0.92rem;">
+                Pre-9 AM Multi-Timeframe Research • 9:10 AM Pre-Market Validation • Dynamic Live SL Trailing & Target Extension • EOD Mistake Autopsy
+            </p>
+        </div>
+        <div style="text-align:right; margin-top:8px;">
+            <span style="background:#334155; padding:6px 14px; border-radius:99px; font-weight:600; font-size:0.85rem;">
+                💰 Equity: ₹{perf['current_equity']:,.0f} • {datetime.now().strftime('%I:%M %p IST')}
+            </span>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-tab_intra, tab_pre, tab_eod, tab_deepdive = st.tabs([
-    "🔥 Intraday Volume Breakouts",
-    "🚀 Pre-Market Movers (9:00–9:15 AM)",
-    "🏦 EOD Institutional Delivery",
-    "🔍 Single-Stock FinBERT Inspector"
+tab_advisor, tab_intra, tab_pre, tab_eod, tab_search = st.tabs([
+    "🎯 1. Autonomous Trader & ₹1.5L Portfolio",
+    "🔥 2. Live Chart & Volume Breakouts",
+    "🌅 3. Pre-Market Gappers (9:00 AM)",
+    "🏦 4. Big Player Delivery (>60%)",
+    "🔍 5. Search Any Stock's News"
 ])
 
+if "intraday_df" not in st.session_state:
+    raw_df, is_fallback = fetch_intraday_breakouts(intra_vol_mult, intra_min_chg, max_results)
+    st.session_state["intraday_fallback"] = is_fallback
+    st.session_state["intraday_df"] = enrich_with_finbert(raw_df, symbol_col="symbol")
+
+intra_df = st.session_state.get("intraday_df", pd.DataFrame())
+pre_df = st.session_state.get("premarket_df", pd.DataFrame())
+
 # ==========================================
-# TAB 1: INTRADAY VOLUME BREAKOUTS
+# TAB 1: AUTONOMOUS TRADER & ₹1.5L PORTFOLIO
+# ==========================================
+with tab_advisor:
+    w1, w2, w3, w4, w5 = st.columns(5)
+    w1.metric("Starting Capital", f"₹{perf['initial_capital']:,.0f}")
+    w2.metric("Current Wallet Equity", f"₹{perf['current_equity']:,.0f}", f"{perf['total_pnl_pct']:+.2f}%")
+    w3.metric("Available Cash", f"₹{perf['available_cash']:,.0f}", f"In Trades: ₹{perf['allocated_capital']:,.0f}")
+    w4.metric("Live Unrealized P&L", f"₹{perf['unrealized_pnl_inr']:+,.0f}", f"{perf['open_trades']} Active Trades")
+    w5.metric("Win Rate (Settled)", f"{perf['win_rate']}%", f"Realized: ₹{perf['total_pnl_inr']:+,.0f}")
+
+    st.divider()
+    rec_df = trade_engine.generate_intraday_recommendations(intra_df, pre_df, top_k=5)
+
+    if not rec_df.empty:
+        st.subheader("🚀 Position-Sized Intraday Setups (Allocated from ₹1,50,000 Capital)")
+        card_cols = st.columns(min(3, len(rec_df)))
+        for idx, col in enumerate(card_cols):
+            r = rec_df.iloc[idx]
+            badge_cls = "badge-buy" if r["action"] == "BUY" else "badge-sell"
+            with col:
+                st.markdown(f"""
+                <div class="stock-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-size:1.25rem; font-weight:800;">{r['symbol']}</span>
+                        <span class="{badge_cls}">{r['action']} • {r['conviction']}/100</span>
+                    </div>
+                    <div style="font-size:0.85rem; margin-top:6px; color:#3b82f6; font-weight:600;">
+                        📦 Qty: {r['qty']} shares (Capital: ₹{r['capital_used']:,.0f}) | Chart: {r['chart_trend']}
+                    </div>
+                    <div class="level-box">
+                        <div><b>Entry:</b><br>₹{r['entry_price']}</div>
+                        <div style="color:#16a34a;"><b>Target 1:</b><br>₹{r['target_1']} (+₹{r['expected_profit_inr']:,.0f})</div>
+                        <div style="color:#15803d;"><b>Target 2:</b><br>₹{r['target_2']}</div>
+                        <div style="color:#dc2626;"><b>Stop-Loss:</b><br>₹{r['stop_loss']} (-₹{r['max_loss_inr']:,.0f})</div>
+                    </div>
+                    <div style="font-size:0.78rem; opacity:0.85; border-top:1px solid #e2e8f0; padding-top:6px;">
+                        📰 <i>"{r['headline']}"</i>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # 4 Autonomous Control Buttons
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            if st.button("🌅 1. Save Pre-9 AM Watchlist", width="stretch"):
+                trade_engine.save_morning_watchlist(rec_df)
+                st.success("✅ Saved Pre-9 AM Watchlist! At 9:10 AM, any pre-market momentum shifts will be flagged.")
+        with b2:
+            if st.button("💼 2. Take Virtual Trades (₹1.5L)", type="primary", width="stretch"):
+                added = trade_engine.record_recommendations(rec_df)
+                if added > 0:
+                    st.success(f"✅ Executed {added} virtual trades from your ₹1,50,000 wallet!")
+                    st.rerun()
+                else:
+                    st.info("ℹ️ Today's trades are already open or cash is fully allocated.")
+        with b3:
+            if st.button("📡 3. Manage Live Trades (Trail/Cut)", width="stretch"):
+                with st.spinner("Inspecting 5-minute VWAP candles & adjusting active targets/SLs..."):
+                    actions = trade_engine.manage_live_positions()
+                    if actions:
+                        for a in actions:
+                            st.toast(a, icon="⚡")
+                    st.rerun()
+        with b4:
+            if st.button("🏁 4. EOD Settle & Learn from Mistakes", width="stretch"):
+                with st.spinner("Settling EOD P&L, running Mistake Autopsy & updating AI weights..."):
+                    res = trade_engine.evaluate_open_trades_and_learn()
+                    st.success(f"🎉 Settled {res['evaluated']} trades! {res['message']}")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("📋 Autonomous Trade Ledger & Live Position Tracker")
+    if not trade_engine.ledger:
+        st.info("No trades recorded yet. Click **'2. Take Virtual Trades (₹1.5L)'** above to deploy capital!")
+    else:
+        ledger_df = pd.DataFrame(trade_engine.ledger).iloc[::-1]
+        for col_name, default_val in [
+            ("qty", 1), ("capital_used", 0.0), ("current_price", 0.0),
+            ("unrealized_pnl_inr", 0.0), ("trade_management_note", ""), ("mistake_diagnosis", "")
+        ]:
+            if col_name not in ledger_df.columns:
+                ledger_df[col_name] = default_val
+
+        st.dataframe(
+            ledger_df[[
+                "date", "symbol", "action", "qty", "capital_used", "entry_price",
+                "current_price", "target_1", "stop_loss", "status", "pnl_inr",
+                "trade_management_note", "mistake_diagnosis"
+            ]],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "date": st.column_config.TextColumn("Date"),
+                "symbol": st.column_config.TextColumn("Stock"),
+                "action": st.column_config.TextColumn("Side"),
+                "qty": st.column_config.NumberColumn("Qty", format="%d"),
+                "capital_used": st.column_config.NumberColumn("Capital Used", format="₹%.0f"),
+                "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                "current_price": st.column_config.NumberColumn("LTP / Exit", format="₹%.2f"),
+                "target_1": st.column_config.NumberColumn("Active Target", format="₹%.2f"),
+                "stop_loss": st.column_config.NumberColumn("Active SL", format="₹%.2f"),
+                "status": st.column_config.TextColumn("Status"),
+                "pnl_inr": st.column_config.NumberColumn("Realized P&L", format="₹%+,.0f"),
+                "trade_management_note": st.column_config.TextColumn("Live AI Trade Management", width="medium"),
+                "mistake_diagnosis": st.column_config.TextColumn("EOD Mistake Autopsy", width="large"),
+            }
+        )
+
+    mistakes = trade_engine.portfolio.get("mistakes_identified", [])
+    if mistakes:
+        with st.expander("🔍 View AI Self-Reflection & Mistake Autopsy Log", expanded=True):
+            for m in mistakes[:5]:
+                st.markdown(f"- 🧠 {m}")
+
+# ==========================================
+# TAB 2: LIVE CHART & VOLUME BREAKOUTS
 # ==========================================
 with tab_intra:
-    col_head, col_btn = st.columns([3, 1])
-    with col_head:
-        st.subheader("Unusual Volume & Momentum Breakouts")
-        st.caption(f"Scanning Nifty 200 universe for Volume ≥ {intra_vol_mult}x of 20-Day Average and Price Change ≥ {intra_min_chg}%.")
-    with col_btn:
-        run_intra = st.button("⚡ Scan Intraday Breakouts", type="primary", use_container_width=True)
-
-    if run_intra or "intraday_df" not in st.session_state:
-        raw_intra = fetch_intraday_breakouts(intra_vol_mult, intra_min_chg, intra_top_n)
-        st.session_state["intraday_df"] = enrich_with_finbert(raw_intra, symbol_col="symbol")
-
-    intra_df = st.session_state.get("intraday_df", pd.DataFrame())
-
-    if intra_df.empty:
-        st.info("No stocks currently meet your volume multiplier and price breakout criteria. Try lowering the 'Volume Surge Multiplier' in the sidebar.")
-    else:
-        # Summary KPI Metrics
-        m1, m2, m3, m4 = st.columns(4)
-        top_vol_row = intra_df.iloc[0]
-        bullish_count = len(intra_df[intra_df["AI Sentiment"].str.contains("POSITIVE")])
-        bearish_count = len(intra_df[intra_df["AI Sentiment"].str.contains("NEGATIVE")])
-
-        m1.metric("Breakout Stocks Found", len(intra_df))
-        m2.metric("Top Volume Leader", top_vol_row["symbol"], f"{top_vol_row['vol_ratio']}x Avg Vol")
-        m3.metric("Positive News Catalysts", bullish_count)
-        m4.metric("Negative News Catalysts", bearish_count)
-
-        # Styled Interactive Dataframe
+    if not intra_df.empty:
         st.dataframe(
-            intra_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "symbol": st.column_config.TextColumn("Ticker", width="small"),
-                "ltp": st.column_config.NumberColumn("LTP (₹)", format="₹%.2f"),
-                "change_pct": st.column_config.NumberColumn("Price Chg %", format="%+.2f%%"),
-                "live_volume": st.column_config.NumberColumn("Live Volume", format="%d"),
-                "avg_volume": st.column_config.NumberColumn("20D Avg Vol", format="%d"),
-                "vol_ratio": st.column_config.NumberColumn("Vol Multiplier", format="%.2fx"),
-                "vol_surge_pct": st.column_config.NumberColumn("Vol % of Avg", format="%d%%"),
-                "AI Sentiment": st.column_config.TextColumn("FinBERT Signal", width="small"),
-                "Confidence (%)": st.column_config.ProgressColumn("AI Confidence", min_value=0, max_value=100, format="%d%%"),
-                "Catalyst Headline": st.column_config.TextColumn("Top Google News Headline", width="large"),
-            }
+            intra_df[[
+                "symbol", "ltp", "change_pct", "chart_trend", "trend_30d",
+                "vol_ratio", "rsi", "Signal Takeaway", "AI Verdict", "Why Is It Moving? (Latest News)"
+            ]],
+            width="stretch",
+            hide_index=True
         )
 
-        if st.button("📲 Push Intraday Breakouts to Telegram"):
-            lines = [f"🔥 <b>INTRADAY VOLUME BREAKOUTS ({datetime.now().strftime('%I:%M %p')})</b>\n"]
-            for _, r in intra_df.head(5).iterrows():
-                lines.append(
-                    f"⚡ <b>{r['symbol']}</b>: Vol <b>{r['vol_surge_pct']}%</b> of avg ({r['vol_ratio']}x) | "
-                    f"₹{r['ltp']} ({r['change_pct']:+.2f}%)\n"
-                    f"   • {r['AI Sentiment']} ({r['Confidence (%)']}%): {r['Catalyst Headline']}\n"
-                )
-            if notifier.send_message("\n".join(lines)):
-                st.success("Alert sent to your Telegram phone!")
-            else:
-                st.error("Failed to send Telegram alert. Check your .env credentials.")
-
 # ==========================================
-# TAB 2: PRE-MARKET MOVERS
+# TAB 3: PRE-MARKET MOVERS
 # ==========================================
 with tab_pre:
-    col_p1, col_p2 = st.columns([3, 1])
-    with col_p1:
-        st.subheader("NSE Pre-Open Session Anomalies (IEP Gap Scanner)")
-        st.caption(f"Fetching directly from NSE hidden endpoint (`/api/market-data-pre-open?key={pre_key}`).")
-    with col_p2:
-        run_pre = st.button("🚀 Fetch Pre-Market Data", type="primary", use_container_width=True)
-
-    if run_pre:
-        raw_pre = fetch_premarket_data(pre_key, pre_min_gap, pre_min_vol, pre_top_n)
+    if st.button("🚀 Scan NSE Pre-Open Session & Compare with Morning Watchlist", type="primary"):
+        raw_pre = fetch_premarket_data("FO", pre_min_gap, 25000, max_results)
         st.session_state["premarket_df"] = enrich_with_finbert(raw_pre, symbol_col="symbol")
+        st.rerun()
 
-    pre_df = st.session_state.get("premarket_df", pd.DataFrame())
-
-    if pre_df.empty:
-        st.info("Click **Fetch Pre-Market Data** to pull the latest NSE Pre-Open session equilibrium prices and run FinBERT.")
-    else:
-        st.dataframe(
-            pre_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "symbol": st.column_config.TextColumn("Symbol", width="small"),
-                "iep": st.column_config.NumberColumn("IEP (₹)", format="₹%.2f"),
-                "prev_close": st.column_config.NumberColumn("Prev Close (₹)", format="₹%.2f"),
-                "pChange": st.column_config.NumberColumn("Gap %", format="%+.2f%%"),
-                "abs_change": None, # Hide helper sorting column
-                "volume": st.column_config.NumberColumn("Pre-Open Vol", format="%d"),
-                "buy_sell_ratio": st.column_config.NumberColumn("Buy/Sell Ratio", format="%.2fx"),
-                "AI Sentiment": st.column_config.TextColumn("FinBERT Signal", width="small"),
-                "Confidence (%)": st.column_config.ProgressColumn("AI Confidence", min_value=0, max_value=100, format="%d%%"),
-                "Catalyst Headline": st.column_config.TextColumn("Top Google News Headline", width="large"),
-            }
-        )
-
-        if st.button("📲 Push Pre-Market Movers to Telegram"):
-            lines = ["🚀 <b>TOP NSE PRE-MARKET MOVERS</b>\n"]
-            for _, r in pre_df.head(5).iterrows():
-                lines.append(
-                    f"• <b>{r['symbol']}</b> | IEP: ₹{r['iep']} (<b>{r['pChange']:+.2f}%</b>) | Buy/Sell: {r['buy_sell_ratio']}x\n"
-                    f"  {r['AI Sentiment']}: {r['Catalyst Headline']}\n"
-                )
-            if notifier.send_message("\n".join(lines)):
-                st.success("Pre-market alert delivered to Telegram!")
+    if not pre_df.empty:
+        new_recs = trade_engine.generate_intraday_recommendations(intra_df, pre_df, top_k=5)
+        shifts = trade_engine.compare_with_morning_watchlist(new_recs)
+        if shifts:
+            st.warning("⚡ **Pre-Market Momentum Shifts Detected vs Pre-9 AM List:**\n\n" + "\n".join(f"- {s}" for s in shifts))
+        st.dataframe(pre_df, width="stretch", hide_index=True)
 
 # ==========================================
-# TAB 3: EOD INSTITUTIONAL DELIVERY
+# TAB 4: EOD INSTITUTIONAL DELIVERY
 # ==========================================
 with tab_eod:
-    st.subheader("End-of-Day Institutional Accumulation (Delivery % Scanner)")
-    st.caption("Queries NSE Equity Quote `trade_info` endpoint for high-volume breakout stocks with strong delivery holding.")
-
-    if st.button("🏦 Check Delivery % for Top Volume Stocks", type="primary"):
-        base_candidates = fetch_intraday_breakouts(vol_mult=1.2, min_price_chg=1.0, top_n=15)
-        if base_candidates.empty:
-            st.warning("No volume movers found to inspect.")
-        else:
-            client = get_nse_client()
-            with st.spinner("Querying NSE Trade Info API for Delivery Percentages..."):
-                deliv_df = client.get_eod_high_delivery_stocks(
-                    base_candidates["symbol"].tolist(),
-                    min_delivery_pct=eod_min_deliv
-                )
-                if not deliv_df.empty:
-                    # Merge price and volume ratios from base_candidates
-                    merged_eod = pd.merge(deliv_df, base_candidates, on="symbol", how="left")
-                    st.session_state["eod_df"] = enrich_with_finbert(merged_eod, symbol_col="symbol")
-                else:
-                    st.session_state["eod_df"] = pd.DataFrame()
-
+    if st.button("🏦 Scan Today's Leaders for High Delivery (>60%)", type="primary"):
+        base_df, _ = fetch_intraday_breakouts(vol_mult=1.1, min_price_chg=0.5, top_n=15)
+        if not base_df.empty:
+            deliv_df = get_nse_client().get_eod_high_delivery_stocks(base_df["symbol"].tolist(), min_delivery_pct=60.0)
+            if not deliv_df.empty:
+                merged = pd.merge(deliv_df, base_df, on="symbol", how="left")
+                st.session_state["eod_df"] = enrich_with_finbert(merged, symbol_col="symbol")
     eod_df = st.session_state.get("eod_df", pd.DataFrame())
     if not eod_df.empty:
-        st.dataframe(
-            eod_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "symbol": st.column_config.TextColumn("Symbol"),
-                "delivery_pct": st.column_config.ProgressColumn("Delivery %", min_value=0, max_value=100, format="%.1f%%"),
-                "quantity_traded": st.column_config.NumberColumn("NSE Traded Qty", format="%d"),
-                "ltp": st.column_config.NumberColumn("Close Price (₹)", format="₹%.2f"),
-                "change_pct": st.column_config.NumberColumn("Day Change %", format="%+.2f%%"),
-                "vol_ratio": st.column_config.NumberColumn("Vol vs 20D Avg", format="%.2fx"),
-                "AI Sentiment": st.column_config.TextColumn("FinBERT Signal"),
-                "Catalyst Headline": st.column_config.TextColumn("Catalyst Headline", width="large"),
-            }
-        )
-    else:
-        st.info(f"Click the button above to scan today's volume leaders for NSE Delivery ≥ {eod_min_deliv}%.")
+        st.dataframe(eod_df, width="stretch", hide_index=True)
 
 # ==========================================
-# TAB 4: SINGLE-STOCK FINBERT DEEP DIVE
+# TAB 5: SINGLE STOCK NEWS INSPECTOR
 # ==========================================
-with tab_deepdive:
-    st.subheader("🔍 Deep-Dive Ticker News & FinBERT Inspector")
-    st.caption("Type any NSE symbol (or company name) to inspect every individual Google News headline and its exact FinBERT classification score.")
-
-    col_in, col_action = st.columns([3, 1])
-    with col_in:
-        custom_query = st.text_input("Enter NSE Symbol or Company Name", value="TATAMOTORS")
-    with col_action:
+with tab_search:
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        query_sym = st.text_input("Type Stock Symbol or Company Name:", value="TATAMOTORS")
+    with c2:
         st.write("")
         st.write("")
-        inspect_btn = st.button("🧠 Run FinBERT Analysis", use_container_width=True)
+        run_search = st.button("🧠 Analyze Stock News", type="primary", width="stretch")
 
-    if inspect_btn and custom_query.strip():
+    if run_search and query_sym.strip():
         engine = get_sentiment_engine()
-        ticker_clean = custom_query.strip().upper()
-        headlines = engine.fetch_google_news(ticker_clean, max_headlines=10)
-
-        if not headlines:
-            st.warning(f"No recent Google News RSS entries found for '{ticker_clean}'.")
-        else:
-            raw_scores = engine.nlp(headlines)
-            breakdown_rows = []
-            for h, s in zip(headlines, raw_scores):
-                lbl = s["label"].upper()
-                icon = "🟢" if lbl == "POSITIVE" else ("🔴" if lbl == "NEGATIVE" else "⚪")
-                breakdown_rows.append({
-                    "Headline": h,
-                    "FinBERT Classification": f"{icon} {lbl}",
-                    "Model Probability": round(float(s["score"]) * 100, 1)
-                })
-
-            summary = engine.analyze_stock_sentiment(ticker_clean)
-            st.success(
-                f"**Aggregate FinBERT Verdict for {ticker_clean}:** {summary['sentiment']} "
-                f"(Avg Weight: {int(summary['confidence'] * 100)}%)"
-            )
-
-            st.dataframe(
-                pd.DataFrame(breakdown_rows),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Headline": st.column_config.TextColumn("Scraped Google News Headline (Last 48h)", width="large"),
-                    "FinBERT Classification": st.column_config.TextColumn("FinBERT Label", width="small"),
-                    "Model Probability": st.column_config.ProgressColumn("Confidence Score", min_value=0, max_value=100, format="%.1f%%")
-                }
-            )
+        clean_q = query_sym.strip().upper()
+        headlines = engine.fetch_google_news(clean_q, max_headlines=8)
+        if headlines:
+            scores = engine.nlp(headlines)
+            rows = [{"News Headline": h, "AI Sentiment": s["label"].upper(), "Confidence": round(float(s["score"]) * 100, 1)} for h, s in zip(headlines, scores)]
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)

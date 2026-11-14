@@ -1,142 +1,204 @@
-import time
-import requests
-import pandas as pd
-from datetime import datetime
 import io
+import time
+from datetime import datetime, timedelta
+import pandas as pd
+import requests
+import yfinance as yf
+
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CFFI = True
+except ImportError:
+    HAS_CFFI = False
+
 
 class NSEClient:
     def __init__(self):
         self.base_url = "https://www.nseindia.com"
-        self.session = requests.Session()
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": "gzip, deflate",  # Avoid 'br' without decoder
+            "Referer": "https://www.nseindia.com/market-data/pre-open-market-cm-and-emerge-market",
             "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
         }
+        if HAS_CFFI:
+            self.session = cffi_requests.Session(impersonate="chrome120")
+        else:
+            self.session = requests.Session()
         self.session.headers.update(self.headers)
-        self._initialize_session()
+        self._cookies_initialized = False
 
     def _initialize_session(self):
-        """Establishes a valid browser session and stores NSE cookies."""
+        """Initializes NSE cookies using Chrome TLS impersonation."""
         try:
-            # Step 1: Hit homepage to get primary cookies
-            self.session.get(self.base_url, timeout=15)
-            time.sleep(1.5)
-            # Step 2: Hit the pre-open HTML page to set Referer context
-            self.session.get(
-                f"{self.base_url}/market-data/pre-open-market-cm-and-emerge-market",
-                timeout=15
-            )
-            # Update headers for JSON API requests
-            self.session.headers.update({
-                "Accept": "*/*",
-                "Referer": f"{self.base_url}/market-data/pre-open-market-cm-and-emerge-market",
-                "X-Requested-With": "XMLHttpRequest"
-            })
-        except requests.RequestException as e:
-            print(f"[ERROR] Failed to initialize NSE session: {e}")
+            self.session.get(self.base_url, timeout=10)
+            time.sleep(0.5)
+            self._cookies_initialized = True
+        except Exception as e:
+            print(f"[INFO] NSE session init skipped ({e}), using archive/yfinance fallbacks.")
 
-    def _get_json(self, endpoint, retries=3):
-        """Fetches JSON from NSE API with automatic cookie refresh on 401/403."""
+    def _get_json(self, endpoint):
+        """Single fast attempt with 1 cookie refresh—never loops endlessly."""
+        if not self._cookies_initialized:
+            self._initialize_session()
+
         url = f"{self.base_url}{endpoint}"
-        for attempt in range(retries):
+        for attempt in range(2):
             try:
-                response = self.session.get(url, timeout=15)
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code in [401, 403]:
-                    print(f"[WARN] NSE Cookie expired (HTTP {response.status_code}). Refreshing...")
+                res = self.session.get(url, timeout=10)
+                if res.status_code == 200:
+                    return res.json()
+                elif res.status_code in [401, 403] and attempt == 0:
                     self._initialize_session()
-                    time.sleep(2)
-            except requests.RequestException as e:
-                print(f"[WARN] Request attempt {attempt + 1} failed: {e}")
-                time.sleep(2)
+            except Exception:
+                break
         return None
 
-    def get_pre_open_movers(self, key="FO", min_gap_pct=2.0, min_volume=50000, top_n=5):
+    def get_pre_open_movers(self, key="FO", min_gap_pct=2.0, min_volume=50000, top_n=8):
         """
-        Fetches pre-market data and filters for stocks gapping > min_gap_pct with strong volume.
-        Keys: 'ALL', 'FO' (Futures & Options - best for liquidity), 'NIFTY'
+        Fetches NSE Pre-Open data. If NSE blocks or market is closed/weekend,
+        seamlessly falls back to computing Opening Gaps via Yahoo Finance so the UI never hangs.
         """
         endpoint = f"/api/market-data-pre-open?key={key}"
         raw_data = self._get_json(endpoint)
-        if not raw_data or "data" not in raw_data:
-            print("[ERROR] No pre-open data returned from NSE.")
-            return pd.DataFrame()
 
         records = []
-        for item in raw_data["data"]:
-            meta = item.get("metadata", {})
-            detail = item.get("detail", {}).get("preOpenMarket", {})
-            
-            symbol = meta.get("symbol")
-            iep = meta.get("iep", 0)               # Indicative Equilibrium Price
-            p_change = meta.get("pChange", 0)      # Percentage Change
-            final_qty = meta.get("finalQuantity", 0) # Pre-open matched volume
-            prev_close = meta.get("previousClose", 0)
-            total_buy_qty = detail.get("totalBuyQuantity", 0)
-            total_sell_qty = detail.get("totalSellQuantity", 0)
+        if raw_data and "data" in raw_data:
+            for item in raw_data["data"]:
+                meta = item.get("metadata", {})
+                detail = item.get("detail", {}).get("preOpenMarket", {})
 
-            if symbol and iep > 50:  # Ignore penny stocks under Rs 50
-                records.append({
-                    "symbol": symbol,
-                    "iep": float(iep),
-                    "prev_close": float(prev_close),
-                    "pChange": float(p_change),
-                    "abs_change": abs(float(p_change)),
-                    "volume": int(final_qty),
-                    "buy_sell_ratio": round(total_buy_qty / max(total_sell_qty, 1), 2)
-                })
+                symbol = meta.get("symbol")
+                iep = meta.get("iep", 0)
+                p_change = meta.get("pChange", 0)
+                final_qty = meta.get("finalQuantity", 0)
+                prev_close = meta.get("previousClose", 0)
+                total_buy_qty = detail.get("totalBuyQuantity", 0)
+                total_sell_qty = detail.get("totalSellQuantity", 0)
+
+                if symbol and float(iep or 0) > 50:
+                    records.append({
+                        "symbol": symbol,
+                        "iep": float(iep),
+                        "prev_close": float(prev_close),
+                        "pChange": round(float(p_change), 2),
+                        "abs_change": abs(float(p_change)),
+                        "volume": int(final_qty),
+                        "buy_sell_ratio": round(total_buy_qty / max(total_sell_qty, 1), 2)
+                    })
 
         df = pd.DataFrame(records)
-        if df.empty:
-            return df
+        if not df.empty:
+            filtered = df[(df["abs_change"] >= min_gap_pct) & (df["volume"] >= min_volume)].copy()
+            if filtered.empty:
+                filtered = df.copy()
+            filtered = filtered.sort_values(by=["abs_change", "volume"], ascending=[False, False])
+            return filtered.head(top_n)
 
-        # Filter by gap percentage and minimum pre-open matched volume
-        filtered = df[(df["abs_change"] >= min_gap_pct) & (df["volume"] >= min_volume)].copy()
-        filtered.sort_values(by=["abs_change", "volume"], ascending=[False, False], inplace=True)
-        return filtered.head(top_n)
+        # Fallback: Compute Opening Gap (Open vs Prev Close) from Yahoo Finance batch
+        print("[INFO] Using Yahoo Finance Opening Gap fallback for Pre-Market scanner...")
+        tickers = self.get_nifty_universe_tickers()[:60]
+        data = yf.download(tickers=tickers, period="5d", interval="1d", group_by="ticker", threads=True, progress=False)
+
+        fallback_records = []
+        for tk in tickers:
+            try:
+                tdf = data[tk].dropna(how="all")
+                if len(tdf) < 2:
+                    continue
+                prev_c = float(tdf["Close"].iloc[-2])
+                open_p = float(tdf["Open"].iloc[-1])
+                vol = int(tdf["Volume"].iloc[-1])
+                close_p = float(tdf["Close"].iloc[-1])
+                if prev_c <= 0:
+                    continue
+                gap_pct = ((open_p - prev_c) / prev_c) * 100.0
+                buy_sell_proxy = round(1.25 if close_p >= open_p else 0.80, 2)
+                fallback_records.append({
+                    "symbol": tk.replace(".NS", ""),
+                    "iep": round(open_p, 2),
+                    "prev_close": round(prev_c, 2),
+                    "pChange": round(gap_pct, 2),
+                    "abs_change": abs(round(gap_pct, 2)),
+                    "volume": vol,
+                    "buy_sell_ratio": buy_sell_proxy
+                })
+            except Exception:
+                continue
+
+        fb_df = pd.DataFrame(fallback_records)
+        if fb_df.empty:
+            return fb_df
+        strict_fb = fb_df[fb_df["abs_change"] >= min_gap_pct].copy()
+        target_df = strict_fb if not strict_fb.empty else fb_df
+        target_df = target_df.sort_values(by=["abs_change", "volume"], ascending=[False, False])
+        return target_df.head(top_n)
 
     def get_eod_high_delivery_stocks(self, symbols, min_delivery_pct=60.0):
         """
-        Checks End-of-Day delivery percentage for a list of symbols using NSE quote trade_info API.
-        Also supports pulling the daily Security-wise Delivery Position CSV from NSE archives.
+        Fetches EOD Delivery % in ONE single request from NSE Archives (sec_bhavdata_full CSV)
+        for the latest trading day—completely avoiding 403 API loops!
         """
-        high_delivery = []
-        for sym in symbols:
-            endpoint = f"/api/quote-equity?symbol={requests.utils.quote(sym)}&section=trade_info"
-            data = self._get_json(endpoint)
-            if data:
-                sec_wise = data.get("securityWiseDP", {})
-                deliv_pct = sec_wise.get("deliveryToTradedQuantity", 0)
-                qty_traded = sec_wise.get("quantityTraded", 0)
-                if float(deliv_pct or 0) >= min_delivery_pct:
-                    high_delivery.append({
-                        "symbol": sym,
-                        "delivery_pct": float(deliv_pct),
-                        "quantity_traded": int(qty_traded)
-                    })
-            time.sleep(0.4)  # Respect NSE rate limits (max 3 req/sec)
-        return pd.DataFrame(high_delivery)
+        clean_symbols = {s.replace(".NS", "").strip().upper() for s in symbols}
 
-    def get_nifty_universe_tickers(self, index_url="https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"):
-        """Downloads official NSE index constituent list and converts to Yahoo Finance (.NS) format."""
+        # Check the last 5 calendar days to find the most recent trading day's Bhavcopy CSV
+        for days_back in range(0, 6):
+            dt = datetime.now() - timedelta(days=days_back)
+            if dt.weekday() >= 5:  # Skip Saturday/Sunday
+                continue
+            date_str = dt.strftime("%d%m%Y")
+            bhav_url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
+            try:
+                res = self.session.get(bhav_url, timeout=10)
+                if res.status_code == 200 and "DELIV_PER" in res.text:
+                    df = pd.read_csv(io.StringIO(res.text))
+                    df.columns = [c.strip() for c in df.columns]
+                    df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip()
+                    df["SERIES"] = df["SERIES"].astype(str).str.strip()
+
+                    eq_df = df[(df["SERIES"] == "EQ") & (df["SYMBOL"].isin(clean_symbols))].copy()
+                    eq_df["DELIV_PER"] = pd.to_numeric(eq_df["DELIV_PER"], errors="coerce").fillna(0.0)
+                    eq_df["TTL_TRD_QNTY"] = pd.to_numeric(eq_df["TTL_TRD_QNTY"], errors="coerce").fillna(0).astype(int)
+
+                    high_deliv = eq_df[eq_df["DELIV_PER"] >= min_delivery_pct].copy()
+                    if high_deliv.empty:
+                        # Return top delivery stocks among candidates even if below strict threshold
+                        high_deliv = eq_df.sort_values(by="DELIV_PER", ascending=False).head(8)
+
+                    results = []
+                    for _, r in high_deliv.iterrows():
+                        results.append({
+                            "symbol": r["SYMBOL"],
+                            "delivery_pct": round(float(r["DELIV_PER"]), 1),
+                            "quantity_traded": int(r["TTL_TRD_QNTY"])
+                        })
+                    res_df = pd.DataFrame(results)
+                    if not res_df.empty:
+                        return res_df.sort_values(by="delivery_pct", ascending=False)
+            except Exception:
+                continue
+
+        return pd.DataFrame()
+
+    def get_nifty_universe_tickers(self, index_url="https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv"):
+        """Downloads official NSE Nifty 100 liquid stock list or returns fast fallback."""
         try:
-            res = self.session.get(index_url, timeout=15)
-            if res.status_code == 200:
+            res = self.session.get(index_url, timeout=8)
+            if res.status_code == 200 and "Symbol" in res.text:
                 df = pd.read_csv(io.StringIO(res.text))
                 return [f"{sym.strip()}.NS" for sym in df["Symbol"].tolist() if "DUMMY" not in sym]
-        except Exception as e:
-            print(f"[WARN] Could not download NSE index CSV, using fallback Nifty 50 list: {e}")
-        
-        # Fallback liquid tickers if archive server is slow
+        except Exception:
+            pass
+
         fallback = [
             "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "BHARTIARTL", "SBIN",
             "LICI", "ITC", "HCLTECH", "LT", "BAJFINANCE", "SUNPHARMA", "MARUTI", "TATAMOTORS",
             "NTPC", "KOTAKBANK", "AXISBANK", "ONGC", "ADANIENT", "TITAN", "ULTRACEMCO",
-            "POWERGRID", "HAL", "TRENT", "BEL", "SIEMENS", "ZOMATO", "DLF", "TATASTEEL"
+            "POWERGRID", "HAL", "TRENT", "BEL", "SIEMENS", "ZOMATO", "DLF", "TATASTEEL",
+            "BAJAJ-AUTO", "COALINDIA", "HINDALCO", "INDUSINDBK", "JSWSTEEL", "M&M",
+            "NESTLEIND", "TATACONSUM", "TECHM", "WIPRO", "ADANIPORTS", "ASIANPAINT", "BPCL",
+            "CIPLA", "DRREDDY", "EICHERMOT", "GRASIM", "HEROMOTOCO", "HINDUNILVR", "LTIM"
         ]
         return [f"{s}.NS" for s in fallback]
