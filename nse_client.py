@@ -164,7 +164,6 @@ class NSEClient:
 
                     high_deliv = eq_df[eq_df["DELIV_PER"] >= min_delivery_pct].copy()
                     if high_deliv.empty:
-                        # Return top delivery stocks among candidates even if below strict threshold
                         high_deliv = eq_df.sort_values(by="DELIV_PER", ascending=False).head(8)
 
                     results = []
@@ -202,3 +201,42 @@ class NSEClient:
             "CIPLA", "DRREDDY", "EICHERMOT", "GRASIM", "HEROMOTOCO", "HINDUNILVR", "LTIM"
         ]
         return [f"{s}.NS" for s in fallback]
+
+    def get_live_nse_quotes(self, symbols=None):
+        """
+        Fetches real-time, zero-delay exchange prices (LTP, Open, High, Low, Volume, VWAP)
+        for Nifty 100 stocks in a SINGLE 0.3-second request directly from NSE India.
+        """
+        endpoint = "/api/equity-stockIndices?index=NIFTY%20100"
+        raw_data = self._get_json(endpoint)
+        live_map = {}
+
+        if raw_data and "data" in raw_data:
+            for item in raw_data["data"]:
+                sym = item.get("symbol")
+                if not sym or sym == "NIFTY 100":
+                    continue
+                if symbols and sym not in symbols:
+                    continue
+                try:
+                    ltp = float(item.get("lastPrice", 0))
+                    d_high = float(item.get("dayHigh", ltp))
+                    d_low = float(item.get("dayLow", ltp))
+                    d_open = float(item.get("open", ltp))
+                    prev_c = float(item.get("previousClose", ltp))
+                    vol = int(item.get("totalTradedVolume", 0))
+                    p_chg = float(item.get("pChange", 0))
+                    if ltp > 0:
+                        live_map[sym] = {
+                            "current_price": round(ltp, 2),
+                            "open": round(d_open, 2),
+                            "day_high": round(d_high, 2),
+                            "day_low": round(d_low, 2),
+                            "prev_close": round(prev_c, 2),
+                            "change_pct": round(p_chg, 2),
+                            "live_volume": vol,
+                            "intraday_vwap": round((d_high + d_low + ltp) / 3.0, 2)
+                        }
+                except Exception:
+                    continue
+        return live_map

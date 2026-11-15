@@ -82,7 +82,7 @@ def fetch_premarket_data(universe_key, min_gap, min_vol, top_n):
     )
 
 
-@st.cache_data(ttl=240, show_spinner="Scanning Nifty charts (EMA 20/50, ATR, RSI, Volume)...")
+@st.cache_data(ttl=30, show_spinner="Fetching live NSE ticks & chart indicators...")
 def fetch_intraday_breakouts(vol_mult, min_price_chg, top_n):
     tickers = get_cached_universe()
     scanner = MarketDataScanner(tickers)
@@ -210,7 +210,7 @@ pre_df = st.session_state.get("premarket_df", pd.DataFrame())
 # ==========================================
 # ZERO-CLICK AUTOPILOT & 5-MINUTE AUTO-REFRESH ENGINE
 # ==========================================
-@st.fragment(run_every="5m")
+@st.fragment(run_every="15s")
 def render_autonomous_portfolio_hub():
     """
     Runs automatically on load and re-executes every 5 minutes without full page reload.
