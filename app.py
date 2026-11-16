@@ -131,6 +131,19 @@ trades = engine.ledger
 open_trades = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
 closed_trades = [t for t in trades if str(t.get("status", "")).upper() != "OPEN"]
 
+initial_cap = float(perf.get("initial_capital", 150000.0))
+manual_dep = float(perf.get("manual_deposits", 0.0))
+total_contrib = float(perf.get("total_capital_contributed", initial_cap + manual_dep))
+current_eq = float(perf.get("current_equity", total_contrib))
+avail_cash = float(perf.get("available_cash", current_eq))
+alloc_cap = float(perf.get("allocated_capital", 0.0))
+unrl_total = float(perf.get("unrealized_pnl_inr", 0.0))
+win_rate_val = float(perf.get("win_rate", 0.0))
+total_pnl_pct = float(perf.get("total_pnl_pct", 0.0))
+total_pnl_inr = float(perf.get("total_pnl_inr", 0.0))
+total_taxes = float(perf.get("total_taxes_paid", engine.portfolio.get("total_taxes_paid", 0.0)))
+shadow_learned = int(perf.get("shadow_samples_learned", engine.weights.get("shadow_samples_learned", 0)))
+
 regime_info = engine.weights.get("last_market_regime", {})
 regime_name = regime_info.get("regime", "NEUTRAL")
 nifty_ltp = float(regime_info.get("nifty_ltp", 0.0))
@@ -159,15 +172,15 @@ with st.sidebar:
     st.markdown("### 💼 Wallet Summary")
     st.metric(
         label="Total Portfolio Value (After Taxes)",
-        value=f"₹{perf['current_equity']:,.0f}",
-        delta=f"{perf['total_pnl_pct']:+.2f}% net return",
+        value=f"₹{current_eq:,.0f}",
+        delta=f"{total_pnl_pct:+.2f}% net return",
     )
-    st.metric(label="Free Cash Ready to Trade", value=f"₹{perf['available_cash']:,.0f}")
-    st.metric(label="Money Currently in Stocks", value=f"₹{perf['allocated_capital']:,.0f}")
+    st.metric(label="Free Cash Ready to Trade", value=f"₹{avail_cash:,.0f}")
+    st.metric(label="Money Currently in Stocks", value=f"₹{alloc_cap:,.0f}")
     st.caption(
-        f"Base Seed: ₹{perf['initial_capital']:,.0f} • "
-        f"Deposits: ₹{perf['manual_deposits']:,.0f} • "
-        f"NSE Taxes/Fees: ₹{perf['total_taxes_paid']:,.0f}"
+        f"Base Seed: ₹{initial_cap:,.0f} • "
+        f"Deposits: ₹{manual_dep:,.0f} • "
+        f"NSE Taxes/Fees: ₹{total_taxes:,.0f}"
     )
 
     st.divider()
@@ -218,7 +231,6 @@ with st.sidebar:
 # MAIN HEADER & KPI CARDS
 # ---------------------------------------------------------
 now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
-shadow_learned = perf.get("shadow_samples_learned", 0)
 st.markdown(
     f"""
     <div class="hero-card">
@@ -236,10 +248,10 @@ st.markdown(
 )
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Net Portfolio Value", f"₹{perf['current_equity']:,.0f}", f"Contributed: ₹{perf['total_capital_contributed']:,.0f}")
-c2.metric("Available Cash", f"₹{perf['available_cash']:,.0f}", f"In Trades: ₹{perf['allocated_capital']:,.0f}")
-c3.metric("Open Trade P&L", f"₹{perf['unrealized_pnl_inr']:+,.0f}", f"{len(open_trades)} Active Positions")
-c4.metric("Net Win Rate (After Tax)", f"{perf['win_rate']:.1f}%", f"Net Realized: ₹{perf['total_pnl_inr']:+,.0f}")
+c1.metric("Net Portfolio Value", f"₹{current_eq:,.0f}", f"Contributed: ₹{total_contrib:,.0f}")
+c2.metric("Available Cash", f"₹{avail_cash:,.0f}", f"In Trades: ₹{alloc_cap:,.0f}")
+c3.metric("Open Trade P&L", f"₹{unrl_total:+,.0f}", f"{len(open_trades)} Active Positions")
+c4.metric("Net Win Rate (After Tax)", f"{win_rate_val:.1f}%", f"Net Realized: ₹{total_pnl_inr:+,.0f}")
 
 st.write("")
 
@@ -303,7 +315,7 @@ with tab1:
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        eq = max(float(perf["current_equity"]), 1.0)
+        eq = max(current_eq, 1.0)
         sec_tags = [
             f"**{sec}**: {vals['count']}/2 trades (₹{vals['capital']:,.0f} • {vals['capital'] / eq * 100:.0f}% of equity)"
             for sec, vals in sector_summary.items()
@@ -354,7 +366,7 @@ with tab2:
     st.divider()
     st.subheader("👻 Counterfactual Shadow-Trade Learning (Skipped Setups Evaluated)")
     st.caption("Near-miss and Bear-Critic vetoed setups are tracked silently and evaluated so the AI learns 5× faster without risking money.")
-    shadows = engine.shadow_ledger
+    shadows = getattr(engine, "shadow_ledger", [])
     if not shadows:
         st.caption("No shadow setups logged yet.")
     else:
@@ -384,7 +396,9 @@ with tab2:
 with tab3:
     st.subheader("🎰 Thompson Sampling Multi-Armed Bandit (Beta α / β Posteriors)")
     arms = engine.weights.get("bandit_arms", {})
-    if arms:
+    if not arms:
+        st.info("Bandit posteriors will appear once the latest trade_engine.py runs its first scan.")
+    else:
         arm_rows = []
         for arm_name, stats in arms.items():
             a = float(stats.get("alpha", 2.0))
