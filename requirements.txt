@@ -5,6 +5,7 @@ requests
 curl_cffi
 yfinance
 pandas
+numpy
 feedparser
 python-dotenv
 streamlit
