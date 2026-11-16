@@ -187,12 +187,23 @@ with tab1:
         rows = []
         for t in open_trades:
             entry = float(t.get("entry_price", 0))
-            target = float(t.get("target_price", t.get("target", 0)))
-            sl = float(t.get("stop_loss", t.get("sl", 0)))
+            target = float(t.get("target_1", t.get("initial_target", 0)))
+            sl = float(t.get("stop_loss", 0))
             qty = int(t.get("qty", 0))
-            prob = float(t.get("ml_win_prob", t.get("confidence", 0)))
+            invested = float(t.get("allocated_capital", entry * qty))
+
+            # Use Online SGD win probability first, falling back to overall conviction
+            prob = float(t.get("ml_win_prob", t.get("conviction", 0)))
             if prob <= 1.0:
                 prob *= 100
+
+            # Combine verified news headline with any live trailing SL/target note
+            headline = str(t.get("headline", "")).strip()
+            mgmt_note = str(t.get("trade_management_note", "")).strip()
+            if headline and mgmt_note:
+                why_picked = f"{headline} ({mgmt_note})"
+            else:
+                why_picked = headline or mgmt_note or "Verified filing + volume breakout"
 
             rows.append(
                 {
@@ -201,9 +212,9 @@ with tab1:
                     "Target (₹)": f"₹{target:,.2f}",
                     "Stop-Loss (₹)": f"₹{sl:,.2f}",
                     "Shares": qty,
-                    "Invested (₹)": f"₹{entry * qty:,.0f}",
-                    "AI Confidence": f"{prob:.0f}%",
-                    "Why AI Picked It": t.get("reason", t.get("headline", "Verified news + volume breakout")),
+                    "Invested (₹)": f"₹{invested:,.0f}",
+                    "AI Win Prob": f"{prob:.0f}%",
+                    "Why AI Picked It": why_picked,
                 }
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -217,7 +228,7 @@ with tab1:
             pnl = float(t.get("pnl", 0))
             closed_rows.append(
                 {
-                    "Date": t.get("date", "—"),
+                    "Date": t.get("date", t.get("entry_time", "—")),
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
                     "Buy (₹)": f"₹{float(t.get('entry_price', 0)):,.2f}",
                     "Exit (₹)": f"₹{float(t.get('exit_price', 0)):,.2f}",
@@ -226,7 +237,6 @@ with tab1:
                 }
             )
         st.dataframe(pd.DataFrame(closed_rows), use_container_width=True, hide_index=True)
-
 with tab2:
     st.subheader("Today's Pre-Market AI Shortlist (08:30 AM Scan)")
     if not watchlist:
