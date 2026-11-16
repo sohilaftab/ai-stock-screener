@@ -1,17 +1,23 @@
 {
   "initial_capital": 150000.0,
-  "current_equity": 150000.0,
-  "available_cash": 7311.75,
-  "allocated_capital": 142688.25,
-  "total_realized_pnl": 0,
+  "current_equity": 147819.8,
+  "available_cash": 147819.8,
+  "allocated_capital": 0,
+  "total_realized_pnl": -2180.2,
   "win_streak": 0,
   "loss_streak": 0,
-  "mistakes_identified": [],
+  "mistakes_identified": [
+    "TMPV (SELL (SHORT)) lost \u20b9638: Over-relied on VOLUME score (100.0). Penalizing TMPV & volume weight.",
+    "EICHERMOT (SELL (SHORT)) lost \u20b9336: Over-relied on VOLUME score (100.0). Penalizing EICHERMOT & volume weight.",
+    "COALINDIA (SELL (SHORT)) lost \u20b9336: Over-relied on MOMENTUM score (85.0). Penalizing COALINDIA & momentum weight.",
+    "ITC (BUY) lost \u20b9386 (Bought at high RSI 85.1): Over-relied on VOLUME score (77.1). Penalizing ITC & volume weight.",
+    "ABB (SELL (SHORT)) lost \u20b9484: Over-relied on VOLUME score (76.4). Penalizing ABB & volume weight."
+  ],
   "daily_equity_log": [
     {
       "date": "2026-11-16",
-      "equity": 150000.0,
-      "pnl": 0.0
+      "equity": 147819.8,
+      "pnl": -2180.2
     }
   ]
 }

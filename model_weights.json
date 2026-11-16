@@ -1,0 +1,57 @@
+{
+  "volume_weight": 0.253,
+  "sentiment_weight": 0.31,
+  "premarket_weight": 0.231,
+  "momentum_weight": 0.206,
+  "risk_per_trade_pct": 0.6,
+  "min_conviction_threshold": 52.0,
+  "atr_sl_multiplier": 0.72,
+  "atr_tp_multiplier": 1.4,
+  "buy_rsi_ceiling": 72.0,
+  "short_rsi_floor": 28.0,
+  "buy_bias_bonus": 0.0,
+  "short_bias_bonus": -6.0,
+  "ticker_memory": {
+    "TMPV": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "net_pnl_inr": -637.97,
+      "win_rate": 0.0
+    },
+    "EICHERMOT": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "net_pnl_inr": -335.97,
+      "win_rate": 0.0
+    },
+    "COALINDIA": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "net_pnl_inr": -335.96,
+      "win_rate": 0.0
+    },
+    "ITC": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "net_pnl_inr": -386.06,
+      "win_rate": 0.0
+    },
+    "ABB": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "net_pnl_inr": -484.24,
+      "win_rate": 0.0
+    }
+  },
+  "blacklisted_tickers": [],
+  "preferred_tickers": [],
+  "generation": 6,
+  "last_evaluated_count": 5,
+  "last_updated": "2026-11-16 03:41 PM",
+  "learning_notes": "Gen #6 (5 trades analyzed): Best Pillar=News AI (31%), Min Conviction=52.0, ATR SL=0.72x / TP=1.4x"
+}
