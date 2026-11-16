@@ -1,469 +1,259 @@
+import json
 import os
-import streamlit as st
-import pandas as pd
 from datetime import datetime
-from dotenv import load_dotenv
+import pytz
+import pandas as pd
+import streamlit as st
 
-from nse_client import NSEClient
-from market_data import MarketDataScanner
-from sentiment_engine import FinBERTSentimentEngine
-from telegram_notifier import TelegramNotifier
-from trade_engine import AdaptiveTradeEngine
-
-load_dotenv()
-
-# ==========================================
-# PAGE CONFIGURATION & MODERN FINTECH STYLING
-# ==========================================
+# ---------------------------------------------------------
+# 1. PAGE CONFIG & CLEAN RESPONSIVE CSS (Fixes Clipping)
+# ---------------------------------------------------------
 st.set_page_config(
-    page_title="PulseAI | ₹1.5L Autonomous Intraday Trader",
-    page_icon="⚡",
+    page_title="PulseAI — NSE Paper Portfolio",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-    .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
-    .hero-banner {
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-        color: white; padding: 20px 24px; border-radius: 14px;
-        margin-bottom: 18px; border: 1px solid #334155;
-    }
-    .stock-card {
-        background-color: #ffffff; border: 1px solid #e2e8f0;
-        border-radius: 12px; padding: 16px; margin-bottom: 12px;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
-    }
-    @media (prefers-color-scheme: dark) {
-        .stock-card { background-color: #1e293b; border-color: #334155; }
-    }
-    .badge-buy { background: #dcfce7; color: #166534; padding: 4px 12px; border-radius: 99px; font-weight: 700; font-size: 0.82rem; }
-    .badge-sell { background: #fee2e2; color: #991b1b; padding: 4px 12px; border-radius: 99px; font-weight: 700; font-size: 0.82rem; }
-    .step-box {
-        background: rgba(59, 130, 246, 0.08); border-left: 4px solid #3b82f6;
-        padding: 10px 14px; border-radius: 6px; font-size: 0.9rem; margin-bottom: 16px;
-    }
-    .level-box {
-        display: flex; justify-content: space-between; background: rgba(148, 163, 184, 0.12);
-        padding: 8px 12px; border-radius: 8px; margin: 8px 0; font-size: 0.85rem;
-    }
-    .autopilot-pill {
-        background: #065f46; color: #a7f3d0; padding: 5px 12px;
-        border-radius: 99px; font-size: 0.8rem; font-weight: 700;
-        border: 1px solid #10b981;
-    }
-</style>
-""", unsafe_allow_html=True)
+IST = pytz.timezone("Asia/Kolkata")
+
+st.markdown(
+    """
+    <style>
+        /* Fix top tab clipping below Streamlit header */
+        .block-container {
+            padding-top: 3.5rem !important;
+            padding-bottom: 2rem !important;
+            max-width: 1280px;
+        }
+        /* Clean readable tabs */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.12);
+            padding-bottom: 6px;
+        }
+        .stTabs [data-baseweb="tab"] {
+            height: 42px;
+            padding: 8px 18px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+        /* Hero banner */
+        .hero-card {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            border-radius: 14px;
+            padding: 20px 24px;
+            margin-bottom: 1.25rem;
+        }
+        .status-pill {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            background: rgba(16, 185, 129, 0.15);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            margin-top: 8px;
+        }
+        /* Metric cards */
+        div[data-testid="stMetric"] {
+            background-color: rgba(30, 41, 59, 0.55);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            padding: 14px 16px;
+            border-radius: 12px;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------
+# 2. SAFE JSON LOADERS
+# ---------------------------------------------------------
+def load_json(filepath, default):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
 
 
-# ==========================================
-# CACHED BACKEND RESOURCES
-# ==========================================
-@st.cache_resource(show_spinner="Connecting to NSE India...")
-def get_nse_client():
-    return NSEClient()
+portfolio = load_json(
+    "portfolio_state.json",
+    {"starting_capital": 150000.0, "available_cash": 150000.0, "realized_pnl": 0.0},
+)
+trades = load_json("trade_history.json", [])
+watchlist = load_json("morning_watchlist.json", [])
 
+open_trades = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
+closed_trades = [t for t in trades if str(t.get("status", "")).upper() != "OPEN"]
 
-@st.cache_resource(show_spinner="Initializing FinBERT Financial AI Model...")
-def get_sentiment_engine():
-    return FinBERTSentimentEngine()
+starting_cap = float(portfolio.get("starting_capital", 150000.0))
+available_cash = float(portfolio.get("available_cash", starting_cap))
+invested_cash = sum(float(t.get("allocated_capital", t.get("entry_price", 0) * t.get("qty", 0))) for t in open_trades)
+unrealized_pnl = sum(float(t.get("unrealized_pnl", 0.0)) for t in open_trades)
+realized_pnl = float(portfolio.get("realized_pnl", sum(float(t.get("pnl", 0.0)) for t in closed_trades)))
+current_equity = available_cash + invested_cash + unrealized_pnl
+total_return_pct = ((current_equity - starting_cap) / starting_cap * 100) if starting_cap else 0.0
 
+wins = sum(1 for t in closed_trades if float(t.get("pnl", 0.0)) > 0)
+win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0.0
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_cached_universe():
-    return get_nse_client().get_nifty_universe_tickers()
-
-
-@st.cache_data(ttl=120, show_spinner="Scanning NSE Pre-Open Order Book...")
-def fetch_premarket_data(universe_key, min_gap, min_vol, top_n):
-    return get_nse_client().get_pre_open_movers(
-        key=universe_key, min_gap_pct=min_gap, min_volume=min_vol, top_n=top_n
-    )
-
-
-@st.cache_data(ttl=30, show_spinner="Fetching live NSE ticks & chart indicators...")
-def fetch_intraday_breakouts(vol_mult, min_price_chg, top_n):
-    tickers = get_cached_universe()
-    scanner = MarketDataScanner(tickers)
-    result = scanner.scan_volume_breakouts(
-        vol_multiplier=vol_mult, min_price_change_pct=min_price_chg, top_n=top_n
-    )
-    return result if isinstance(result, tuple) else (result, False)
-
-
-def enrich_with_finbert(df, symbol_col="symbol"):
-    if df.empty:
-        return df
-
-    engine = get_sentiment_engine()
-    sentiments, raw_labels, confidences, headlines, action_tags = [], [], [], [], []
-    progress = st.progress(0, text="🧠 FinBERT AI is reading the latest news headlines...")
-    total = len(df)
-
-    for idx, (_, row) in enumerate(df.iterrows()):
-        sym = row[symbol_col]
-        res = engine.analyze_stock_sentiment(sym)
-        lbl = res["sentiment"]
-        conf = int(res["confidence"] * 100)
-        chg = row.get("change_pct", row.get("pChange", 0))
-
-        if lbl == "POSITIVE" and chg >= 0:
-            tag, badge = "🟢 Bullish News + Chart", "🟢 POSITIVE"
-        elif lbl == "NEGATIVE" and chg < 0:
-            tag, badge = "🔴 Bearish Breakdown", "🔴 NEGATIVE"
-        elif lbl == "NEGATIVE" and chg >= 0:
-            tag, badge = "⚠️ Price Up on Bad News", "🔴 NEGATIVE"
-        elif lbl == "POSITIVE" and chg < 0:
-            tag, badge = "👀 Dip on Positive News", "🟢 POSITIVE"
-        else:
-            tag, badge = "⚡ Chart & Volume Driven", "⚪ NEUTRAL"
-
-        raw_labels.append(lbl)
-        sentiments.append(badge)
-        confidences.append(conf)
-        headlines.append(res["top_headline"])
-        action_tags.append(tag)
-        progress.progress((idx + 1) / total, text=f"🧠 Analyzing news for {sym} ({idx + 1}/{total})...")
-
-    progress.empty()
-    enriched = df.copy()
-    enriched["raw_sentiment"] = raw_labels
-    enriched["AI Verdict"] = sentiments
-    enriched["Signal Takeaway"] = action_tags
-    enriched["AI Confidence"] = confidences
-    enriched["Why Is It Moving? (Latest News)"] = headlines
-    return enriched
-
-
-trade_engine = AdaptiveTradeEngine()
-perf = trade_engine.get_performance_metrics()
-notifier = TelegramNotifier()
-
-# ==========================================
-# SIDEBAR: ₹1,50,000 WALLET & AUTOPILOT CONTROLS
-# ==========================================
+# ---------------------------------------------------------
+# 4. CLEAN SIDEBAR (No Truncated Numbers)
+# ---------------------------------------------------------
 with st.sidebar:
-    st.markdown("## 🤖 Autonomous Autopilot")
-    autopilot_on = st.toggle(
-        "Enable Zero-Click Autopilot",
-        value=True,
-        help="Automatically deploys ₹1.5L capital, sends per-trade Telegram tickets, trails Stop-Losses every 5 mins, and settles EOD P&L."
-    )
-    simulate_after_hours = st.checkbox(
-        "Simulate Live Entry in After-Hours/Weekend",
-        value=True,
-        help="When checked, Autopilot will immediately open today's virtual trades even if you open the app on a weekend or night."
-    )
-
-    st.divider()
-    st.markdown("## 💼 ₹1.5L Autonomous Wallet")
+    st.markdown("### 💼 Wallet Summary")
     st.metric(
-        "Current Portfolio Equity",
-        f"₹{perf['current_equity']:,.2f}",
-        f"₹{perf['total_pnl_inr']:+,.0f} ({perf['total_pnl_pct']:+.2f}%)"
+        label="Total Portfolio Value",
+        value=f"₹{current_equity:,.0f}",
+        delta=f"{total_return_pct:+.2f}% overall",
     )
-    c_cash, c_alloc = st.columns(2)
-    c_cash.metric("Available Cash", f"₹{perf['available_cash']:,.0f}")
-    c_alloc.metric("In Active Trades", f"₹{perf['allocated_capital']:,.0f}")
+    # Full-width metrics prevent "₹142,..." truncation
+    st.metric(label="Free Cash Ready to Trade", value=f"₹{available_cash:,.0f}")
+    st.metric(label="Money Currently in Stocks", value=f"₹{invested_cash:,.0f}")
 
     st.divider()
-    st.markdown(f"### 🧠 Self-Learning Brain (Gen #{trade_engine.weights['generation']})")
-    st.caption(f"Max Risk Per Trade: **{trade_engine.weights.get('risk_per_trade_pct', 1.0)}%** of capital")
-    st.progress(float(trade_engine.weights["volume_weight"]), text=f"📊 Volume Surge: {int(trade_engine.weights['volume_weight']*100)}%")
-    st.progress(float(trade_engine.weights["sentiment_weight"]), text=f"📰 FinBERT News AI: {int(trade_engine.weights['sentiment_weight']*100)}%")
-    st.progress(float(trade_engine.weights["premarket_weight"]), text=f"🌅 Pre-Market Flow: {int(trade_engine.weights['premarket_weight']*100)}%")
-    st.progress(float(trade_engine.weights["momentum_weight"]), text=f"📈 Chart (EMA/RSI/VWAP): {int(trade_engine.weights['momentum_weight']*100)}%")
-    st.caption(f"*{trade_engine.weights['learning_notes']}*")
+    st.markdown("### 🕒 Daily AI Schedule (IST)")
+    st.caption(
+        "• **08:30 AM** — Scans overnight news & filings\n"
+        "• **09:10 AM** — Confirms gap-up & enters trades\n"
+        "• **10:15 / 12:15 / 02:15** — Protects profits & SL\n"
+        "• **03:40 PM** — Closes day & trains AI model"
+    )
 
     st.divider()
-    preset = st.radio(
-        "🎯 Screening Strictness:",
-        options=["⚖️ Balanced (Recommended)", "🔥 High Conviction Only", "🌊 Show More Stocks"],
-        index=0
-    )
-    if "High Conviction" in preset:
-        intra_vol_mult, intra_min_chg, pre_min_gap, max_results = 1.8, 2.0, 2.5, 6
-    elif "Show More" in preset:
-        intra_vol_mult, intra_min_chg, pre_min_gap, max_results = 1.0, 0.5, 1.0, 12
-    else:
-        intra_vol_mult, intra_min_chg, pre_min_gap, max_results = 1.3, 1.2, 1.8, 8
+    with st.expander("⚙️ Developer Controls (Keep OFF)", expanded=False):
+        st.caption("GitHub Actions runs automatically on schedule. Keep these OFF to avoid duplicate trades.")
+        st.toggle("Enable Browser Autopilot", value=False, key="ui_autopilot")
+        st.checkbox("Simulate After-Hours Entry", value=False, key="ui_sim")
 
-    if st.button("🔄 Force Refresh All Data Now", width="stretch", type="primary"):
-        st.cache_data.clear()
-        for key in ["intraday_df", "premarket_df", "eod_df"]:
-            st.session_state.pop(key, None)
-        st.rerun()
-
-# ==========================================
-# LOAD BASE MARKET DATA
-# ==========================================
-if "intraday_df" not in st.session_state:
-    raw_df, is_fallback = fetch_intraday_breakouts(intra_vol_mult, intra_min_chg, max_results)
-    st.session_state["intraday_fallback"] = is_fallback
-    st.session_state["intraday_df"] = enrich_with_finbert(raw_df, symbol_col="symbol")
-
-intra_df = st.session_state.get("intraday_df", pd.DataFrame())
-pre_df = st.session_state.get("premarket_df", pd.DataFrame())
-
-
-# ==========================================
-# ZERO-CLICK AUTOPILOT & 5-MINUTE AUTO-REFRESH ENGINE
-# ==========================================
-@st.fragment(run_every="15s")
-def render_autonomous_portfolio_hub():
-    """
-    Runs automatically on load and re-executes every 5 minutes without full page reload.
-    Automatically takes trades from Rs 1,50,000, sends per-trade Telegram tickets,
-    manages live SL/Targets, and logs P&L.
-    """
-    engine = AdaptiveTradeEngine()
-    rec_df = engine.generate_intraday_recommendations(intra_df, pre_df, top_k=5)
-
-    now_ist = datetime.now()
-    mins_now = now_ist.hour * 60 + now_ist.minute
-    today_str = now_ist.strftime("%Y-%m-%d")
-
-    today_trades = [t for t in engine.ledger if t.get("date") == today_str]
-    open_trades = [t for t in engine.ledger if t.get("status") == "OPEN"]
-    autopilot_logs = []
-
-    if autopilot_on and not rec_df.empty:
-        # 1. Pre-9 AM: Automatically save morning baseline watchlist
-        if mins_now < 540 and not os.path.exists("morning_watchlist.json"):
-            engine.save_morning_watchlist(rec_df)
-            autopilot_logs.append("🌅 Pre-9 AM Watchlist automatically saved (`morning_watchlist.json`).")
-
-        # 2. Auto-Deploy Rs 1,50,000 into Virtual Trades if none taken yet today
-        is_market_window = (548 <= mins_now < 915) and (now_ist.weekday() < 5)
-        if not today_trades and (is_market_window or simulate_after_hours):
-            # record_recommendations() automatically sends a Telegram ticket for EACH trade taken!
-            added = engine.record_recommendations(rec_df, notify_telegram=True)
-            if added > 0:
-                msg = f"🤖 Autopilot automatically opened {added} virtual trades & sent individual tickets to Telegram!"
-                st.toast(msg, icon="💼")
-                autopilot_logs.append(msg)
-                open_trades = [t for t in engine.ledger if t.get("status") == "OPEN"]
-
-        # 3. Live 5-Minute Position Monitoring (Trail SL / Extend Target / Early Cut / Exit)
-        if open_trades and ((555 <= mins_now < 925) or simulate_after_hours):
-            # manage_live_positions() automatically sends a Telegram ticket whenever a trade exits or modifies!
-            live_actions = engine.manage_live_positions(notify_telegram=True)
-            if live_actions:
-                for act in live_actions:
-                    st.toast(act, icon="⚡")
-                    autopilot_logs.append(act)
-
-        # 4. Auto-EOD Settlement after 3:25 PM IST on weekdays
-        if open_trades and (mins_now >= 925 and now_ist.weekday() < 5):
-            # evaluate_open_trades_and_learn() automatically sends a Telegram exit ticket for EACH trade!
-            eod_res = engine.evaluate_open_trades_and_learn(notify_telegram=True)
-            if eod_res["evaluated"] > 0:
-                msg = f"🏁 Autopilot EOD settled {eod_res['evaluated']} trades & sent receipts to Telegram!"
-                st.toast(msg, icon="🧠")
-                autopilot_logs.append(msg)
-
-    live_perf = engine.get_performance_metrics()
-
-    # Hero Banner inside Fragment so Equity & Clock update every 5 minutes
-    ap_badge = "🟢 AUTOPILOT ACTIVE (5m Live Sync)" if autopilot_on else "⚪ MANUAL MODE"
-    st.markdown(f"""
-    <div class="hero-banner">
-        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
-            <div>
-                <h2 style="margin:0; color:white; font-size:1.55rem;">⚡ PulseAI — Autonomous ₹1,50,000 Intraday Portfolio Manager</h2>
-                <p style="margin:4px 0 0 0; color:#cbd5e1; font-size:0.92rem;">
-                    Pre-9 AM Multi-Timeframe Research • 9:10 AM Pre-Market Validation • 5-Min Live SL Trailing & Target Extension • EOD Mistake Autopsy
-                </p>
-            </div>
-            <div style="text-align:right; margin-top:8px;">
-                <span class="autopilot-pill">{ap_badge} • Last Sync: {now_ist.strftime('%I:%M:%S %p IST')}</span>
-            </div>
-        </div>
+# ---------------------------------------------------------
+# 5. MAIN HEADER & BEGINNER GUIDE
+# ---------------------------------------------------------
+now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+st.markdown(
+    f"""
+    <div class="hero-card">
+        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Smart NSE Paper Trading Dashboard</h2>
+        <p style="margin:6px 0 0 0; color:#94a3b8; font-size:0.95rem;">
+            Tracks a virtual <strong>₹1,50,000</strong> intraday portfolio using verified NSE corporate filings, news sentiment, and volume breakouts.
+        </p>
+        <div class="status-pill">● Cloud Autopilot Active • Last Synced: {now_ist}</div>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-    # Top Portfolio KPI Row
-    w1, w2, w3, w4, w5 = st.columns(5)
-    w1.metric("Starting Capital", f"₹{live_perf['initial_capital']:,.0f}")
-    w2.metric("Current Wallet Equity", f"₹{live_perf['current_equity']:,.0f}", f"{live_perf['total_pnl_pct']:+.2f}%")
-    w3.metric("Available Cash", f"₹{live_perf['available_cash']:,.0f}", f"In Trades: ₹{live_perf['allocated_capital']:,.0f}")
-    w4.metric("Live Unrealized P&L", f"₹{live_perf['unrealized_pnl_inr']:+,.0f}", f"{live_perf['open_trades']} Active Trades")
-    w5.metric("Win Rate (Settled)", f"{live_perf['win_rate']}%", f"Realized: ₹{live_perf['total_pnl_inr']:+,.0f}")
+with st.expander("ℹ️ New here? Click to understand how this dashboard works in 30 seconds", expanded=False):
+    st.markdown(
+        """
+        1. **No Real Money Is Used:** This is a 100% virtual ₹1,50,000 paper wallet used to test AI stock picks safely.
+        2. **How Stocks Are Picked:** Every morning before market open, the AI reads Indian financial news, verifies announcements against official NSE filings, and checks pre-market volume.
+        3. **Automatic Risk Protection:** Every trade has a fixed **Target Price** (to book profit) and **Stop-Loss** (to cap losses automatically).
+        """
+    )
 
-    if autopilot_logs:
-        st.success("**🤖 Latest Autonomous Actions Taken:**\n" + "\n".join(f"- {log}" for log in autopilot_logs))
+# Top 4 KPI Cards
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Portfolio Value", f"₹{current_equity:,.0f}", f"Start: ₹{starting_cap:,.0f}")
+c2.metric("Available Cash", f"₹{available_cash:,.0f}", f"In Trades: ₹{invested_cash:,.0f}")
+c3.metric("Open Trade P&L", f"₹{unrealized_pnl:+,.0f}", f"{len(open_trades)} Active Positions")
+c4.metric("Win Rate", f"{win_rate:.0f}%", f"{wins}W / {len(closed_trades) - wins}L ({len(closed_trades)} Closed)")
 
-    st.divider()
+st.write("")
 
-    if not rec_df.empty:
-        st.subheader("🚀 Active & Suggested Setups (Position-Sized from ₹1,50,000 Wallet)")
-        card_cols = st.columns(min(3, len(rec_df)))
-        for idx, col in enumerate(card_cols):
-            r = rec_df.iloc[idx]
-            badge_cls = "badge-buy" if r["action"] == "BUY" else "badge-sell"
-            with col:
-                st.markdown(f"""
-                <div class="stock-card">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <span style="font-size:1.25rem; font-weight:800;">{r['symbol']}</span>
-                        <span class="{badge_cls}">{r['action']} • {r['conviction']}/100</span>
-                    </div>
-                    <div style="font-size:0.85rem; margin-top:6px; color:#3b82f6; font-weight:600;">
-                        📦 Qty: {r['qty']} shares (Capital: ₹{r['capital_used']:,.0f}) | Chart: {r['chart_trend']}
-                    </div>
-                    <div class="level-box">
-                        <div><b>Entry:</b><br>₹{r['entry_price']}</div>
-                        <div style="color:#16a34a;"><b>Target 1:</b><br>₹{r['target_1']} (+₹{r['expected_profit_inr']:,.0f})</div>
-                        <div style="color:#15803d;"><b>Target 2:</b><br>₹{r['target_2']}</div>
-                        <div style="color:#dc2626;"><b>Stop-Loss:</b><br>₹{r['stop_loss']} (-₹{r['max_loss_inr']:,.0f})</div>
-                    </div>
-                    <div style="font-size:0.78rem; opacity:0.85; border-top:1px solid #e2e8f0; padding-top:6px;">
-                        📰 <i>"{r['headline']}"</i>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+# ---------------------------------------------------------
+# 6. CLEAN HUMAN-READABLE TABS
+# ---------------------------------------------------------
+tab1, tab2, tab3 = st.tabs(
+    [
+        f"📊 Active & Past Trades ({len(open_trades)} Open)",
+        f"🌅 Morning AI Watchlist ({len(watchlist)})",
+        "🧠 How the AI Scores Stocks",
+    ]
+)
 
-        # Manual Override Controls (Always available if you want to trigger a phase on demand)
-        b1, b2, b3, b4 = st.columns(4)
-        with b1:
-            if st.button("🌅 Save Pre-9 AM Watchlist", width="stretch"):
-                engine.save_morning_watchlist(rec_df)
-                st.success("✅ Saved Pre-9 AM Watchlist!")
-        with b2:
-            if st.button("💼 Deploy ₹1.5L Into Trades Now", type="primary", width="stretch"):
-                added = engine.record_recommendations(rec_df, notify_telegram=True)
-                if added > 0:
-                    st.success(f"✅ Executed {added} virtual trades & sent tickets to Telegram!")
-                    st.rerun()
-                else:
-                    st.info("ℹ️ Today's trades are already open in your ledger below!")
-        with b3:
-            if st.button("📡 Run Live SL/Target Check Now", width="stretch"):
-                actions = engine.manage_live_positions(notify_telegram=True)
-                if actions:
-                    for a in actions:
-                        st.toast(a, icon="⚡")
-                st.rerun()
-        with b4:
-            if st.button("🏁 Settle EOD P&L & Train AI Now", width="stretch"):
-                res = engine.evaluate_open_trades_and_learn(notify_telegram=True)
-                st.success(f"🎉 Settled {res['evaluated']} trades! {res['message']}")
-                st.rerun()
-
-    st.divider()
-    st.subheader("📋 Autonomous Trade Ledger & Live Position Tracker (`trade_history.json`)")
-    if not engine.ledger:
-        st.info("No trades in ledger yet.")
+with tab1:
+    st.subheader("Currently Open Positions")
+    if not open_trades:
+        st.info("No active trades right now. New positions are evaluated automatically at 09:10 AM IST on market days.")
     else:
-        ledger_df = pd.DataFrame(engine.ledger).iloc[::-1]
-        for col_name, default_val in [
-            ("qty", 1), ("capital_used", 0.0), ("current_price", 0.0),
-            ("unrealized_pnl_inr", 0.0), ("trade_management_note", ""), ("mistake_diagnosis", "")
-        ]:
-            if col_name not in ledger_df.columns:
-                ledger_df[col_name] = default_val
+        rows = []
+        for t in open_trades:
+            entry = float(t.get("entry_price", 0))
+            target = float(t.get("target_price", t.get("target", 0)))
+            sl = float(t.get("stop_loss", t.get("sl", 0)))
+            qty = int(t.get("qty", 0))
+            prob = float(t.get("ml_win_prob", t.get("confidence", 0)))
+            if prob <= 1.0:
+                prob *= 100
 
-        st.dataframe(
-            ledger_df[[
-                "date", "symbol", "action", "qty", "capital_used", "entry_price",
-                "current_price", "target_1", "stop_loss", "status", "pnl_inr",
-                "trade_management_note", "mistake_diagnosis"
-            ]],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "date": st.column_config.TextColumn("Date"),
-                "symbol": st.column_config.TextColumn("Stock"),
-                "action": st.column_config.TextColumn("Side"),
-                "qty": st.column_config.NumberColumn("Qty", format="%d"),
-                "capital_used": st.column_config.NumberColumn("Capital Used", format="₹%.0f"),
-                "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
-                "current_price": st.column_config.NumberColumn("LTP / Exit", format="₹%.2f"),
-                "target_1": st.column_config.NumberColumn("Active Target", format="₹%.2f"),
-                "stop_loss": st.column_config.NumberColumn("Active SL", format="₹%.2f"),
-                "status": st.column_config.TextColumn("Status"),
-                "pnl_inr": st.column_config.NumberColumn("Realized P&L", format="₹%+,.0f"),
-                "trade_management_note": st.column_config.TextColumn("Live AI Trade Management", width="medium"),
-                "mistake_diagnosis": st.column_config.TextColumn("EOD Mistake Autopsy", width="large"),
-            }
+            rows.append(
+                {
+                    "Stock": t.get("symbol", "N/A").replace(".NS", ""),
+                    "Buy Price (₹)": f"₹{entry:,.2f}",
+                    "Target (₹)": f"₹{target:,.2f}",
+                    "Stop-Loss (₹)": f"₹{sl:,.2f}",
+                    "Shares": qty,
+                    "Invested (₹)": f"₹{entry * qty:,.0f}",
+                    "AI Confidence": f"{prob:.0f}%",
+                    "Why AI Picked It": t.get("reason", t.get("headline", "Verified news + volume breakout")),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.subheader("Completed Trade History")
+    if not closed_trades:
+        st.caption("No settled trades yet. Open positions settle automatically at 03:40 PM IST.")
+    else:
+        closed_rows = []
+        for t in reversed(closed_trades[-20:]):
+            pnl = float(t.get("pnl", 0))
+            closed_rows.append(
+                {
+                    "Date": t.get("date", "—"),
+                    "Stock": t.get("symbol", "N/A").replace(".NS", ""),
+                    "Buy (₹)": f"₹{float(t.get('entry_price', 0)):,.2f}",
+                    "Exit (₹)": f"₹{float(t.get('exit_price', 0)):,.2f}",
+                    "Profit / Loss": f"₹{pnl:+,.0f}",
+                    "Result": "✅ Profit" if pnl > 0 else "❌ Stop-Loss / Exit",
+                }
+            )
+        st.dataframe(pd.DataFrame(closed_rows), use_container_width=True, hide_index=True)
+
+with tab2:
+    st.subheader("Today's Pre-Market AI Shortlist (08:30 AM Scan)")
+    if not watchlist:
+        st.info("Watchlist updates every weekday at 08:30 AM IST before the NSE pre-open session.")
+    else:
+        st.dataframe(pd.DataFrame(watchlist), use_container_width=True, hide_index=True)
+
+with tab3:
+    st.subheader("How PulseAI Filters Out Fake News & Bad Setups")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(
+            """
+            **Step 1: Official NSE Filing Cross-Check**
+            Headlines from financial news are cross-checked against official NSE corporate announcements so rumors without filings are ignored.
+
+            **Step 2: FinBERT Sentiment Scoring**
+            An Indian market NLP model (`finbert-sentfin`) reads whether the news is genuinely bullish (order wins, earnings beat) or just noise.
+            """
         )
+    with col_b:
+        st.markdown(
+            """
+            **Step 3: Volume & Pre-Market Confirmation**
+            Even good news is skipped unless real buyer volume shows up at 09:10 AM IST.
 
-    mistakes = engine.portfolio.get("mistakes_identified", [])
-    if mistakes:
-        with st.expander("🔍 View AI Self-Reflection & Mistake Autopsy Log", expanded=True):
-            for m in mistakes[:5]:
-                st.markdown(f"- 🧠 {m}")
-
-
-# ==========================================
-# MAIN NAVIGATION TABS
-# ==========================================
-tab_advisor, tab_intra, tab_pre, tab_eod, tab_search = st.tabs([
-    "🎯 1. Autonomous Trader & ₹1.5L Portfolio",
-    "🔥 2. Live Chart & Volume Breakouts",
-    "🌅 3. Pre-Market Gappers (9:00 AM)",
-    "🏦 4. Big Player Delivery (>60%)",
-    "🔍 5. Search Any Stock's News"
-])
-
-with tab_advisor:
-    render_autonomous_portfolio_hub()
-
-with tab_intra:
-    if not intra_df.empty:
-        st.dataframe(
-            intra_df[[
-                "symbol", "ltp", "change_pct", "chart_trend", "trend_30d",
-                "vol_ratio", "rsi", "Signal Takeaway", "AI Verdict", "Why Is It Moving? (Latest News)"
-            ]],
-            width="stretch",
-            hide_index=True
+            **Step 4: Self-Improving Daily Learning**
+            At 03:40 PM IST, the model compares its morning predictions against actual closing prices and adjusts its weights automatically.
+            """
         )
-
-with tab_pre:
-    if st.button("🚀 Scan NSE Pre-Open Session & Compare with Morning Watchlist", type="primary"):
-        raw_pre = fetch_premarket_data("FO", pre_min_gap, 25000, max_results)
-        st.session_state["premarket_df"] = enrich_with_finbert(raw_pre, symbol_col="symbol")
-        st.rerun()
-
-    if not pre_df.empty:
-        new_recs = trade_engine.generate_intraday_recommendations(intra_df, pre_df, top_k=5)
-        shifts = trade_engine.compare_with_morning_watchlist(new_recs)
-        if shifts:
-            st.warning("⚡ **Pre-Market Momentum Shifts Detected vs Pre-9 AM List:**\n\n" + "\n".join(f"- {s}" for s in shifts))
-        st.dataframe(pre_df, width="stretch", hide_index=True)
-
-with tab_eod:
-    if st.button("🏦 Scan Today's Leaders for High Delivery (>60%)", type="primary"):
-        base_df, _ = fetch_intraday_breakouts(vol_mult=1.1, min_price_chg=0.5, top_n=15)
-        if not base_df.empty:
-            deliv_df = get_nse_client().get_eod_high_delivery_stocks(base_df["symbol"].tolist(), min_delivery_pct=60.0)
-            if not deliv_df.empty:
-                merged = pd.merge(deliv_df, base_df, on="symbol", how="left")
-                st.session_state["eod_df"] = enrich_with_finbert(merged, symbol_col="symbol")
-    eod_df = st.session_state.get("eod_df", pd.DataFrame())
-    if not eod_df.empty:
-        st.dataframe(eod_df, width="stretch", hide_index=True)
-
-with tab_search:
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        query_sym = st.text_input("Type Stock Symbol or Company Name:", value="TATAMOTORS")
-    with c2:
-        st.write("")
-        st.write("")
-        run_search = st.button("🧠 Analyze Stock News", type="primary", width="stretch")
-
-    if run_search and query_sym.strip():
-        engine = get_sentiment_engine()
-        clean_q = query_sym.strip().upper()
-        headlines = engine.fetch_google_news(clean_q, max_headlines=8)
-        if headlines:
-            scores = engine.nlp(headlines)
-            rows = [{
-                "News Headline": h,
-                "AI Sentiment": s["label"].upper(),
-                "Confidence": round(float(s["score"]) * 100, 1)
-            } for h, s in zip(headlines, scores)]
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
