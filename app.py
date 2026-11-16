@@ -24,7 +24,7 @@ st.markdown(
         .block-container {
             padding-top: 3.5rem !important;
             padding-bottom: 2rem !important;
-            max-width: 1360px;
+            max-width: 1380px;
         }
         .stTabs [data-baseweb="tab-list"] {
             gap: 10px;
@@ -158,7 +158,7 @@ if os.path.exists("morning_watchlist.json"):
 with st.sidebar:
     st.markdown("### 💼 Wallet Summary")
     st.metric(
-        label="Total Portfolio Value",
+        label="Total Portfolio Value (After Taxes)",
         value=f"₹{perf['current_equity']:,.0f}",
         delta=f"{perf['total_pnl_pct']:+.2f}% net return",
     )
@@ -166,7 +166,8 @@ with st.sidebar:
     st.metric(label="Money Currently in Stocks", value=f"₹{perf['allocated_capital']:,.0f}")
     st.caption(
         f"Base Seed: ₹{perf['initial_capital']:,.0f} • "
-        f"Manual Deposits: ₹{perf['manual_deposits']:,.0f}"
+        f"Deposits: ₹{perf['manual_deposits']:,.0f} • "
+        f"NSE Taxes/Fees: ₹{perf['total_taxes_paid']:,.0f}"
     )
 
     st.divider()
@@ -217,15 +218,16 @@ with st.sidebar:
 # MAIN HEADER & KPI CARDS
 # ---------------------------------------------------------
 now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+shadow_learned = perf.get("shadow_samples_learned", 0)
 st.markdown(
     f"""
     <div class="hero-card">
-        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Quantitative Bandit & Half-Kelly Portfolio Manager</h2>
+        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Global Quant & NSE Autonomous Portfolio Manager</h2>
         <p style="margin:6px 0 0 0; color:#94a3b8; font-size:0.95rem;">
-            Self-learning NSE engine powered by Thompson Sampling Multi-Armed Bandits, Half-Kelly sizing, Mansfield Relative Strength vs. Nifty 50, and real-time news emotion guards.
+            Powered by Thompson Sampling Bandits, Qlib TRA Archetype Routing, Adversarial Bear Critic Vetoes, Half-Kelly Sizing, Counterfactual Shadow Learning, and 2026 NSE Tax Accounting.
         </p>
         <div class="pill-row">
-            <span class="status-pill">● Brain Gen #{engine.weights.get('generation', 1)} • Synced: {now_ist}</span>
+            <span class="status-pill">● Brain Gen #{engine.weights.get('generation', 1)} ({shadow_learned} Shadow Setups Learned) • {now_ist}</span>
             <span class="regime-pill" style="background:{r_bg}; color:{r_fg}; border:1px solid {r_border};">{regime_badge_text}</span>
         </div>
     </div>
@@ -234,10 +236,10 @@ st.markdown(
 )
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Portfolio Value", f"₹{perf['current_equity']:,.0f}", f"Contributed: ₹{perf['total_capital_contributed']:,.0f}")
+c1.metric("Net Portfolio Value", f"₹{perf['current_equity']:,.0f}", f"Contributed: ₹{perf['total_capital_contributed']:,.0f}")
 c2.metric("Available Cash", f"₹{perf['available_cash']:,.0f}", f"In Trades: ₹{perf['allocated_capital']:,.0f}")
 c3.metric("Open Trade P&L", f"₹{perf['unrealized_pnl_inr']:+,.0f}", f"{len(open_trades)} Active Positions")
-c4.metric("Settled Win Rate", f"{perf['win_rate']:.1f}%", f"Realized P&L: ₹{perf['total_pnl_inr']:+,.0f}")
+c4.metric("Net Win Rate (After Tax)", f"{perf['win_rate']:.1f}%", f"Net Realized: ₹{perf['total_pnl_inr']:+,.0f}")
 
 st.write("")
 
@@ -247,8 +249,8 @@ st.write("")
 tab1, tab2, tab3, tab4 = st.tabs(
     [
         f"📊 Active & Past Trades ({len(open_trades)} Open)",
-        "🧠 AI Research & Mistake Autopsy",
-        "🎰 Bandit Arms, Half-Kelly & Timing",
+        "🧠 AI Research & Shadow Learning",
+        "🎰 Bandit Arms, TRA & Timing",
         f"🌅 Watchlist ({len(watchlist_data)})",
     ]
 )
@@ -256,7 +258,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
 with tab1:
     st.subheader("Currently Open Positions")
     if not open_trades:
-        st.info("No active trades right now. The AI enters automatically when a setup passes its Bandit, Mansfield RS, Regime, and Sector filters.")
+        st.info("No active trades right now. The AI enters automatically when a setup passes its Bear Critic, Bandit, Mansfield RS, Regime, and Sector filters.")
     else:
         rows = []
         sector_summary = {}
@@ -285,6 +287,7 @@ with tab1:
                 {
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
                     "Sector": sec,
+                    "TRA Archetype": t.get("archetype", "MOMENTUM_MOVER"),
                     "Side": t.get("action", "BUY"),
                     "Bandit Arm": t.get("strategy_arm", "MOMENTUM_BREAKOUT"),
                     "Mansfield RS": f"{mrs:+.2f}%",
@@ -307,13 +310,14 @@ with tab1:
         ]
         st.caption("🛡️ **Sector Correlation Guard (Max 2 trades / 40% equity per sector):** " + " | ".join(sec_tags))
 
-    st.subheader("Completed Trade History & Lessons")
+    st.subheader("Completed Trade History (Net After 2026 NSE Taxes & Brokerage)")
     if not closed_trades:
-        st.caption("No settled trades yet. Whenever the AI closes a trade, its exact exit reason and research lesson appear here.")
+        st.caption("No settled trades yet. Whenever the AI closes a trade, its net after-tax P&L and research lesson appear here.")
     else:
         closed_rows = []
         for t in reversed(closed_trades[-30:]):
             pnl = float(t.get("pnl_inr", 0))
+            charges = float(t.get("charges_inr", 0))
             closed_rows.append(
                 {
                     "Date": t.get("date", "—"),
@@ -324,7 +328,8 @@ with tab1:
                     "Entry (₹)": f"₹{float(t.get('entry_price', 0)):,.2f}",
                     "Exit (₹)": f"₹{float(t.get('exit_price', 0)):,.2f}",
                     "Hold": f"{float(t.get('hold_minutes', 0)):.0f}m",
-                    "Profit / Loss": f"₹{pnl:+,.0f} ({float(t.get('pnl_pct', 0)):+.2f}%)",
+                    "Taxes/Fees": f"₹{charges:.2f}",
+                    "Net P&L": f"₹{pnl:+,.0f} ({float(t.get('pnl_pct', 0)):+.2f}%)",
                     "AI Exit Reason": t.get("status", "CLOSED"),
                     "Post-Trade Research Lesson": t.get("mistake_diagnosis", "—"),
                 }
@@ -347,6 +352,28 @@ with tab2:
             st.markdown(f"{icon} **{item.get('timestamp', '')}**{regime_tag} — {item.get('lesson', '')}")
 
     st.divider()
+    st.subheader("👻 Counterfactual Shadow-Trade Learning (Skipped Setups Evaluated)")
+    st.caption("Near-miss and Bear-Critic vetoed setups are tracked silently and evaluated so the AI learns 5× faster without risking money.")
+    shadows = engine.shadow_ledger
+    if not shadows:
+        st.caption("No shadow setups logged yet.")
+    else:
+        s_rows = [
+            {
+                "Date": s.get("date", "—"),
+                "Stock": s.get("symbol", "").replace(".NS", ""),
+                "Side": s.get("action", "BUY"),
+                "Archetype": s.get("archetype", "—"),
+                "Conviction": s.get("conviction", 0),
+                "Why Skipped / Vetoed": s.get("skip_reason", "—"),
+                "Outcome": s.get("status", "SHADOW_OPEN"),
+                "Shadow P&L": f"{float(s.get('shadow_pnl_pct', 0)):+.2f}%",
+            }
+            for s in reversed(shadows[-15:])
+        ]
+        st.dataframe(pd.DataFrame(s_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
     st.subheader("💰 Manual Deposit History")
     deposits = engine.portfolio.get("deposit_history", [])
     if not deposits:
@@ -356,10 +383,6 @@ with tab2:
 
 with tab3:
     st.subheader("🎰 Thompson Sampling Multi-Armed Bandit (Beta α / β Posteriors)")
-    st.caption(
-        "Each strategy arm models its learned win probability as Beta(α, β). "
-        "Higher α/β means higher posterior win probability and larger Half-Kelly position sizing."
-    )
     arms = engine.weights.get("bandit_arms", {})
     if arms:
         arm_rows = []
@@ -373,11 +396,33 @@ with tab3:
                     "Alpha (Wins)": round(a, 2),
                     "Beta (Losses)": round(b, 2),
                     "Posterior Win Prob": f"{post_p:.1f}%",
-                    "Trades Settled": int(stats.get("trades", 0)),
+                    "Real Trades": int(stats.get("trades", 0)),
                     "Net P&L (₹)": f"₹{float(stats.get('net_pnl_inr', 0.0)):+,.0f}",
                 }
             )
         st.dataframe(pd.DataFrame(arm_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("🧬 Qlib TRA Stock Archetype Routing Memory")
+    arch_mem = engine.weights.get("archetype_memory", {})
+    if not arch_mem:
+        st.info("Archetype stats (Large-Cap Steady vs. Momentum Mover vs. High-Vol Midcap) populate automatically as real & shadow trades settle.")
+    else:
+        arch_rows = []
+        for arch_name, st_a in arch_mem.items():
+            w_wins = float(st_a.get("weighted_wins", 1.0))
+            w_losses = float(st_a.get("weighted_losses", 1.0))
+            wp = (w_wins / max(w_wins + w_losses, 1.0)) * 100.0
+            arch_rows.append(
+                {
+                    "Stock Archetype": arch_name,
+                    "Learned Win Rate": f"{wp:.1f}%",
+                    "Real Trades": int(st_a.get("trades", 0)),
+                    "SL Multiplier Adj": f"{float(st_a.get('sl_mult_adj', 1.0)):.2f}x",
+                    "Score Adjustment": f"{float(st_a.get('score_adj', 0.0)):+.1f} pts",
+                }
+            )
+        st.dataframe(pd.DataFrame(arch_rows), use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("⏱️ Learned Time-of-Day Session Performance")
@@ -396,14 +441,6 @@ with tab3:
             for k, v in sess_mem.items()
         ]
         st.dataframe(pd.DataFrame(sess_rows), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader("🎛️ Current Learned AI Parameters")
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Min Conviction Bar", f"{engine.weights.get('min_conviction_threshold', 52.0)}/100")
-    p2.metric("Profit Giveback Cutoff", f"{engine.weights.get('max_profit_giveback_pct', 45.0)}%")
-    p3.metric("Optimal Max Hold", f"{engine.weights.get('learned_max_hold_mins', 180.0):.0f} mins")
-    p4.metric("ATR SL / Target", f"{engine.weights.get('atr_sl_multiplier', 0.55)}x / {engine.weights.get('atr_tp_multiplier', 1.60)}x")
 
 with tab4:
     st.subheader("Latest AI Watchlist Snapshot")

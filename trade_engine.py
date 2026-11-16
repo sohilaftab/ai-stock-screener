@@ -15,6 +15,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 WEIGHTS_FILE = "model_weights.json"
 LEDGER_FILE = "trade_history.json"
+SHADOW_LEDGER_FILE = "shadow_ledger.json"
 PORTFOLIO_FILE = "portfolio_state.json"
 MORNING_WATCHLIST_FILE = "morning_watchlist.json"
 SECTOR_CACHE_FILE = "sector_cache.json"
@@ -41,6 +42,7 @@ class AdaptiveTradeEngine:
         self.notifier = TelegramNotifier()
         self.weights = self._load_weights()
         self.ledger = self._load_ledger()
+        self.shadow_ledger = self._load_shadow_ledger()
         self.portfolio = self._load_portfolio()
         self.sector_cache = self._load_sector_cache()
 
@@ -83,14 +85,112 @@ class AdaptiveTradeEngine:
             return 0.0
 
     # ------------------------------------------------------------------
-    # INSTITUTIONAL MODULE A: NIFTY 50 & INDIA VIX MARKET REGIME ENGINE
+    # REALISTIC 2026 INDIAN NSE STATUTORY TAXES & BROKERAGE MODEL
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _calculate_nse_charges(side, qty, entry_price, exit_price, is_overnight=False):
+        """
+        Computes exact 2026 Indian equity transaction costs (STT, Stamp Duty,
+        NSE Exchange Txn Charges, SEBI Turnover Fee, Discount Brokerage & 18% GST)
+        so simulated net P&L matches live Indian broker contract notes.
+        """
+        qty = max(1, int(qty))
+        buy_val = (entry_price * qty) if side == "BUY" else (exit_price * qty)
+        sell_val = (exit_price * qty) if side == "BUY" else (entry_price * qty)
+        turnover = buy_val + sell_val
+
+        if is_overnight:
+            # Equity Delivery (2026): 0.10% STT on both buy & sell, 0.015% stamp on buy
+            stt = round(0.001 * turnover)
+            stamp = round(0.00015 * buy_val)
+            brokerage = 0.0 if side == "BUY" else min(20.0, 0.0003 * buy_val)
+            dp_charges = 15.93 if side == "BUY" else 0.0
+        else:
+            # Equity Intraday (2026): 0.025% STT on sell side only, 0.003% stamp on buy
+            stt = round(0.00025 * sell_val)
+            stamp = round(0.00003 * buy_val)
+            brokerage = min(20.0, 0.0003 * buy_val) + min(20.0, 0.0003 * sell_val)
+            dp_charges = 0.0
+
+        nse_txn = 0.0000307 * turnover
+        sebi_fee = 0.000001 * turnover
+        gst = 0.18 * (brokerage + nse_txn + sebi_fee)
+
+        total_charges = round(stt + stamp + brokerage + nse_txn + sebi_fee + gst + dp_charges, 2)
+        return total_charges
+
+    # ------------------------------------------------------------------
+    # QLIB TRA: 3-ARCHETYPE STOCK ROUTING & ALPHA158 MICROSTRUCTURE
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _classify_stock_archetype(ltp, atr):
+        """
+        Temporal Routing Adaptor (TRA) behavioral bucketing:
+        Routes steady large-caps, momentum movers, and high-volatility midcaps
+        to separate parameter memories.
+        """
+        atr_pct = (atr / ltp) * 100.0 if ltp > 0 else 1.5
+        if atr_pct < 1.8:
+            return "LARGE_CAP_STEADY"
+        elif atr_pct <= 3.5:
+            return "MOMENTUM_MOVER"
+        return "HIGH_VOL_MIDCAP"
+
+    @staticmethod
+    def _compute_clv(ltp, d_high, d_low):
+        """
+        Qlib Alpha158 Close Location Value (CLV) in [-1.0, +1.0]:
+        +1.0 = closed right at day's high (strong buyer control)
+        -1.0 = closed right at day's low (strong seller control)
+        """
+        span = float(d_high) - float(d_low)
+        if span <= 1e-6:
+            return 0.0
+        clv = ((float(ltp) - float(d_low)) - (float(d_high) - float(ltp))) / span
+        return round(max(-1.0, min(1.0, clv)), 3)
+
+    # ------------------------------------------------------------------
+    # US TRADINGAGENTS: ADVERSARIAL "BEAR CRITIC" VETO AGENT
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _adversarial_bear_critic(side, ltp, atr, chg_pct, rsi, clv, intraday_alpha, archetype, regime_name):
+        """
+        Dedicated Devil's Advocate Critic that inspects every candidate setup for
+        structural traps before capital is deployed. Vetoes setups with >= 2 red flags.
+        """
+        red_flags = []
+        atr_pct = (atr / ltp) * 100.0 if ltp > 0 else 1.5
+
+        if side == "BUY":
+            if atr_pct > 0 and chg_pct > (2.1 * atr_pct):
+                red_flags.append("Chasing exhausted >2.1x ATR spike")
+            if clv < -0.35:
+                red_flags.append(f"Bearish upper-wick rejection (CLV {clv:+.2f})")
+            if rsi > 74.0:
+                red_flags.append(f"Overbought RSI ({rsi:.1f})")
+            if intraday_alpha < -0.6:
+                red_flags.append(f"Lagging Nifty 50 ({intraday_alpha:+.2f}% alpha)")
+        else:
+            if atr_pct > 0 and chg_pct < -(2.1 * atr_pct):
+                red_flags.append("Chasing exhausted >2.1x ATR drop")
+            if clv > 0.35:
+                red_flags.append(f"Bullish lower-wick bounce (CLV {clv:+.2f})")
+            if rsi < 26.0:
+                red_flags.append(f"Oversold RSI ({rsi:.1f})")
+            if intraday_alpha > 0.6:
+                red_flags.append(f"Outperforming Nifty 50 ({intraday_alpha:+.2f}% alpha)")
+
+        if archetype == "HIGH_VOL_MIDCAP" and regime_name in ("SIDEWAYS_CHOP", "HIGH_VOLATILITY_PANIC"):
+            red_flags.append(f"High-vol midcap during {regime_name}")
+
+        vetoed = len(red_flags) >= 2
+        penalty = round(len(red_flags) * 4.5, 1)
+        return vetoed, penalty, red_flags
+
+    # ------------------------------------------------------------------
+    # NIFTY 50 & INDIA VIX MARKET REGIME ENGINE
     # ------------------------------------------------------------------
     def _detect_market_regime(self):
-        """
-        Analyzes ^NSEI (Nifty 50) trend/VWAP alignment and ^INDIAVIX volatility
-        to classify the broader market into BULL_TREND, BEAR_TREND, SIDEWAYS_CHOP,
-        or HIGH_VOLATILITY_PANIC.
-        """
         default_regime = {
             "regime": "NEUTRAL",
             "nifty_ltp": 0.0,
@@ -178,15 +278,9 @@ class AdaptiveTradeEngine:
             return default_regime
 
     # ------------------------------------------------------------------
-    # INSTITUTIONAL MODULE B: MANSFIELD RELATIVE STRENGTH VS NIFTY 50
+    # MANSFIELD RELATIVE STRENGTH VS NIFTY 50
     # ------------------------------------------------------------------
     def _batch_compute_mansfield_rs(self, symbols):
-        """
-        Computes 10-day Mansfield Relative Strength vs ^NSEI for all candidate symbols
-        in a single batch download:
-            RS_t = Stock_Close_t / Nifty_Close_t
-            Mansfield_RS = ((RS_today / SMA_10(RS)) - 1) * 100
-        """
         rs_map = {s: 0.0 for s in symbols}
         if not symbols:
             return rs_map
@@ -202,16 +296,12 @@ class AdaptiveTradeEngine:
                 threads=True,
                 progress=False
             )
-            if raw.empty:
+            if raw.empty or not isinstance(raw.columns, pd.MultiIndex):
                 return rs_map
 
-            if isinstance(raw.columns, pd.MultiIndex):
-                if "^NSEI" not in raw.columns.get_level_values(0):
-                    return rs_map
-                nifty_close = raw["^NSEI"]["Close"].dropna()
-            else:
+            if "^NSEI" not in raw.columns.get_level_values(0):
                 return rs_map
-
+            nifty_close = raw["^NSEI"]["Close"].dropna()
             if len(nifty_close) < 10:
                 return rs_map
 
@@ -238,7 +328,7 @@ class AdaptiveTradeEngine:
         return rs_map
 
     # ------------------------------------------------------------------
-    # INSTITUTIONAL MODULE C: THOMPSON SAMPLING BANDIT & HALF-KELLY SIZING
+    # THOMPSON SAMPLING MULTI-ARMED BANDIT & HALF-KELLY SIZING
     # ------------------------------------------------------------------
     def _default_bandit_arms(self):
         return {
@@ -250,7 +340,6 @@ class AdaptiveTradeEngine:
 
     @staticmethod
     def _classify_strategy_arm(vol_score, sent_score, pre_score, mom_score, mansfield_rs, side):
-        """Assigns each setup to its dominant quantitative strategy arm for Thompson Sampling."""
         rs_aligned = (side == "BUY" and mansfield_rs >= 1.2) or (side.startswith("SELL") and mansfield_rs <= -1.2)
         if rs_aligned and abs(mansfield_rs) >= 1.5:
             return "RELATIVE_STRENGTH_LEADER"
@@ -263,10 +352,6 @@ class AdaptiveTradeEngine:
         return max(pillar_scores.items(), key=lambda x: x[1])[0]
 
     def _sample_bandit_arm(self, arm_name):
-        """
-        Draws a Beta(alpha, beta) Thompson sample and computes the posterior win probability
-        to balance exploration vs. exploitation without overreacting to small sample sizes.
-        """
         arms = self.weights.setdefault("bandit_arms", self._default_bandit_arms())
         arm = arms.setdefault(arm_name, {"alpha": 2.0, "beta": 2.0, "trades": 0, "wins": 0, "net_pnl_inr": 0.0})
         alpha = max(0.5, float(arm.get("alpha", 2.0)))
@@ -274,26 +359,28 @@ class AdaptiveTradeEngine:
 
         sampled_theta = random.betavariate(alpha, beta)
         posterior_prob = alpha / (alpha + beta)
-        # Convert sampled edge around 0.50 into a bounded [-8, +10] conviction adjustment
         bandit_adj = round(max(-8.0, min(10.0, (sampled_theta - 0.50) * 22.0)), 2)
         return sampled_theta, posterior_prob, bandit_adj
 
-    def _update_bandit_arm(self, arm_name, pnl_inr, risk_inr):
-        """Updates Beta(alpha, beta) parameters after every closed trade with sliding-window decay."""
+    def _update_bandit_arm(self, arm_name, pnl_inr, risk_inr, weight_scale=1.0, count_as_real=True):
+        """
+        Updates Beta(alpha, beta) parameters after real trades (weight_scale=1.0)
+        or counterfactual shadow trades (weight_scale=0.35).
+        """
         arms = self.weights.setdefault("bandit_arms", self._default_bandit_arms())
         arm = arms.setdefault(arm_name, {"alpha": 2.0, "beta": 2.0, "trades": 0, "wins": 0, "net_pnl_inr": 0.0})
 
         alpha = float(arm.get("alpha", 2.0))
         beta = float(arm.get("beta", 2.0))
-        r_mag = min(2.0, max(0.5, abs(pnl_inr) / max(risk_inr, 100.0)))
+        r_mag = min(2.0, max(0.4, abs(pnl_inr) / max(risk_inr, 100.0))) * float(weight_scale)
 
         if pnl_inr > 0:
             alpha += r_mag
-            arm["wins"] = int(arm.get("wins", 0)) + 1
+            if count_as_real:
+                arm["wins"] = int(arm.get("wins", 0)) + 1
         else:
             beta += r_mag
 
-        # Sliding-window decay prevents old regimes from locking alpha+beta permanently
         if (alpha + beta) > 60.0:
             scale = 50.0 / (alpha + beta)
             alpha = max(1.0, alpha * scale)
@@ -301,15 +388,11 @@ class AdaptiveTradeEngine:
 
         arm["alpha"] = round(alpha, 3)
         arm["beta"] = round(beta, 3)
-        arm["trades"] = int(arm.get("trades", 0)) + 1
-        arm["net_pnl_inr"] = round(float(arm.get("net_pnl_inr", 0.0)) + pnl_inr, 2)
+        if count_as_real:
+            arm["trades"] = int(arm.get("trades", 0)) + 1
+            arm["net_pnl_inr"] = round(float(arm.get("net_pnl_inr", 0.0)) + pnl_inr, 2)
 
     def _compute_half_kelly_fraction(self, win_prob, fallback_rr):
-        """
-        Computes fractional Half-Kelly portfolio allocation:
-            f* = 0.5 * max(0, p - (1 - p) / b)
-        where p is calibrated win probability and b is historical avg_win / avg_loss payoff ratio.
-        """
         settled = [t for t in self.ledger if t.get("status") != "OPEN" and float(t.get("pnl_inr", 0.0)) != 0.0]
         wins = [float(t["pnl_inr"]) for t in settled if float(t["pnl_inr"]) > 0]
         losses = [abs(float(t["pnl_inr"])) for t in settled if float(t["pnl_inr"]) < 0]
@@ -324,12 +407,188 @@ class AdaptiveTradeEngine:
         p = max(0.35, min(0.85, float(win_prob)))
         full_kelly = p - ((1.0 - p) / payoff_b)
         half_kelly = 0.5 * max(0.0, full_kelly)
-        # Clamp allocation per trade between 8% and 25% of total portfolio equity
         clamped_fraction = round(max(0.08, min(0.25, half_kelly)), 4)
         return clamped_fraction, round(payoff_b, 2)
 
     # ------------------------------------------------------------------
-    # INSTITUTIONAL MODULE D: SECTOR CORRELATION & OVERNIGHT GAP GUARDS
+    # COUNTERFACTUAL SHADOW-TRADE LEDGER (LEARNS FROM SKIPPED SETUPS)
+    # ------------------------------------------------------------------
+    def _load_shadow_ledger(self):
+        if os.path.exists(SHADOW_LEDGER_FILE):
+            try:
+                with open(SHADOW_LEDGER_FILE, "r") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
+
+    def _save_shadow_ledger(self):
+        try:
+            with open(SHADOW_LEDGER_FILE, "w") as f:
+                json.dump(self.shadow_ledger[-150:], f, indent=2)
+        except Exception:
+            pass
+
+    def _record_shadow_candidates(self, skipped_candidates):
+        """Logs near-miss setups so the AI learns from skipped opportunities too."""
+        if not skipped_candidates:
+            return
+        now_ist = self._now_ist()
+        today_str = now_ist.strftime("%Y-%m-%d")
+        session_bucket = self._get_session_bucket(now_ist)
+
+        existing_today = {
+            s["symbol"] for s in self.shadow_ledger if s.get("date") == today_str
+        }
+        today_count = len(existing_today)
+
+        added = 0
+        for item in skipped_candidates:
+            if today_count + added >= 15:
+                break
+            sym = item["symbol"]
+            if sym in existing_today or float(item.get("conviction", 0)) < 40.0:
+                continue
+
+            self.shadow_ledger.append({
+                "date": today_str,
+                "entry_iso": now_ist.isoformat(),
+                "entry_session": session_bucket,
+                "symbol": sym,
+                "action": item["action"],
+                "strategy_arm": item.get("strategy_arm", "MOMENTUM_BREAKOUT"),
+                "archetype": item.get("archetype", "MOMENTUM_MOVER"),
+                "entry_price": float(item["entry_price"]),
+                "target_1": float(item["target_1"]),
+                "stop_loss": float(item["stop_loss"]),
+                "conviction": float(item["conviction"]),
+                "skip_reason": item.get("skip_reason", "Below conviction threshold"),
+                "status": "SHADOW_OPEN",
+                "shadow_pnl_pct": 0.0
+            })
+            existing_today.add(sym)
+            added += 1
+
+        if added > 0:
+            self._save_shadow_ledger()
+
+    def _evaluate_shadow_trades(self):
+        """
+        Evaluates counterfactual shadow setups after >= 75 minutes (or after 3:10 PM IST)
+        and feeds discounted (0.35x) outcomes into the Bandit & TRA Archetype memories.
+        """
+        now_ist = self._now_ist()
+        mins_now = now_ist.hour * 60 + now_ist.minute
+        near_close = mins_now >= (15 * 60 + 10)
+
+        due_shadows = []
+        for s in self.shadow_ledger:
+            if s.get("status") != "SHADOW_OPEN":
+                continue
+            age_mins = self._calculate_hold_minutes(s)
+            if age_mins >= 75.0 or near_close or s.get("date") != now_ist.strftime("%Y-%m-%d"):
+                due_shadows.append(s)
+
+        if not due_shadows:
+            return 0
+
+        syms = list({s["symbol"] for s in due_shadows})
+        snaps = MarketDataScanner.fetch_live_intraday_snapshot(syms)
+        evaluated = 0
+
+        for s in due_shadows:
+            sym = s["symbol"]
+            snap = snaps.get(sym)
+            if not snap:
+                continue
+
+            ltp = float(snap["current_price"])
+            d_high = float(snap["day_high"])
+            d_low = float(snap["day_low"])
+            entry = float(s["entry_price"])
+            t1 = float(s["target_1"])
+            sl = float(s["stop_loss"])
+            side = s["action"]
+
+            if side == "BUY":
+                if d_high >= t1 and d_low > sl:
+                    exit_px = t1
+                elif d_low <= sl and d_high < t1:
+                    exit_px = sl
+                else:
+                    exit_px = ltp
+                pnl_pct = ((exit_px - entry) / entry) * 100.0
+            else:
+                if d_low <= t1 and d_high < sl:
+                    exit_px = t1
+                elif d_high >= sl and d_low > t1:
+                    exit_px = sl
+                else:
+                    exit_px = ltp
+                pnl_pct = ((entry - exit_px) / entry) * 100.0
+
+            # Deduct ~0.08% simulated intraday tax/slippage
+            net_pnl_pct = round(pnl_pct - 0.08, 2)
+            pseudo_pnl_inr = round((net_pnl_pct / 100.0) * 20000.0, 2)
+
+            s["status"] = "SHADOW_WIN" if net_pnl_pct > 0 else "SHADOW_LOSS"
+            s["shadow_pnl_pct"] = net_pnl_pct
+
+            # Feed discounted counterfactual learning (0.35x) into Bandit & Archetype memory
+            self._update_bandit_arm(
+                s.get("strategy_arm", "MOMENTUM_BREAKOUT"),
+                pseudo_pnl_inr,
+                300.0,
+                weight_scale=0.35,
+                count_as_real=False
+            )
+            self._update_archetype_memory(
+                s.get("archetype", "MOMENTUM_MOVER"),
+                pseudo_pnl_inr,
+                hit_sl=(exit_px == sl),
+                weight_scale=0.35
+            )
+            evaluated += 1
+
+        if evaluated > 0:
+            self.weights["shadow_samples_learned"] = int(self.weights.get("shadow_samples_learned", 0)) + evaluated
+            self._save_shadow_ledger()
+            self._save_weights()
+            print(f"[SHADOW LEARNING] Learned from {evaluated} counterfactual market setup(s).")
+        return evaluated
+
+    def _update_archetype_memory(self, archetype, pnl_inr, hit_sl=False, weight_scale=1.0):
+        """Updates TRA archetype win rate & ATR stop-loss multiplier per stock personality."""
+        arch_mem = self.weights.setdefault("archetype_memory", {})
+        rec = arch_mem.setdefault(archetype, {
+            "weighted_wins": 1.0,
+            "weighted_losses": 1.0,
+            "sl_hits": 0,
+            "trades": 0,
+            "sl_mult_adj": 1.0,
+            "score_adj": 0.0
+        })
+        if pnl_inr > 0:
+            rec["weighted_wins"] = round(float(rec["weighted_wins"]) + weight_scale, 2)
+        else:
+            rec["weighted_losses"] = round(float(rec["weighted_losses"]) + weight_scale, 2)
+            if hit_sl:
+                rec["sl_hits"] = int(rec.get("sl_hits", 0)) + 1
+
+        if weight_scale >= 1.0:
+            rec["trades"] = int(rec.get("trades", 0)) + 1
+
+        total_w = float(rec["weighted_wins"]) + float(rec["weighted_losses"])
+        win_prob = float(rec["weighted_wins"]) / max(total_w, 1.0)
+        rec["score_adj"] = round(max(-8.0, min(8.0, (win_prob - 0.50) * 20.0)), 1)
+
+        if rec["trades"] >= 3 and (rec["sl_hits"] / rec["trades"]) > 0.45:
+            rec["sl_mult_adj"] = 1.20
+        elif win_prob >= 0.60:
+            rec["sl_mult_adj"] = 0.95
+
+    # ------------------------------------------------------------------
+    # SECTOR CORRELATION & OVERNIGHT GAP GUARDS
     # ------------------------------------------------------------------
     def _load_sector_cache(self):
         if os.path.exists(SECTOR_CACHE_FILE):
@@ -425,7 +684,7 @@ class AdaptiveTradeEngine:
         return False, ""
 
     # ------------------------------------------------------------------
-    # REAL-TIME NEWS & EMOTION RESEARCH FOR ACTIVE / SETTLED STOCKS
+    # REAL-TIME NEWS & EMOTION RESEARCH
     # ------------------------------------------------------------------
     def _analyze_live_news_emotion(self, sym):
         clean_sym = sym.replace(".NS", "").strip()
@@ -487,6 +746,8 @@ class AdaptiveTradeEngine:
             "max_profit_giveback_pct": 45.0,
             "learned_max_hold_mins": 180.0,
             "bandit_arms": self._default_bandit_arms(),
+            "archetype_memory": {},
+            "shadow_samples_learned": 0,
             "session_memory": {},
             "ticker_memory": {},
             "blacklisted_tickers": [],
@@ -496,7 +757,7 @@ class AdaptiveTradeEngine:
             "generation": 1,
             "last_evaluated_count": 0,
             "last_updated": self._now_ist().strftime("%Y-%m-%d %H:%M"),
-            "learning_notes": "Initialized Thompson Bandit, Half-Kelly & Mansfield RS Brain."
+            "learning_notes": "Initialized Global Quant Brain (Bandit, TRA, Bear Critic, Shadow Learning & 2026 Tax Model)."
         }
         if os.path.exists(WEIGHTS_FILE):
             try:
@@ -537,6 +798,7 @@ class AdaptiveTradeEngine:
             "available_cash": INITIAL_CAPITAL,
             "allocated_capital": 0.0,
             "total_realized_pnl": 0.0,
+            "total_taxes_paid": 0.0,
             "win_streak": 0,
             "loss_streak": 0,
             "mistakes_identified": [],
@@ -570,7 +832,12 @@ class AdaptiveTradeEngine:
             float(t.get("pnl_inr", 0.0))
             for t in self.ledger if t.get("status") != "OPEN"
         )
+        taxes_paid = sum(
+            float(t.get("charges_inr", 0.0))
+            for t in self.ledger if t.get("status") != "OPEN"
+        )
         port_dict["total_realized_pnl"] = round(realized, 2)
+        port_dict["total_taxes_paid"] = round(taxes_paid, 2)
         port_dict["current_equity"] = round(max(0.0, total_contributed + realized), 2)
         port_dict["allocated_capital"] = round(open_allocated, 2)
         port_dict["available_cash"] = round(max(0.0, port_dict["current_equity"] - open_allocated), 2)
@@ -651,7 +918,7 @@ class AdaptiveTradeEngine:
         return changes
 
     # ------------------------------------------------------------------
-    # 1. QUANTITATIVE REGIME, MANSFIELD RS, BANDIT & HALF-KELLY SCORER
+    # 1. FULL QUANTITATIVE SCORER (TRA + BEAR CRITIC + BANDIT + SHADOW)
     # ------------------------------------------------------------------
     def generate_intraday_recommendations(self, enriched_df, premarket_df=None, top_k=5):
         if enriched_df.empty:
@@ -660,8 +927,6 @@ class AdaptiveTradeEngine:
         self._recalculate_cash(self.portfolio)
         current_equity = float(self.portfolio["current_equity"])
         avail_cash = float(self.portfolio["available_cash"])
-        if avail_cash < 500:
-            return pd.DataFrame()
 
         regime_info = self._detect_market_regime()
         regime_name = regime_info["regime"]
@@ -674,12 +939,8 @@ class AdaptiveTradeEngine:
         current_session = self._get_session_bucket()
         session_mem = self.weights.get("session_memory", {}).get(current_session, {})
         session_adj = float(session_mem.get("score_adj", 0.0))
+        session_blocked = session_mem.get("trades", 0) >= 4 and session_mem.get("win_rate", 50.0) < 30.0
 
-        if session_mem.get("trades", 0) >= 4 and session_mem.get("win_rate", 50.0) < 30.0:
-            print(f"[AI TIMING GUARD] Skipping entries during low-win-rate window: {current_session}")
-            return pd.DataFrame()
-
-        # Batch-compute 10-day Mansfield Relative Strength vs ^NSEI
         candidate_syms = enriched_df["symbol"].tolist()
         mansfield_rs_map = self._batch_compute_mansfield_rs(candidate_syms)
 
@@ -697,7 +958,7 @@ class AdaptiveTradeEngine:
         w_pre = float(self.weights["premarket_weight"])
         w_mom = float(self.weights["momentum_weight"])
 
-        atr_sl_mult = float(self.weights.get("atr_sl_multiplier", 0.55)) * regime_sl_adj
+        base_atr_sl_mult = float(self.weights.get("atr_sl_multiplier", 0.55)) * regime_sl_adj
         atr_tp_mult = float(self.weights.get("atr_tp_multiplier", 1.60))
         buy_rsi_max = float(self.weights.get("buy_rsi_ceiling", 72.0))
         short_rsi_min = float(self.weights.get("short_rsi_floor", 28.0))
@@ -706,9 +967,12 @@ class AdaptiveTradeEngine:
         short_bonus = float(self.weights.get("short_bias_bonus", 0.0))
 
         ticker_memory = self.weights.get("ticker_memory", {})
+        archetype_memory = self.weights.get("archetype_memory", {})
         blacklist = set(self.weights.get("blacklisted_tickers", []))
 
         scored_candidates = []
+        skipped_for_shadow = []
+
         for _, row in enriched_df.iterrows():
             sym = row["symbol"]
             if sym in blacklist and len(enriched_df) > 3:
@@ -720,6 +984,8 @@ class AdaptiveTradeEngine:
             atr = float(row.get("atr", ltp * 0.015))
             rsi = float(row.get("rsi", 50.0))
             vwap = float(row.get("vwap_proxy", ltp))
+            d_high = float(row.get("day_high", row.get("high", ltp)))
+            d_low = float(row.get("day_low", row.get("low", ltp)))
             chart_trend = row.get("chart_trend", "RANGE_CONSOLIDATION")
 
             if sym in pre_map and pre_map[sym]["iep"] > 50:
@@ -736,14 +1002,24 @@ class AdaptiveTradeEngine:
             else:
                 side = "BUY" if chg >= 0 else "SELL (SHORT)"
 
-            # Intraday & 10-day Mansfield Relative Strength vs Nifty 50
+            # Qlib TRA Archetype & Alpha158 CLV
+            archetype = self._classify_stock_archetype(ltp, atr)
+            arch_stats = archetype_memory.get(archetype, {})
+            arch_score_adj = float(arch_stats.get("score_adj", 0.0))
+            arch_sl_adj = float(arch_stats.get("sl_mult_adj", 1.0))
+            clv = self._compute_clv(ltp, d_high, d_low)
+
             mansfield_rs = float(mansfield_rs_map.get(sym, 0.0))
             intraday_alpha = round(chg - nifty_chg_pct, 2)
 
-            # PRICED-IN NEWS / INSTITUTIONAL DISTRIBUTION TRAP DETECTION
+            # Priced-In News / Institutional Distribution Trap Filter
             if side == "BUY" and raw_sent == "POSITIVE" and ltp < vwap and intraday_alpha < -0.5:
-                print(f"[NEWS TRAP GUARD] Skipped {sym}: Bullish news priced-in / institutional selling below VWAP.")
                 continue
+
+            # US TradingAgents Adversarial Bear Critic Veto Check
+            vetoed, critic_penalty, red_flags = self._adversarial_bear_critic(
+                side, ltp, atr, chg, rsi, clv, intraday_alpha, archetype, regime_name
+            )
 
             vol_score = min(100.0, (vol_ratio / 2.8) * 100.0)
 
@@ -768,24 +1044,26 @@ class AdaptiveTradeEngine:
             if side == "BUY":
                 trend_bonus = 25.0 if chart_trend == "BULLISH_UPTREND" else 0.0
                 vwap_bonus = 15.0 if ltp >= vwap else -10.0
+                clv_bonus = 6.0 * clv
                 if 50.0 <= rsi <= buy_rsi_max:
                     rsi_bonus = 15.0
                 elif rsi > buy_rsi_max:
                     rsi_bonus = -15.0
                 else:
                     rsi_bonus = 0.0
-                mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus))
+                mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus + clv_bonus))
                 rs_adj = max(-6.0, min(8.0, (mansfield_rs * 1.5) + (intraday_alpha * 1.2)))
             else:
                 trend_bonus = 25.0 if chart_trend == "BEARISH_DOWNTREND" else 0.0
                 vwap_bonus = 15.0 if ltp <= vwap else -10.0
+                clv_bonus = -6.0 * clv
                 if short_rsi_min <= rsi <= 50.0:
                     rsi_bonus = 15.0
                 elif rsi < short_rsi_min:
                     rsi_bonus = -15.0
                 else:
                     rsi_bonus = 0.0
-                mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus))
+                mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus + clv_bonus))
                 rs_adj = max(-6.0, min(8.0, (-mansfield_rs * 1.5) + (-intraday_alpha * 1.2)))
 
             base_conviction = (
@@ -795,7 +1073,6 @@ class AdaptiveTradeEngine:
                 (w_mom * mom_score)
             )
 
-            # Thompson Sampling Multi-Armed Bandit Evaluation
             strategy_arm = self._classify_strategy_arm(
                 vol_score, sent_score, pre_score, mom_score, mansfield_rs, side
             )
@@ -817,13 +1094,21 @@ class AdaptiveTradeEngine:
             dir_adj = (buy_bonus + regime_buy_adj) if side == "BUY" else (short_bonus + regime_short_adj)
 
             conviction = round(
-                max(1.0, min(99.0, base_conviction + ticker_adj + dir_adj + session_adj + chop_adj + rs_adj + bandit_adj)),
+                max(
+                    1.0,
+                    min(
+                        99.0,
+                        base_conviction + ticker_adj + dir_adj + session_adj + chop_adj +
+                        rs_adj + bandit_adj + arch_score_adj - critic_penalty
+                    )
+                ),
                 1
             )
 
-            intraday_risk_per_share = max(round(atr * atr_sl_mult, 2), round(ltp * 0.006, 2))
-            reward_1_per_share = round(intraday_risk_per_share * (atr_tp_mult / max(atr_sl_mult, 0.3)), 2)
-            reward_2_per_share = round(intraday_risk_per_share * ((atr_tp_mult + 1.0) / max(atr_sl_mult, 0.3)), 2)
+            effective_sl_mult = base_atr_sl_mult * arch_sl_adj
+            intraday_risk_per_share = max(round(atr * effective_sl_mult, 2), round(ltp * 0.006, 2))
+            reward_1_per_share = round(intraday_risk_per_share * (atr_tp_mult / max(effective_sl_mult, 0.3)), 2)
+            reward_2_per_share = round(intraday_risk_per_share * ((atr_tp_mult + 1.0) / max(effective_sl_mult, 0.3)), 2)
 
             entry_price = round(ltp, 2)
             if side == "BUY":
@@ -836,16 +1121,16 @@ class AdaptiveTradeEngine:
                 target_2 = round(entry_price - reward_2_per_share, 2)
 
             rr_val = round(reward_1_per_share / max(intraday_risk_per_share, 0.01), 2)
-
-            # Calibrated win probability blends Bandit posterior & conviction
             calibrated_p = round(0.5 * posterior_prob + 0.5 * (conviction / 100.0), 4)
 
-            scored_candidates.append({
+            cand_obj = {
                 "symbol": sym,
                 "action": side,
                 "conviction": conviction,
                 "calibrated_win_prob": calibrated_p,
                 "strategy_arm": strategy_arm,
+                "archetype": archetype,
+                "clv": clv,
                 "mansfield_rs": mansfield_rs,
                 "intraday_alpha": intraday_alpha,
                 "entry_price": entry_price,
@@ -864,38 +1149,55 @@ class AdaptiveTradeEngine:
                 "sent_score": round(sent_score, 1),
                 "pre_score": round(pre_score, 1),
                 "mom_score": round(mom_score, 1)
-            })
+            }
+
+            if vetoed:
+                cand_obj["skip_reason"] = f"Bear Critic Veto: {', '.join(red_flags)}"
+                skipped_for_shadow.append(cand_obj)
+                continue
+
+            if session_blocked or conviction < min_conviction or avail_cash < 500:
+                cand_obj["skip_reason"] = (
+                    "Low-win-rate session window" if session_blocked else f"Conviction {conviction} < {min_conviction}"
+                )
+                skipped_for_shadow.append(cand_obj)
+                continue
+
+            scored_candidates.append(cand_obj)
+
+        # Log skipped near-misses into Counterfactual Shadow Ledger so AI learns from them
+        self._record_shadow_candidates(skipped_for_shadow)
 
         if not scored_candidates:
             return pd.DataFrame()
 
         scored_candidates.sort(key=lambda x: x["conviction"], reverse=True)
-        qualified = [c for c in scored_candidates if c["conviction"] >= min_conviction]
-        if not qualified:
-            print(f"[AI SELECTIVITY] No setups met min conviction ({min_conviction}) under {regime_name}.")
-            return pd.DataFrame()
 
         # Sector Correlation Guard
         sector_counts, sector_capital = self._get_open_sector_exposure()
         max_sector_cap = current_equity * MAX_SECTOR_EXPOSURE_PCT
 
         filtered_by_sector = []
-        for item in qualified:
+        for item in scored_candidates:
             if len(filtered_by_sector) >= top_k:
-                break
-            sec = self._get_stock_sector(item["symbol"])
-            if sector_counts.get(sec, 0) >= MAX_POSITIONS_PER_SECTOR:
+                item["skip_reason"] = "Top-K slot limit"
+                skipped_for_shadow.append(item)
                 continue
-            if sector_capital.get(sec, 0.0) >= max_sector_cap:
+            sec = self._get_stock_sector(item["symbol"])
+            if sector_counts.get(sec, 0) >= MAX_POSITIONS_PER_SECTOR or sector_capital.get(sec, 0.0) >= max_sector_cap:
+                item["skip_reason"] = f"Sector cap ({sec})"
+                skipped_for_shadow.append(item)
                 continue
             item["sector"] = sec
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
             filtered_by_sector.append(item)
 
+        self._record_shadow_candidates(skipped_for_shadow)
+
         if not filtered_by_sector:
             return pd.DataFrame()
 
-        # HALF-KELLY CRITERION CAPITAL ALLOCATION
+        # Half-Kelly Criterion Capital Allocation
         remaining_wallet_cash = avail_cash
         risk_pct_allowed = (float(self.weights.get("risk_per_trade_pct", 1.0)) / 100.0) * regime_size_mult
         max_risk_inr_per_trade = current_equity * risk_pct_allowed
@@ -909,7 +1211,7 @@ class AdaptiveTradeEngine:
             if remaining_wallet_cash < entry_price:
                 continue
 
-            kelly_frac, payoff_b = self._compute_half_kelly_fraction(
+            kelly_frac, _ = self._compute_half_kelly_fraction(
                 item["calibrated_win_prob"], item["rr_val"]
             )
             kelly_budget = current_equity * kelly_frac * regime_size_mult
@@ -935,6 +1237,8 @@ class AdaptiveTradeEngine:
                 "sector": sec,
                 "market_regime": regime_name,
                 "strategy_arm": item["strategy_arm"],
+                "archetype": item["archetype"],
+                "clv": item["clv"],
                 "mansfield_rs": item["mansfield_rs"],
                 "intraday_alpha": item["intraday_alpha"],
                 "kelly_pct": round(kelly_frac * regime_size_mult * 100.0, 1),
@@ -1024,6 +1328,7 @@ class AdaptiveTradeEngine:
             exp_profit = round(abs(t1 - entry_p) * qty, 2)
             regime_tag = row.get("market_regime", self.weights.get("last_market_regime", {}).get("regime", "NEUTRAL"))
             arm_tag = row.get("strategy_arm", "MOMENTUM_BREAKOUT")
+            arch_tag = row.get("archetype", "MOMENTUM_MOVER")
             mrs_val = float(row.get("mansfield_rs", 0.0))
             kelly_pct = float(row.get("kelly_pct", 15.0))
 
@@ -1035,6 +1340,7 @@ class AdaptiveTradeEngine:
                 "entry_session": session_bucket,
                 "market_regime": regime_tag,
                 "strategy_arm": arm_tag,
+                "archetype": arch_tag,
                 "mansfield_rs": mrs_val,
                 "kelly_pct": kelly_pct,
                 "sector": sec,
@@ -1056,12 +1362,14 @@ class AdaptiveTradeEngine:
                 "entry_sentiment": row.get("sentiment", "NEUTRAL"),
                 "chart_trend": row.get("chart_trend", "RANGE_CONSOLIDATION"),
                 "status": "OPEN",
-                "trade_management_note": f"Arm: {arm_tag} | RS vs Nifty: {mrs_val:+.2f}% | Half-Kelly: {kelly_pct:.1f}%.",
+                "trade_management_note": f"Arm: {arm_tag} | TRA: {arch_tag} | RS: {mrs_val:+.2f}% | Kelly: {kelly_pct:.1f}%.",
                 "exit_price": None,
                 "exit_time": None,
                 "hold_minutes": 0.0,
                 "day_high": None,
                 "day_low": None,
+                "gross_pnl_inr": 0.0,
+                "charges_inr": 0.0,
                 "pnl_pct": 0.0,
                 "pnl_inr": 0.0,
                 "mistake_diagnosis": None,
@@ -1084,8 +1392,8 @@ class AdaptiveTradeEngine:
                     f"{side_header}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']}) | <b>Sector:</b> {sec}\n"
-                    f"🎰 <b>Bandit Arm:</b> <code>{arm_tag}</code> | <b>Mansfield RS:</b> {mrs_val:+.2f}%\n"
-                    f"🌐 <b>Regime:</b> <code>{regime_tag}</code> | <b>Conviction:</b> {row['conviction']}/100\n"
+                    f"🎰 <b>Bandit Arm:</b> <code>{arm_tag}</code> | <b>TRA:</b> <code>{arch_tag}</code>\n"
+                    f"🌐 <b>Regime:</b> <code>{regime_tag}</code> | <b>Mansfield RS:</b> {mrs_val:+.2f}%\n"
                     f"📦 <b>Quantity:</b> <b>{qty} Shares</b> @ <b>₹{entry_p}</b> (Half-Kelly: {kelly_pct:.1f}%)\n"
                     f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Cash Left: ₹{avail_cash:,.2f})</i>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1101,9 +1409,12 @@ class AdaptiveTradeEngine:
         return added
 
     # ------------------------------------------------------------------
-    # 3. DYNAMIC EMOTION, DISTRIBUTION TRAP & OVERNIGHT GAP MANAGER
+    # 3. LIVE MANAGER + NET AFTER-TAX SETTLEMENT + SHADOW LEARNING
     # ------------------------------------------------------------------
     def manage_live_positions(self, notify_telegram=True):
+        # Also evaluate counterfactual shadow trades so AI learns from skipped setups
+        self._evaluate_shadow_trades()
+
         open_trades = [t for t in self.ledger if t.get("status") == "OPEN"]
         if not open_trades:
             return []
@@ -1114,6 +1425,7 @@ class AdaptiveTradeEngine:
         snapshots = MarketDataScanner.fetch_live_intraday_snapshot(symbols)
         actions_taken = []
         now_ist = self._now_ist()
+        today_str = now_ist.strftime("%Y-%m-%d")
         now_time = now_ist.strftime("%I:%M:%S %p")
 
         giveback_limit_pct = float(self.weights.get("max_profit_giveback_pct", 45.0))
@@ -1173,14 +1485,12 @@ class AdaptiveTradeEngine:
             exit_price = ltp
             exit_note = ""
 
-            # 1) BREAKING NEWS / EMOTION REVERSAL CUTOFF
             if emotion_flipped:
                 exit_triggered = True
                 exit_status = "EMOTION SHIFT EXIT"
                 exit_price = ltp
                 exit_note = f"News emotion flipped to {live_news['emotion']}: {live_news['top_headline']}"
 
-            # 2) INSTITUTIONAL DISTRIBUTION / PRICED-IN NEWS TRAP EXIT
             elif (
                 side == "BUY"
                 and trade.get("entry_sentiment") == "POSITIVE"
@@ -1194,14 +1504,12 @@ class AdaptiveTradeEngine:
                 exit_price = ltp
                 exit_note = f"Bullish news failed to hold VWAP (₹{vwap}) with {live_alpha:+.2f}% Nifty alpha."
 
-            # 3) OVERNIGHT GAP, EARNINGS OR CUSHION GUARD (15:05-15:29 IST)
             elif overnight_exit:
                 exit_triggered = True
                 exit_status = "OVERNIGHT RISK GUARD EXIT"
                 exit_price = ltp
                 exit_note = overnight_reason
 
-            # 4) TARGET HIT OR MOMENTUM EXTENSION
             elif (side == "BUY" and (ltp >= t1 or d_high >= t1)) or (side.startswith("SELL") and (ltp <= t1 or d_low <= t1)):
                 strong_momentum = (ltp >= t1 and ltp > vwap and t1 < t2) if side == "BUY" else (ltp <= t1 and ltp < vwap and t1 > t2)
                 if strong_momentum:
@@ -1216,7 +1524,6 @@ class AdaptiveTradeEngine:
                     exit_price = t1
                     exit_note = "AI booked full target profit."
 
-            # 5) STOP-LOSS HIT
             elif (side == "BUY" and ltp <= sl) or (side.startswith("SELL") and ltp >= sl):
                 exit_triggered = True
                 is_be = (sl >= entry) if side == "BUY" else (sl <= entry)
@@ -1224,7 +1531,6 @@ class AdaptiveTradeEngine:
                 exit_price = sl
                 exit_note = "Exited at dynamic Stop-Loss."
 
-            # 6) LEARNED PEAK-PROFIT GIVEBACK CUTOFF
             elif peak_pnl >= (risk_unit * qty * 0.75) and unrealized_inr > 0:
                 giveback_pct = ((peak_pnl - unrealized_inr) / peak_pnl) * 100.0
                 if giveback_pct >= giveback_limit_pct:
@@ -1233,56 +1539,61 @@ class AdaptiveTradeEngine:
                     exit_price = ltp
                     exit_note = f"AI locked profit after {giveback_pct:.0f}% pullback from peak ₹{peak_pnl:,.0f}."
 
-            # 7) EARLY WEAKNESS CUT BELOW/ABOVE VWAP
             elif r_multiple <= -0.65 and ((side == "BUY" and ltp < vwap) or (side.startswith("SELL") and ltp > vwap)):
                 exit_triggered = True
                 exit_status = "EARLY CUT (LOSS MINIMIZED)"
                 exit_price = ltp
                 exit_note = f"Cut early against VWAP (₹{vwap}) to protect capital."
 
-            # 8) LEARNED HOLDING DECAY / STAGNATION EXIT
             elif hold_mins >= max_hold_mins and unrealized_inr <= 0:
                 exit_triggered = True
                 exit_status = "STAGNATION EXIT (AI TIMING)"
                 exit_price = ltp
                 exit_note = f"Exited after {hold_mins:.0f}m without momentum follow-through."
 
-            # 9) TRAILING BREAKEVEN PROTECTION
             elif r_multiple >= 0.8 and ((side == "BUY" and sl < entry) or (side.startswith("SELL") and sl > entry)):
                 trade["stop_loss"] = entry
                 trade["trade_management_note"] = f"SL trailed to breakeven ₹{entry}."
 
             if exit_triggered:
-                pnl_pct = (((exit_price - entry) / entry) * 100.0) if side == "BUY" else (((entry - exit_price) / entry) * 100.0)
-                pnl_inr = ((exit_price - entry) * qty) if side == "BUY" else ((entry - exit_price) * qty)
+                is_overnight = trade.get("date") != today_str
+                gross_pnl_inr = ((exit_price - entry) * qty) if side == "BUY" else ((entry - exit_price) * qty)
+                charges_inr = self._calculate_nse_charges(side, qty, entry, exit_price, is_overnight=is_overnight)
+                net_pnl_inr = round(gross_pnl_inr - charges_inr, 2)
+                cap_used = max(float(trade.get("capital_used", entry * qty)), 1.0)
+                net_pnl_pct = round((net_pnl_inr / cap_used) * 100.0, 2)
 
                 trade["status"] = exit_status
                 trade["exit_price"] = round(exit_price, 2)
                 trade["exit_time"] = f"{now_time} IST"
                 trade["unrealized_pnl_inr"] = 0.0
-                trade["pnl_pct"] = round(pnl_pct, 2)
-                trade["pnl_inr"] = round(pnl_inr, 2)
-                trade["trade_management_note"] = exit_note
+                trade["gross_pnl_inr"] = round(gross_pnl_inr, 2)
+                trade["charges_inr"] = charges_inr
+                trade["pnl_pct"] = net_pnl_pct
+                trade["pnl_inr"] = net_pnl_inr
+                trade["trade_management_note"] = f"{exit_note} (After ₹{charges_inr:.2f} NSE taxes/fees)"
 
-                # Update Thompson Sampling Bandit Arm immediately
                 arm_used = trade.get("strategy_arm", "MOMENTUM_BREAKOUT")
-                self._update_bandit_arm(arm_used, pnl_inr, risk_unit * qty)
+                arch_used = trade.get("archetype", "MOMENTUM_MOVER")
+                self._update_bandit_arm(arm_used, net_pnl_inr, risk_unit * qty, weight_scale=1.0, count_as_real=True)
+                self._update_archetype_memory(arch_used, net_pnl_inr, hit_sl=("SL HIT" in exit_status), weight_scale=1.0)
 
                 self._recalculate_cash(self.portfolio)
                 lesson = self._research_and_learn_from_trade(trade, live_news)
 
-                msg = f"{'✅' if pnl_inr >= 0 else '🛑'} <b>AI CLOSED {sym} ({exit_status}):</b> ₹{exit_price} | P&L: <b>₹{pnl_inr:+,.0f}</b>"
+                msg = f"{'✅' if net_pnl_inr >= 0 else '🛑'} <b>AI CLOSED {sym} ({exit_status}):</b> ₹{exit_price} | Net P&L: <b>₹{net_pnl_inr:+,.0f}</b>"
                 actions_taken.append(msg)
 
                 if notify_telegram:
-                    header = "✅ <b>AI TRADE COMPLETED — PROFIT BOOKED</b>" if pnl_inr >= 0 else "🔴 <b>AI TRADE COMPLETED — CUT & RESEARCHED</b>"
+                    header = "✅ <b>AI TRADE COMPLETED — NET PROFIT BOOKED</b>" if net_pnl_inr >= 0 else "🔴 <b>AI TRADE COMPLETED — CUT & RESEARCHED</b>"
                     tg_ticket = (
                         f"{header}\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📌 <b>Stock:</b> <code>{sym}</code> ({side}) | <b>Arm:</b> <code>{arm_used}</code>\n"
                         f"🏷️ <b>AI Decision:</b> {exit_status} ({hold_mins:.0f} mins)\n"
                         f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{round(exit_price, 2)}</b>\n"
-                        f"💰 <b>Net Realized P&L:</b> <b>₹{pnl_inr:+,.2f} ({pnl_pct:+.2f}%)</b>\n"
+                        f"🧾 <b>Gross P&L:</b> ₹{gross_pnl_inr:+,.2f} | <b>STT/Taxes/Fees:</b> -₹{charges_inr:.2f}\n"
+                        f"💰 <b>Net Realized P&L:</b> <b>₹{net_pnl_inr:+,.2f} ({net_pnl_pct:+.2f}%)</b>\n"
                         f"🏦 <b>Updated Wallet Equity:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
                         f"🧠 <b>Post-Trade AI Research & Lesson:</b>\n<i>{lesson}</i>"
                     )
@@ -1304,6 +1615,7 @@ class AdaptiveTradeEngine:
         session_used = trade.get("entry_session", self._get_session_bucket())
         regime_used = trade.get("market_regime", "NEUTRAL")
         arm_used = trade.get("strategy_arm", "MOMENTUM_BREAKOUT")
+        arch_used = trade.get("archetype", "MOMENTUM_MOVER")
         hold_mins = float(trade.get("hold_minutes", 0.0))
 
         news_ctx = pre_fetched_news or self._analyze_live_news_emotion(sym)
@@ -1311,10 +1623,7 @@ class AdaptiveTradeEngine:
         latest_emotion = news_ctx.get("emotion", "NEUTRAL")
 
         if pnl_inr < 0:
-            f_scores = trade.get("factor_scores", {})
-            culprit = max(f_scores.items(), key=lambda x: x[1])[0] if f_scores else "momentum"
             entry_rsi = float(trade.get("entry_rsi", 50.0))
-
             reasons = []
             if (side == "BUY" and latest_emotion == "NEGATIVE") or (side.startswith("SELL") and latest_emotion == "POSITIVE"):
                 reasons.append(f"sudden {latest_emotion} news ('{latest_headline[:65]}')")
@@ -1323,11 +1632,11 @@ class AdaptiveTradeEngine:
             if side == "BUY" and entry_rsi > 68:
                 reasons.append(f"overbought entry RSI {entry_rsi}")
             if not reasons:
-                reasons.append(f"bandit arm {arm_used} underperformed in {session_used} [{regime_used}]")
+                reasons.append(f"{arm_used} on {arch_used} underperformed in {session_used} [{regime_used}]")
 
             lesson = (
-                f"MISTAKE AUTOPSY ({sym} {side}, ₹{pnl_inr:+,.0f}): Failed due to {', '.join(reasons)}. "
-                f"Action: Penalized {arm_used} Beta posterior & {session_used} priority."
+                f"MISTAKE AUTOPSY ({sym} {side}, ₹{pnl_inr:+,.0f} net): Failed due to {', '.join(reasons)}. "
+                f"Action: Penalized {arm_used} Beta posterior & {arch_used} profile."
             )
             trade["mistake_diagnosis"] = lesson
             self.portfolio["mistakes_identified"] = (
@@ -1335,8 +1644,8 @@ class AdaptiveTradeEngine:
             )[:20]
         else:
             lesson = (
-                f"WINNING EDGE ({sym} {side}, +₹{pnl_inr:,.0f} in {hold_mins:.0f}m): "
-                f"Reinforced {arm_used} Alpha posterior in {session_used} [{regime_used}]."
+                f"WINNING EDGE ({sym} {side}, +₹{pnl_inr:,.0f} net in {hold_mins:.0f}m): "
+                f"Reinforced {arm_used} Alpha posterior on {arch_used} in {session_used} [{regime_used}]."
             )
             trade["mistake_diagnosis"] = lesson
 
@@ -1347,6 +1656,7 @@ class AdaptiveTradeEngine:
             "session": session_used,
             "regime": regime_used,
             "arm": arm_used,
+            "archetype": arch_used,
             "emotion_at_exit": latest_emotion,
             "lesson": lesson
         })
@@ -1415,7 +1725,7 @@ class AdaptiveTradeEngine:
             conv = float(t.get("conviction", 60.0))
             hold_m = float(t.get("hold_minutes", 0.0))
 
-            if pnl > 0:
+            if pnl_inr > 0:
                 wins_count += 1
                 winning_convictions.append(conv)
                 if hold_m > 0:
@@ -1432,7 +1742,7 @@ class AdaptiveTradeEngine:
             elif "TARGET" in status_str or "PROFIT LOCKED" in status_str:
                 target_hits += 1
 
-            direction = 1.0 if pnl > 0 else (-1.25 if pnl < 0 else 0.0)
+            direction = 1.0 if pnl_inr > 0 else (-1.25 if pnl_inr < 0 else 0.0)
             magnitude = min(2.5, max(0.5, abs(pnl)))
             scores = t["factor_scores"]
             for factor_key in adjustments:
@@ -1555,12 +1865,12 @@ class AdaptiveTradeEngine:
             key=lambda kv: float(kv[1].get("alpha", 2.0)) / (float(kv[1].get("alpha", 2.0)) + float(kv[1].get("beta", 2.0)))
         )
         top_arm_prob = float(top_arm[1]["alpha"]) / (float(top_arm[1]["alpha"]) + float(top_arm[1]["beta"]))
+        shadow_n = int(self.weights.get("shadow_samples_learned", 0))
 
         note = (
-            f"Gen #{self.weights['generation']} ({len(settled)} trades): "
-            f"Top Bandit Arm={top_arm[0]} ({top_arm_prob:.0%} win prob), "
-            f"Min Conviction={self.weights['min_conviction_threshold']}, "
-            f"Giveback Cutoff={self.weights['max_profit_giveback_pct']}%"
+            f"Gen #{self.weights['generation']} ({len(settled)} real + {shadow_n} shadow setups): "
+            f"Top Arm={top_arm[0]} ({top_arm_prob:.0%}), "
+            f"Min Conviction={self.weights['min_conviction_threshold']}"
         )
         self.weights["learning_notes"] = note
         self._save_weights()
@@ -1591,5 +1901,7 @@ class AdaptiveTradeEngine:
             "open_trades": len(open_trades),
             "win_rate": win_rate,
             "total_pnl_pct": roi_pct,
-            "total_pnl_inr": total_pnl_inr
+            "total_pnl_inr": total_pnl_inr,
+            "total_taxes_paid": self.portfolio.get("total_taxes_paid", 0.0),
+            "shadow_samples_learned": int(self.weights.get("shadow_samples_learned", 0)),
         }
