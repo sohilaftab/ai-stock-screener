@@ -1,31 +1,18 @@
-name: AI Stock Screener Automation
+name: PulseAI Autonomous NSE Screener
 
 on:
-  schedule:
-    # 08:30 AM IST (Before 9 AM Morning Research & Watchlist) -> 03:00 UTC (Mon-Fri)
-    - cron: '0 3 * * 1-5'
-    # 09:10 AM IST (Pre-Market Momentum Check & Virtual Trade Entry) -> 03:40 UTC (Mon-Fri)
-    - cron: '40 3 * * 1-5'
-    # 10:30 AM IST (Live Trade Management #1: Trail SL / Extend Target) -> 05:00 UTC (Mon-Fri)
-    - cron: '0 5 * * 1-5'
-    # 12:15 PM IST (Live Trade Management #2: Mid-Day Check) -> 06:45 UTC (Mon-Fri)
-    - cron: '45 6 * * 1-5'
-    # 02:00 PM IST (Live Trade Management #3: Afternoon Check) -> 08:30 UTC (Mon-Fri)
-    - cron: '30 8 * * 1-5'
-    # 03:40 PM IST (EOD Settlement, Mistake Autopsy & Rs 1.5L Wallet Update) -> 10:10 UTC (Mon-Fri)
-    - cron: '10 10 * * 1-5'
-
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Autonomous phase to execute manually'
+        description: "Execution mode"
         required: true
-        default: 'morning_prep'
+        default: "autonomous_cycle"
         type: choice
         options:
+          - autonomous_cycle
+          - live_manage
           - morning_prep
           - premarket_update
-          - live_manage
           - eod
 
 permissions:
@@ -42,59 +29,34 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Cache HuggingFace FinBERT Model
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: ${{ runner.os }}-finbert-v1
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Determine Execution Mode & Run Autonomous Trader
+      - name: Execute PulseAI Engine
         env:
+          RUN_MODE: ${{ github.event.inputs.mode || 'autonomous_cycle' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TZ: 'Asia/Kolkata'
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${{ github.event.inputs.mode }}"
-          else
-            HOUR=$(date +%H)
-            MIN=$(date +%M)
-            TOTAL_MINS=$((10#$HOUR * 60 + 10#$MIN))
-            if [ "$TOTAL_MINS" -lt 545 ]; then
-              MODE="morning_prep"
-            elif [ "$TOTAL_MINS" -lt 580 ]; then
-              MODE="premarket_update"
-            elif [ "$TOTAL_MINS" -ge 930 ]; then
-              MODE="eod"
-            else
-              MODE="live_manage"
-            fi
-          fi
-          echo "Executing autonomous trader in mode: $MODE"
-          python main.py --mode "$MODE"
+          python main.py "${RUN_MODE}"
 
-      - name: Auto-Commit & Push Updated Portfolio, Ledger & AI Weights
+      - name: Commit & Sync Updated Portfolio State
         run: |
-          git config --local user.name "PulseAI Autonomous Trader"
-          git config --local user.email "actions@github.com"
-          
-          for f in trade_history.json model_weights.json portfolio_state.json morning_watchlist.json; do
-            if [ -f "$f" ]; then git add "$f"; fi
-          done
-          
-          if ! git diff --staged --quiet; then
-            git commit -m "🤖 Auto-update ₹1.5L portfolio state, trade ledger & AI weights [skip ci]"
+          git config user.name "PulseAI Bot"
+          git config user.email "actions@github.com"
+          git add portfolio_state.json trade_history.json model_weights.json morning_watchlist.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(pulseai): update portfolio, ledger & learned weights [${{ github.event.inputs.mode || 'autonomous_cycle' }}]"
             git pull --rebase origin main
             git push origin main
+          else
+            echo "No state changes to commit."
           fi

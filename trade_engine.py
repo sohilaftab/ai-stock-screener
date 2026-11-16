@@ -1,5 +1,8 @@
 import os
 import json
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -16,6 +19,18 @@ MORNING_WATCHLIST_FILE = "morning_watchlist.json"
 
 INITIAL_CAPITAL = 150000.0
 
+# Lightweight financial emotion lexicon for real-time news shift detection
+BULLISH_KEYWORDS = {
+    "surge", "soar", "jump", "gain", "profit", "beat", "order", "win", "won",
+    "contract", "approval", "upgrade", "buy", "bullish", "growth", "expansion",
+    "dividend", "bonus", "acquisition", "partnership", "record", "strong", "rally"
+}
+BEARISH_KEYWORDS = {
+    "fall", "drop", "plunge", "slump", "loss", "miss", "downgrade", "sell",
+    "bearish", "fraud", "probe", "raid", "penalty", "fine", "ban", "recall",
+    "default", "debt", "resign", "cut", "weak", "crash", "warning", "lawsuit"
+}
+
 
 class AdaptiveTradeEngine:
     def __init__(self):
@@ -28,36 +43,90 @@ class AdaptiveTradeEngine:
     def _now_ist():
         return datetime.now(IST)
 
-    def _is_past_320pm_ist(self):
+    @staticmethod
+    def _get_session_bucket(dt=None):
+        """Categorizes the current IST time so the AI learns which market windows are profitable."""
+        dt = dt or datetime.now(IST)
+        mins = dt.hour * 60 + dt.minute
+        if mins < 9 * 60 + 45:
+            return "OPENING_SURGE (09:15-09:45)"
+        elif mins < 11 * 60 + 30:
+            return "MORNING_TREND (09:45-11:30)"
+        elif mins < 13 * 60 + 30:
+            return "MIDDAY_CHOP (11:30-13:30)"
+        elif mins < 15 * 60:
+            return "AFTERNOON_MOVE (13:30-15:00)"
+        else:
+            return "CLOSING_SESSION (15:00-15:30)"
+
+    def _calculate_hold_minutes(self, trade):
+        """Computes how many minutes a trade has been open using IST timestamps."""
         now_ist = self._now_ist()
-        return (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 20)
-
-    def _get_320pm_ist_price(self, sym, fallback_price):
-        """
-        Fetches the exact 3:20 PM IST price from intraday bars (15:19 1m bar or 15:15 5m bar)
-        so intraday trades never settle on post-3:20 PM or 3:30 PM closing auction prices.
-        """
-        sym_ns = sym if sym.endswith(".NS") else f"{sym}.NS"
-        for interval, max_min in (("1m", 19), ("5m", 15)):
+        if trade.get("entry_iso"):
             try:
-                df = yf.Ticker(sym_ns).history(period="1d", interval=interval)
-                if df.empty:
-                    continue
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize(IST)
-                else:
-                    df.index = df.index.tz_convert(IST)
+                entry_dt = datetime.fromisoformat(trade["entry_iso"])
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=IST)
+                return max(0.0, (now_ist - entry_dt).total_seconds() / 60.0)
+            except Exception:
+                pass
+        try:
+            dt_str = f"{trade.get('date')} {trade.get('timestamp')}"
+            entry_dt = datetime.strptime(dt_str, "%Y-%m-%d %I:%M:%S %p").replace(tzinfo=IST)
+            return max(0.0, (now_ist - entry_dt).total_seconds() / 60.0)
+        except Exception:
+            return 0.0
 
-                valid_bars = df[
-                    (df.index.hour < 15)
-                    | ((df.index.hour == 15) & (df.index.minute <= max_min))
-                ]
-                if not valid_bars.empty:
-                    return round(float(valid_bars["Close"].iloc[-1]), 2)
-            except Exception as e:
-                print(f"[WARN] 3:20 PM {interval} bar lookup failed for {sym_ns}: {e}")
-        return round(float(fallback_price), 2)
+    # ------------------------------------------------------------------
+    # REAL-TIME NEWS & EMOTION RESEARCH FOR ACTIVE / SETTLED STOCKS
+    # ------------------------------------------------------------------
+    def _analyze_live_news_emotion(self, sym):
+        """
+        Fetches latest Google News RSS headlines for an NSE stock to detect
+        real-time market emotion shifts during active trades and post-trade research.
+        """
+        clean_sym = sym.replace(".NS", "").strip()
+        query = urllib.parse.quote(f"{clean_sym} NSE stock news")
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                xml_data = resp.read()
+            root = ET.fromstring(xml_data)
+            items = root.findall(".//item")[:5]
+            if not items:
+                return {"emotion": "NEUTRAL", "score": 0.0, "top_headline": "No breaking news"}
 
+            bull_hits = 0
+            bear_hits = 0
+            headlines = []
+            for item in items:
+                title = (item.findtext("title") or "").strip()
+                headlines.append(title)
+                words = set(w.strip(".,:;!?()[]\"'").lower() for w in title.split())
+                bull_hits += len(words & BULLISH_KEYWORDS)
+                bear_hits += len(words & BEARISH_KEYWORDS)
+
+            net = bull_hits - bear_hits
+            if net >= 2:
+                emotion = "POSITIVE"
+            elif net <= -2:
+                emotion = "NEGATIVE"
+            else:
+                emotion = "NEUTRAL"
+
+            return {
+                "emotion": emotion,
+                "score": round(float(net), 2),
+                "top_headline": headlines[0] if headlines else "No breaking news",
+                "all_headlines": headlines[:3]
+            }
+        except Exception:
+            return {"emotion": "NEUTRAL", "score": 0.0, "top_headline": "News feed unavailable", "all_headlines": []}
+
+    # ------------------------------------------------------------------
+    # STATE LOADERS & SAVERS
+    # ------------------------------------------------------------------
     def _load_weights(self):
         default_weights = {
             "volume_weight": 0.28,
@@ -65,20 +134,24 @@ class AdaptiveTradeEngine:
             "premarket_weight": 0.22,
             "momentum_weight": 0.22,
             "risk_per_trade_pct": 1.0,
-            "min_conviction_threshold": 52.0,  # Learned minimum quality bar to allow a trade
-            "atr_sl_multiplier": 0.55,         # Learned Stop-Loss distance (in ATRs)
-            "atr_tp_multiplier": 1.60,         # Learned Target 1 distance (in ATRs)
-            "buy_rsi_ceiling": 72.0,           # Learned max RSI for BUY entries (avoids buying tops)
-            "short_rsi_floor": 28.0,           # Learned min RSI for SHORT entries
-            "buy_bias_bonus": 0.0,             # Learned directional adjustment for BUY setups
-            "short_bias_bonus": 0.0,           # Learned directional adjustment for SHORT setups
+            "min_conviction_threshold": 52.0,
+            "atr_sl_multiplier": 0.55,
+            "atr_tp_multiplier": 1.60,
+            "buy_rsi_ceiling": 72.0,
+            "short_rsi_floor": 28.0,
+            "buy_bias_bonus": 0.0,
+            "short_bias_bonus": 0.0,
+            "max_profit_giveback_pct": 45.0,   # Learned trailing giveback cutoff once in profit
+            "learned_max_hold_mins": 180.0,    # Learned optimal holding horizon before stagnation exit
+            "session_memory": {},              # Learned win rate & P&L per time-of-day window
             "ticker_memory": {},               # Per-stock win/loss & P&L memory
-            "blacklisted_tickers": [],         # Stocks blocked due to repeated Stop-Loss hits
-            "preferred_tickers": [],           # Stocks rewarded for consistent profitable execution
+            "blacklisted_tickers": [],
+            "preferred_tickers": [],
+            "trade_lessons_log": [],           # Structured research lessons from every closed trade
             "generation": 1,
             "last_evaluated_count": 0,
             "last_updated": self._now_ist().strftime("%Y-%m-%d %H:%M"),
-            "learning_notes": "Initialized 5-Layer Self-Learning Brain on Rs 1,50,000 closed wallet."
+            "learning_notes": "Initialized 6-Layer Autonomous Emotion & Timing Brain."
         }
         if os.path.exists(WEIGHTS_FILE):
             try:
@@ -109,6 +182,9 @@ class AdaptiveTradeEngine:
         today_str = self._now_ist().strftime("%Y-%m-%d")
         default_portfolio = {
             "initial_capital": INITIAL_CAPITAL,
+            "manual_deposits": 0.0,
+            "total_capital_contributed": INITIAL_CAPITAL,
+            "deposit_history": [],
             "current_equity": INITIAL_CAPITAL,
             "available_cash": INITIAL_CAPITAL,
             "allocated_capital": 0.0,
@@ -131,13 +207,18 @@ class AdaptiveTradeEngine:
 
     def _recalculate_cash(self, port_dict):
         """
-        STRICT CLOSED-WALLET ACCOUNTING:
-        - Initial seed is fixed at Rs 1,50,000.00 (never adds external money).
-        - Current Equity = Rs 1,50,000.00 + sum of all settled Profits/Losses.
-        - Allocated Capital = exact cash locked in currently OPEN trades.
-        - Available Cash = Current Equity - Allocated Capital (strictly clamped >= 0).
+        STRICT CLOSED-WALLET ACCOUNTING WITH USER-ONLY MANUAL DEPOSITS:
+        - Base seed is fixed at Rs 1,50,000.00.
+        - Manual deposits come ONLY from explicit user actions (`deposit_history`).
+        - The AI NEVER adds capital on its own.
         """
+        deposits = port_dict.get("deposit_history", [])
+        manual_total = round(sum(float(d.get("amount", 0.0)) for d in deposits), 2)
+        total_contributed = round(INITIAL_CAPITAL + manual_total, 2)
+
         port_dict["initial_capital"] = INITIAL_CAPITAL
+        port_dict["manual_deposits"] = manual_total
+        port_dict["total_capital_contributed"] = total_contributed
 
         open_allocated = sum(
             float(t.get("capital_used", 0.0))
@@ -148,7 +229,7 @@ class AdaptiveTradeEngine:
             for t in self.ledger if t.get("status") != "OPEN"
         )
         port_dict["total_realized_pnl"] = round(realized, 2)
-        port_dict["current_equity"] = round(max(0.0, INITIAL_CAPITAL + realized), 2)
+        port_dict["current_equity"] = round(max(0.0, total_contributed + realized), 2)
         port_dict["allocated_capital"] = round(open_allocated, 2)
         port_dict["available_cash"] = round(max(0.0, port_dict["current_equity"] - open_allocated), 2)
 
@@ -156,6 +237,39 @@ class AdaptiveTradeEngine:
         self._recalculate_cash(self.portfolio)
         with open(PORTFOLIO_FILE, "w") as f:
             json.dump(self.portfolio, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # USER-ONLY MANUAL CAPITAL ADDITION (NEVER CALLED BY AI)
+    # ------------------------------------------------------------------
+    def add_manual_funds(self, amount, note="Manual user deposit", notify_telegram=True):
+        """
+        Adds user-deposited funds into the portfolio wallet.
+        Called ONLY when the human user explicitly submits a deposit in the web dashboard.
+        """
+        amt = round(float(amount), 2)
+        if amt <= 0:
+            raise ValueError("Deposit amount must be greater than ₹0.")
+
+        now_str = self._now_ist().strftime("%Y-%m-%d %I:%M:%S %p IST")
+        self.portfolio.setdefault("deposit_history", []).append({
+            "timestamp": now_str,
+            "amount": amt,
+            "note": str(note).strip() or "Manual user deposit"
+        })
+        self._save_portfolio()
+
+        if notify_telegram:
+            msg = (
+                f"💵 <b>MANUAL FUNDS ADDED BY USER</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"➕ <b>Amount Added:</b> +₹{amt:,.2f}\n"
+                f"📝 <b>Note:</b> {note}\n"
+                f"🏦 <b>New Total Equity:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
+                f"💰 <b>Available Cash to Trade:</b> <b>₹{self.portfolio['available_cash']:,.2f}</b>"
+            )
+            self.notifier.send_message(msg)
+
+        return self.portfolio
 
     def save_morning_watchlist(self, rec_df):
         records = rec_df.to_dict(orient="records") if not rec_df.empty else []
@@ -179,33 +293,32 @@ class AdaptiveTradeEngine:
             sym = row["symbol"]
             if sym not in old_map:
                 changes.append(
-                    f"🆕 <b>NEW PRE-MARKET ENTRY: {sym}</b> jumped into Top Picks ({row['action']} @ ₹{row['entry_price']}, Conviction {row['conviction']}/100)."
+                    f"🆕 <b>NEW SETUP DETECTED: {sym}</b> entered Top Picks ({row['action']} @ ₹{row['entry_price']}, Conviction {row['conviction']}/100)."
                 )
             else:
                 old_item = old_map[sym]
                 if old_item["action"] != row["action"]:
                     changes.append(
-                        f"🔄 <b>DIRECTION FLIP: {sym}</b> flipped from {old_item['action']} to <b>{row['action']}</b> after Pre-Open order flow!"
+                        f"🔄 <b>EMOTION & DIRECTION FLIP: {sym}</b> flipped from {old_item['action']} to <b>{row['action']}</b>!"
                     )
                 elif abs(float(row["entry_price"]) - float(old_item["entry_price"])) / float(old_item["entry_price"]) > 0.01:
                     changes.append(
-                        f"⚡ <b>GAP ADJUSTMENT: {sym}</b> levels updated to Entry ₹{row['entry_price']} | Target ₹{row['target_1']} | SL ₹{row['stop_loss']}."
+                        f"⚡ <b>LEVEL UPDATE: {sym}</b> adjusted to Entry ₹{row['entry_price']} | Target ₹{row['target_1']} | SL ₹{row['stop_loss']}."
                     )
 
         for old_sym in old_map:
             if old_sym not in new_symbols:
-                changes.append(f"❌ <b>DROPPED: {old_sym}</b> removed from Pre-9 AM list due to weak pre-market volume/sentiment.")
+                changes.append(f"❌ <b>DROPPED: {old_sym}</b> removed due to weakening volume/sentiment.")
 
         return changes
 
+    # ------------------------------------------------------------------
+    # 1. ADAPTIVE OPPORTUNITY & TIMING SCORER
+    # ------------------------------------------------------------------
     def generate_intraday_recommendations(self, enriched_df, premarket_df=None, top_k=5):
         """
-        Uses all 5 learned layers from `model_weights.json`:
-        1. Skips or heavily penalizes `blacklisted_tickers` that repeatedly lost money.
-        2. Boosts `preferred_tickers` with proven historical win rates.
-        3. Applies learned `buy_rsi_ceiling`, `short_rsi_floor`, and directional bias bonuses.
-        4. Applies learned `min_conviction_threshold` so weak trades are filtered out.
-        5. Computes Stop-Loss and Target using learned `atr_sl_multiplier` and `atr_tp_multiplier`.
+        Evaluates live market data, news emotion, and learned session-timing windows
+        to decide if now is a suitable moment to enter a trade.
         """
         if enriched_df.empty:
             return pd.DataFrame()
@@ -213,7 +326,18 @@ class AdaptiveTradeEngine:
         self._recalculate_cash(self.portfolio)
         current_equity = float(self.portfolio["current_equity"])
         avail_cash = float(self.portfolio["available_cash"])
-        budget_pool = avail_cash if avail_cash > 1000 else current_equity
+        if avail_cash < 500:
+            return pd.DataFrame()
+
+        # Check what the AI has learned about the CURRENT time-of-day window
+        current_session = self._get_session_bucket()
+        session_mem = self.weights.get("session_memory", {}).get(current_session, {})
+        session_adj = float(session_mem.get("score_adj", 0.0))
+
+        # If AI learned this time window has <30% win rate over >=4 trades, stay out unless conviction is extraordinary
+        if session_mem.get("trades", 0) >= 4 and session_mem.get("win_rate", 50.0) < 30.0:
+            print(f"[AI TIMING GUARD] Skipping entries during low-win-rate window: {current_session}")
+            return pd.DataFrame()
 
         pre_map = {}
         if premarket_df is not None and not premarket_df.empty:
@@ -243,8 +367,6 @@ class AdaptiveTradeEngine:
         scored_candidates = []
         for _, row in enriched_df.iterrows():
             sym = row["symbol"]
-
-            # Layer 1: Skip blacklisted stocks unless there are fewer than 3 total candidates
             if sym in blacklist and len(enriched_df) > 3:
                 continue
 
@@ -290,14 +412,13 @@ class AdaptiveTradeEngine:
             else:
                 pre_score = 55.0
 
-            # Layer 3: Use learned RSI ceiling/floor so the AI stops buying overbought tops
             if side == "BUY":
                 trend_bonus = 25.0 if chart_trend == "BULLISH_UPTREND" else 0.0
                 vwap_bonus = 15.0 if ltp >= vwap else -10.0
                 if 50.0 <= rsi <= buy_rsi_max:
                     rsi_bonus = 15.0
                 elif rsi > buy_rsi_max:
-                    rsi_bonus = -15.0  # Penalize overbought exhaustion learned from past losses
+                    rsi_bonus = -15.0
                 else:
                     rsi_bonus = 0.0
                 mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus))
@@ -307,7 +428,7 @@ class AdaptiveTradeEngine:
                 if short_rsi_min <= rsi <= 50.0:
                     rsi_bonus = 15.0
                 elif rsi < short_rsi_min:
-                    rsi_bonus = -15.0  # Penalize oversold exhaustion on shorts
+                    rsi_bonus = -15.0
                 else:
                     rsi_bonus = 0.0
                 mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus))
@@ -319,7 +440,6 @@ class AdaptiveTradeEngine:
                 (w_mom * mom_score)
             )
 
-            # Apply Layer 1 & Layer 2 Historical Memory Adjustments
             ticker_adj = 0.0
             if sym in ticker_memory:
                 tm = ticker_memory[sym]
@@ -328,14 +448,13 @@ class AdaptiveTradeEngine:
                 net_pnl = tm.get("net_pnl_inr", 0.0)
                 if trades_n >= 1:
                     if win_r >= 60.0 and net_pnl > 0:
-                        ticker_adj = min(8.0, 3.0 + (trades_n * 1.5))  # Reward proven winners
+                        ticker_adj = min(8.0, 3.0 + (trades_n * 1.5))
                     elif win_r < 40.0 and net_pnl < 0:
-                        ticker_adj = -min(15.0, 5.0 + (trades_n * 3.0))  # Penalize repeat losers
+                        ticker_adj = -min(15.0, 5.0 + (trades_n * 3.0))
 
             dir_adj = buy_bonus if side == "BUY" else short_bonus
-            conviction = round(max(1.0, min(99.0, base_conviction + ticker_adj + dir_adj)), 1)
+            conviction = round(max(1.0, min(99.0, base_conviction + ticker_adj + dir_adj + session_adj)), 1)
 
-            # Layer 4: Learned ATR Stop-Loss & Target Multipliers
             intraday_risk_per_share = max(round(atr * atr_sl_mult, 2), round(ltp * 0.006, 2))
             reward_1_per_share = round(intraday_risk_per_share * (atr_tp_mult / max(atr_sl_mult, 0.3)), 2)
             reward_2_per_share = round(intraday_risk_per_share * ((atr_tp_mult + 1.0) / max(atr_sl_mult, 0.3)), 2)
@@ -378,14 +497,15 @@ class AdaptiveTradeEngine:
 
         scored_candidates.sort(key=lambda x: x["conviction"], reverse=True)
 
-        # Layer 5: Apply Learned Minimum Conviction Filter (Always keep at least top 2 if market is quiet)
+        # AI only takes setups that genuinely pass its learned conviction threshold (no forced entries)
         qualified = [c for c in scored_candidates if c["conviction"] >= min_conviction]
-        if len(qualified) < 2:
-            qualified = scored_candidates[:max(2, min(3, len(scored_candidates)))]
+        if not qualified:
+            print(f"[AI SELECTIVITY] No setups met learned min conviction ({min_conviction}). Waiting for better opportunity.")
+            return pd.DataFrame()
+
         top_candidates = qualified[:top_k]
 
-        # STRICT SEQUENTIAL WALLET ALLOCATION
-        remaining_wallet_cash = budget_pool
+        remaining_wallet_cash = avail_cash
         risk_pct_allowed = float(self.weights.get("risk_per_trade_pct", 1.0)) / 100.0
         max_risk_inr_per_trade = current_equity * risk_pct_allowed
         total_conviction = sum(c["conviction"] for c in top_candidates) or 1.0
@@ -416,25 +536,20 @@ class AdaptiveTradeEngine:
             capital_used = round(qty * entry_price, 2)
             remaining_wallet_cash = round(remaining_wallet_cash - capital_used, 2)
 
-            max_loss_inr = round(qty * risk_per_share, 2)
-            expected_profit_inr = round(qty * abs(item["target_1"] - entry_price), 2)
-            risk_pct = round((risk_per_share / entry_price) * 100, 2)
-            reward_pct = round((abs(item["target_1"] - entry_price) / entry_price) * 100, 2)
-
             final_suggestions.append({
                 "symbol": item["symbol"],
                 "action": item["action"],
                 "conviction": item["conviction"],
                 "qty": qty,
                 "capital_used": capital_used,
-                "max_loss_inr": max_loss_inr,
-                "expected_profit_inr": expected_profit_inr,
+                "max_loss_inr": round(qty * risk_per_share, 2),
+                "expected_profit_inr": round(qty * abs(item["target_1"] - entry_price), 2),
                 "entry_price": entry_price,
                 "target_1": item["target_1"],
                 "target_2": item["target_2"],
                 "stop_loss": item["stop_loss"],
-                "risk_pct": risk_pct,
-                "reward_pct": reward_pct,
+                "risk_pct": round((risk_per_share / entry_price) * 100, 2),
+                "reward_pct": round((abs(item["target_1"] - entry_price) / entry_price) * 100, 2),
                 "rr_ratio": item["rr_ratio"],
                 "chart_trend": item["chart_trend"],
                 "vol_ratio": item["vol_ratio"],
@@ -449,16 +564,15 @@ class AdaptiveTradeEngine:
 
         return pd.DataFrame(final_suggestions)
 
+    # ------------------------------------------------------------------
+    # 2. AUTONOMOUS ENTRY EXECUTION
+    # ------------------------------------------------------------------
     def record_recommendations(self, rec_df, notify_telegram=True):
         """
-        Executes virtual trades out of the exact available_cash in your wallet.
-        Strictly blocks any new intraday entries at or after 3:20 PM IST.
+        Executes virtual trades whenever the AI identifies high-conviction setups
+        inside a favorable learned market window.
         """
         if rec_df.empty:
-            return 0
-
-        if self._is_past_320pm_ist():
-            print("[INFO] Past 3:20 PM IST intraday cutoff. Blocking new intraday entries.")
             return 0
 
         self._recalculate_cash(self.portfolio)
@@ -467,9 +581,9 @@ class AdaptiveTradeEngine:
         now_ist = self._now_ist()
         today_str = now_ist.strftime("%Y-%m-%d")
         now_time = now_ist.strftime("%I:%M:%S %p")
-        existing_today = {
-            item["symbol"] for item in self.ledger if item.get("date") == today_str
-        }
+        session_bucket = self._get_session_bucket(now_ist)
+
+        open_symbols = {item["symbol"] for item in self.ledger if item.get("status") == "OPEN"}
 
         candidate_syms = rec_df["symbol"].tolist()
         fresh_ticks = MarketDataScanner.fetch_live_intraday_snapshot(candidate_syms)
@@ -477,7 +591,7 @@ class AdaptiveTradeEngine:
         added = 0
         for _, row in rec_df.iterrows():
             sym = row["symbol"]
-            if sym in existing_today:
+            if sym in open_symbols:
                 continue
 
             old_entry = float(row["entry_price"])
@@ -508,9 +622,11 @@ class AdaptiveTradeEngine:
             exp_profit = round(abs(t1 - entry_p) * qty, 2)
 
             trade_record = {
-                "trade_id": f"{today_str}_{sym}",
+                "trade_id": f"{today_str}_{sym}_{now_ist.strftime('%H%M')}",
                 "date": today_str,
                 "timestamp": now_time,
+                "entry_iso": now_ist.isoformat(),
+                "entry_session": session_bucket,
                 "symbol": sym,
                 "action": row["action"],
                 "conviction": float(row["conviction"]),
@@ -523,12 +639,16 @@ class AdaptiveTradeEngine:
                 "initial_sl": sl,
                 "stop_loss": sl,
                 "current_price": entry_p,
+                "peak_pnl_inr": 0.0,
                 "unrealized_pnl_inr": 0.0,
                 "entry_rsi": float(row.get("rsi", 50.0)),
+                "entry_sentiment": row.get("sentiment", "NEUTRAL"),
                 "chart_trend": row.get("chart_trend", "RANGE_CONSOLIDATION"),
                 "status": "OPEN",
-                "trade_management_note": f"Funded from wallet (₹{avail_cash:,.0f} cash remaining; 3:20 PM IST auto-exit).",
+                "trade_management_note": f"AI entered during {session_bucket} (₹{avail_cash:,.0f} cash left).",
                 "exit_price": None,
+                "exit_time": None,
+                "hold_minutes": 0.0,
                 "day_high": None,
                 "day_low": None,
                 "pnl_pct": 0.0,
@@ -543,23 +663,22 @@ class AdaptiveTradeEngine:
                 "headline": row["headline"]
             }
             self.ledger.append(trade_record)
+            open_symbols.add(sym)
             added += 1
 
             if notify_telegram:
-                side_header = "🟢 <b>NEW BUY TRADE TAKEN (LIVE TICK)</b>" if row["action"] == "BUY" else "🔴 <b>NEW SHORT SELL TRADE TAKEN (LIVE TICK)</b>"
+                side_header = "🟢 <b>AI AUTONOMOUS BUY ENTRY</b>" if row["action"] == "BUY" else "🔴 <b>AI AUTONOMOUS SHORT ENTRY</b>"
                 entry_ticket = (
                     f"{side_header}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']})\n"
-                    f"🕒 <b>Exact Execution Time:</b> {now_time} IST ({today_str})\n"
+                    f"🕒 <b>AI Chosen Window:</b> {now_time} IST | <code>{session_bucket}</code>\n"
                     f"🧠 <b>AI Conviction:</b> {row['conviction']}/100 | Chart: <code>{row['chart_trend']}</code>\n"
                     f"📦 <b>Quantity:</b> <b>{qty} Shares</b> @ <b>₹{entry_p}</b>\n"
-                    f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Remaining Cash: ₹{avail_cash:,.2f} / Wallet Equity: ₹{self.portfolio['current_equity']:,.2f})</i>\n"
+                    f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Cash Left: ₹{avail_cash:,.2f})</i>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🎯 <b>Target 1:</b> ₹{t1} <i>(+₹{exp_profit:,.0f} profit)</i>\n"
-                    f"🚀 <b>Target 2:</b> ₹{t2}\n"
-                    f"🛑 <b>Stop-Loss:</b> ₹{sl} <i>(-₹{max_loss:,.0f} max risk)</i>\n"
-                    f"⏰ <b>Hard Intraday Cutoff:</b> 03:20 PM IST\n"
+                    f"🎯 <b>Target 1:</b> ₹{t1} <i>(+₹{exp_profit:,.0f})</i> | 🚀 <b>Target 2:</b> ₹{t2}\n"
+                    f"🛑 <b>Initial Stop-Loss:</b> ₹{sl} <i>(-₹{max_loss:,.0f} risk)</i>\n"
                     f"📰 <b>Catalyst ({row['sentiment']}):</b> {row['headline']}"
                 )
                 self.notifier.send_message(entry_ticket)
@@ -569,11 +688,14 @@ class AdaptiveTradeEngine:
             self._save_portfolio()
         return added
 
+    # ------------------------------------------------------------------
+    # 3. DYNAMIC EMOTION, MOMENTUM & GIVEBACK CUTOFF ENGINE
+    # ------------------------------------------------------------------
     def manage_live_positions(self, notify_telegram=True):
         """
-        Monitors active positions via live NSE tick prices & 1-minute intraday candles.
-        - ENFORCES HARD AUTO SQUARE-OFF AT OR AFTER 3:20 PM IST using the exact 3:20 PM bar price.
-        - Whenever a trade closes, immediately triggers `_optimize_weights_from_history()`.
+        Continuously evaluates live price action, peak profit giveback, hold decay,
+        and breaking news emotion shifts to decide autonomously when to exit any trade.
+        Immediately researches and learns from every closed trade.
         """
         open_trades = [t for t in self.ledger if t.get("status") == "OPEN"]
         if not open_trades:
@@ -582,75 +704,15 @@ class AdaptiveTradeEngine:
         symbols = [t["symbol"] for t in open_trades]
         snapshots = MarketDataScanner.fetch_live_intraday_snapshot(symbols)
         actions_taken = []
-        closed_any = False
-
         now_ist = self._now_ist()
         now_time = now_ist.strftime("%I:%M:%S %p")
-        past_320_cutoff = self._is_past_320pm_ist()
+
+        giveback_limit_pct = float(self.weights.get("max_profit_giveback_pct", 45.0))
+        max_hold_mins = float(self.weights.get("learned_max_hold_mins", 180.0))
 
         for trade in open_trades:
             sym = trade["symbol"]
-            entry = float(trade["entry_price"])
-            t1 = float(trade["target_1"])
-            t2 = float(trade["target_2"])
-            sl = float(trade["stop_loss"])
-            init_sl = float(trade.get("initial_sl", sl))
-            qty = int(trade.get("qty", 1))
-            side = trade["action"]
-
             snap = snapshots.get(sym)
-            tg_ticket = None
-
-            # --------------------------------------------------------------
-            # HARD 3:20 PM IST INTRADAY SQUARE-OFF (Runs even if live snap is empty)
-            # --------------------------------------------------------------
-            if past_320_cutoff:
-                fallback_ltp = snap["current_price"] if snap else float(trade.get("current_price", entry))
-                exit_320 = self._get_320pm_ist_price(sym, fallback_ltp)
-
-                if side == "BUY":
-                    pnl_pct = ((exit_320 - entry) / entry) * 100.0
-                    pnl_inr = (exit_320 - entry) * qty
-                    exit_label = "SELL (3:20 PM Auto Square-Off)"
-                else:
-                    pnl_pct = ((entry - exit_320) / entry) * 100.0
-                    pnl_inr = (entry - exit_320) * qty
-                    exit_label = "BUY TO COVER (3:20 PM Auto Square-Off)"
-
-                trade["status"] = "3:20 PM WIN (AUTO SQUARE-OFF)" if pnl_inr >= 0 else "3:20 PM LOSS (AUTO SQUARE-OFF)"
-                trade["exit_price"] = exit_320
-                trade["current_price"] = exit_320
-                trade["unrealized_pnl_inr"] = 0.0
-                trade["pnl_pct"] = round(pnl_pct, 2)
-                trade["pnl_inr"] = round(pnl_inr, 2)
-                trade["trade_management_note"] = f"Auto squared-off at 3:20 PM IST limit @ ₹{exit_320:.2f}."
-                trade["mistake_diagnosis"] = (
-                    "Intraday square-off at 3:20 PM IST in profit."
-                    if pnl_inr >= 0
-                    else f"{sym} ({side}) did not reach target before 3:20 PM IST cutoff (P&L: ₹{pnl_inr:+,.0f})."
-                )
-                closed_any = True
-                self._recalculate_cash(self.portfolio)
-
-                msg = f"⏰ <b>3:20 PM AUTO SQUARE-OFF ({sym}):</b> Closed {qty} shares @ ₹{exit_320} (P&L: ₹{trade['pnl_inr']:+,.0f})."
-                actions_taken.append(msg)
-                tg_ticket = (
-                    f"⏰ <b>TRADE COMPLETED — 3:20 PM IST INTRADAY AUTO SQUARE-OFF</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 <b>Stock:</b> <code>{sym}</code> | <b>Order:</b> {exit_label}\n"
-                    f"🕒 <b>Cutoff Time:</b> 03:20 PM IST\n"
-                    f"📦 <b>Qty Closed:</b> {qty} Shares\n"
-                    f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>3:20 PM Exit:</b> <b>₹{exit_320}</b>\n"
-                    f"💰 <b>Net Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                    f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
-                )
-                if notify_telegram and tg_ticket:
-                    self.notifier.send_message(tg_ticket)
-                continue
-
-            # --------------------------------------------------------------
-            # REGULAR INTRADAY MONITORING (Before 3:20 PM IST)
-            # --------------------------------------------------------------
             if not snap:
                 continue
 
@@ -659,397 +721,248 @@ class AdaptiveTradeEngine:
             d_low = snap["day_low"]
             vwap = snap["intraday_vwap"]
 
+            entry = float(trade["entry_price"])
+            t1 = float(trade["target_1"])
+            t2 = float(trade["target_2"])
+            sl = float(trade["stop_loss"])
+            init_sl = float(trade.get("initial_sl", sl))
+            qty = int(trade.get("qty", 1))
+            side = trade["action"]
+
             risk_unit = max(abs(entry - init_sl), entry * 0.005)
+            hold_mins = round(self._calculate_hold_minutes(trade), 1)
+            trade["hold_minutes"] = hold_mins
             trade["current_price"] = ltp
             trade["day_high"] = d_high
             trade["day_low"] = d_low
 
-            if side == "BUY":
-                unrealized_per_share = ltp - entry
-                trade["unrealized_pnl_inr"] = round(unrealized_per_share * qty, 2)
-                r_multiple = unrealized_per_share / risk_unit
+            unrealized_per_share = (ltp - entry) if side == "BUY" else (entry - ltp)
+            unrealized_inr = round(unrealized_per_share * qty, 2)
+            trade["unrealized_pnl_inr"] = unrealized_inr
+            r_multiple = unrealized_per_share / risk_unit
 
-                if ltp >= t1 or d_high >= t1:
-                    if ltp >= t1 and ltp > vwap and t1 < t2 and now_ist.hour < 15:
-                        new_sl = round(entry + (0.8 * risk_unit), 2)
-                        trade["stop_loss"] = max(sl, new_sl)
-                        trade["target_1"] = t2
-                        trade["trade_management_note"] = "Target extended to T2; profit locked."
-                        msg = f"🚀 <b>TARGET EXTENDED ({sym}):</b> Crossed ₹{t1}! New Target: <b>₹{t2}</b> | Trailing SL: <b>₹{trade['stop_loss']}</b>."
-                        actions_taken.append(msg)
-                        tg_ticket = (
-                            f"🚀 <b>LIVE TRADE MODIFIED — TARGET EXTENDED</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📌 <b>Stock:</b> <code>{sym}</code> (BUY {qty} Qty)\n"
-                            f"📈 <b>Current LTP:</b> ₹{ltp} (Above VWAP ₹{vwap})\n"
-                            f"🎯 <b>New Extended Target:</b> <b>₹{t2}</b> <i>(was ₹{t1})</i>\n"
-                            f"🛡️ <b>Profit-Locked SL:</b> <b>₹{trade['stop_loss']}</b> <i>(Entry was ₹{entry})</i>\n"
-                            f"💵 <b>Unrealized Profit:</b> +₹{trade['unrealized_pnl_inr']:,.0f}"
-                        )
-                    else:
-                        trade["status"] = "WIN (TARGET HIT)"
-                        trade["exit_price"] = t1
-                        trade["pnl_pct"] = round(((t1 - entry) / entry) * 100, 2)
-                        trade["pnl_inr"] = round((t1 - entry) * qty, 2)
-                        trade["unrealized_pnl_inr"] = 0.0
-                        trade["trade_management_note"] = "Booked full target profit."
-                        trade["mistake_diagnosis"] = "Target achieved cleanly."
-                        closed_any = True
-                        self._recalculate_cash(self.portfolio)
-                        msg = f"✅ <b>TRADE COMPLETED — TARGET HIT ({sym}):</b> Sold {qty} shares @ ₹{t1} for <b>+₹{trade['pnl_inr']:,.0f}</b> profit!"
-                        actions_taken.append(msg)
-                        tg_ticket = (
-                            f"✅ <b>TRADE COMPLETED — TARGET BOOKED (SELL EXIT)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📌 <b>Stock:</b> <code>{sym}</code> (Closed BUY)\n"
-                            f"🕒 <b>Exit Time:</b> {now_time} IST\n"
-                            f"📦 <b>Qty Sold:</b> {qty} Shares\n"
-                            f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{t1}</b>\n"
-                            f"💰 <b>Net Realized Profit:</b> <b>+₹{trade['pnl_inr']:,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                            f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
-                        )
+            # Track highest profit reached during this trade's life
+            prev_peak = float(trade.get("peak_pnl_inr", 0.0))
+            peak_pnl = max(prev_peak, unrealized_inr)
+            trade["peak_pnl_inr"] = round(peak_pnl, 2)
 
-                elif ltp <= sl:
-                    trade["status"] = "BREAKEVEN EXIT" if sl >= entry else "LOSS (SL HIT)"
-                    trade["exit_price"] = sl
-                    trade["pnl_pct"] = round(((sl - entry) / entry) * 100, 2)
-                    trade["pnl_inr"] = round((sl - entry) * qty, 2)
-                    trade["unrealized_pnl_inr"] = 0.0
-                    trade["trade_management_note"] = "Stopped out at active SL."
-                    closed_any = True
-                    self._recalculate_cash(self.portfolio)
-                    msg = f"🛑 <b>TRADE COMPLETED — SL HIT ({sym}):</b> Sold {qty} shares @ ₹{sl} (P&L: ₹{trade['pnl_inr']:+,.0f})."
-                    actions_taken.append(msg)
+            # Check live news emotion shift if trade is losing or giving back gains
+            live_news = None
+            emotion_flipped = False
+            if unrealized_inr < 0 or (peak_pnl > 0 and unrealized_inr < peak_pnl * 0.6):
+                live_news = self._analyze_live_news_emotion(sym)
+                if side == "BUY" and live_news["emotion"] == "NEGATIVE":
+                    emotion_flipped = True
+                elif side.startswith("SELL") and live_news["emotion"] == "POSITIVE":
+                    emotion_flipped = True
+
+            exit_triggered = False
+            exit_status = ""
+            exit_price = ltp
+            exit_note = ""
+
+            # 1) BREAKING NEWS / EMOTION REVERSAL CUTOFF
+            if emotion_flipped:
+                exit_triggered = True
+                exit_status = "EMOTION SHIFT EXIT"
+                exit_price = ltp
+                exit_note = f"News emotion flipped to {live_news['emotion']}: {live_news['top_headline']}"
+
+            # 2) TARGET HIT OR MOMENTUM EXTENSION
+            elif (side == "BUY" and (ltp >= t1 or d_high >= t1)) or (side.startswith("SELL") and (ltp <= t1 or d_low <= t1)):
+                strong_momentum = (ltp >= t1 and ltp > vwap and t1 < t2) if side == "BUY" else (ltp <= t1 and ltp < vwap and t1 > t2)
+                if strong_momentum:
+                    new_sl = round(entry + (0.85 * risk_unit), 2) if side == "BUY" else round(entry - (0.85 * risk_unit), 2)
+                    trade["stop_loss"] = max(sl, new_sl) if side == "BUY" else min(sl, new_sl)
+                    trade["target_1"] = t2
+                    trade["trade_management_note"] = f"AI extended target to ₹{t2} & locked SL at ₹{trade['stop_loss']}."
+                    actions_taken.append(f"🚀 <b>TARGET EXTENDED ({sym}):</b> New Target ₹{t2} | Locked SL ₹{trade['stop_loss']}")
+                else:
+                    exit_triggered = True
+                    exit_status = "WIN (TARGET HIT)"
+                    exit_price = t1
+                    exit_note = "AI booked full target profit."
+
+            # 3) STOP-LOSS HIT
+            elif (side == "BUY" and ltp <= sl) or (side.startswith("SELL") and ltp >= sl):
+                exit_triggered = True
+                is_be = (sl >= entry) if side == "BUY" else (sl <= entry)
+                exit_status = "BREAKEVEN EXIT" if is_be else "LOSS (SL HIT)"
+                exit_price = sl
+                exit_note = "Exited at dynamic Stop-Loss."
+
+            # 4) LEARNED PEAK-PROFIT GIVEBACK CUTOFF (Locks in profit before full reversal)
+            elif peak_pnl >= (risk_unit * qty * 0.75) and unrealized_inr > 0:
+                giveback_pct = ((peak_pnl - unrealized_inr) / peak_pnl) * 100.0
+                if giveback_pct >= giveback_limit_pct:
+                    exit_triggered = True
+                    exit_status = "WIN (PROFIT LOCKED)"
+                    exit_price = ltp
+                    exit_note = f"AI locked profit after {giveback_pct:.0f}% pullback from peak ₹{peak_pnl:,.0f}."
+
+            # 5) EARLY WEAKNESS CUT BELOW/ABOVE VWAP
+            elif r_multiple <= -0.65 and ((side == "BUY" and ltp < vwap) or (side.startswith("SELL") and ltp > vwap)):
+                exit_triggered = True
+                exit_status = "EARLY CUT (LOSS MINIMIZED)"
+                exit_price = ltp
+                exit_note = f"Cut early against VWAP (₹{vwap}) to protect capital."
+
+            # 6) LEARNED HOLDING DECAY / STAGNATION EXIT
+            elif hold_mins >= max_hold_mins and unrealized_inr <= 0:
+                exit_triggered = True
+                exit_status = "STAGNATION EXIT (AI TIMING)"
+                exit_price = ltp
+                exit_note = f"Exited after {hold_mins:.0f}m without momentum follow-through."
+
+            # 7) TRAILING BREAKEVEN PROTECTION
+            elif r_multiple >= 0.8 and ((side == "BUY" and sl < entry) or (side.startswith("SELL") and sl > entry)):
+                trade["stop_loss"] = entry
+                trade["trade_management_note"] = f"SL trailed to breakeven ₹{entry}."
+
+            if exit_triggered:
+                pnl_pct = (((exit_price - entry) / entry) * 100.0) if side == "BUY" else (((entry - exit_price) / entry) * 100.0)
+                pnl_inr = ((exit_price - entry) * qty) if side == "BUY" else ((entry - exit_price) * qty)
+
+                trade["status"] = exit_status
+                trade["exit_price"] = round(exit_price, 2)
+                trade["exit_time"] = f"{now_time} IST"
+                trade["unrealized_pnl_inr"] = 0.0
+                trade["pnl_pct"] = round(pnl_pct, 2)
+                trade["pnl_inr"] = round(pnl_inr, 2)
+                trade["trade_management_note"] = exit_note
+
+                self._recalculate_cash(self.portfolio)
+
+                # Immediately research this trade & learn from its outcome/mistakes
+                lesson = self._research_and_learn_from_trade(trade, live_news)
+
+                msg = f"{'✅' if pnl_inr >= 0 else '🛑'} <b>AI CLOSED {sym} ({exit_status}):</b> ₹{exit_price} | P&L: <b>₹{pnl_inr:+,.0f}</b>"
+                actions_taken.append(msg)
+
+                if notify_telegram:
+                    header = "✅ <b>AI TRADE COMPLETED — PROFIT BOOKED</b>" if pnl_inr >= 0 else "🔴 <b>AI TRADE COMPLETED — CUT & RESEARCHED</b>"
                     tg_ticket = (
-                        f"🛑 <b>TRADE COMPLETED — STOP-LOSS EXIT</b>\n"
+                        f"{header}\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> (Closed BUY)\n"
-                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
-                        f"📦 <b>Qty Sold:</b> {qty} Shares\n"
-                        f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{sl}</b>\n"
-                        f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                        f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
+                        f"📌 <b>Stock:</b> <code>{sym}</code> ({side}) | <b>Hold:</b> {hold_mins:.0f} mins\n"
+                        f"🏷️ <b>AI Decision:</b> {exit_status}\n"
+                        f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{round(exit_price, 2)}</b>\n"
+                        f"💰 <b>Net Realized P&L:</b> <b>₹{pnl_inr:+,.2f} ({pnl_pct:+.2f}%)</b>\n"
+                        f"🏦 <b>Updated Wallet Equity:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
+                        f"🧠 <b>Post-Trade AI Research & Lesson:</b>\n<i>{lesson}</i>"
                     )
-
-                elif r_multiple >= 0.8 and sl < entry:
-                    trade["stop_loss"] = entry
-                    trade["trade_management_note"] = "Trailed SL to Breakeven (Risk = Rs 0)."
-                    msg = f"🛡️ <b>SL TRAILED TO BREAKEVEN ({sym}):</b> Up +{r_multiple:.1f}R (₹{ltp}). SL moved to ₹{entry}."
-                    actions_taken.append(msg)
-                    tg_ticket = (
-                        f"🛡️ <b>LIVE TRADE MODIFIED — SL TRAILED TO BREAKEVEN</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> (BUY {qty} Qty)\n"
-                        f"📈 <b>Current LTP:</b> ₹{ltp} (+{r_multiple:.1f}R in profit)\n"
-                        f"🛡️ <b>Updated Stop-Loss:</b> <b>₹{entry}</b> <i>(Risk reduced to ₹0)</i>\n"
-                        f"🎯 <b>Active Target:</b> ₹{t1}"
-                    )
-
-                elif r_multiple <= -0.65 and ltp < vwap:
-                    trade["status"] = "EARLY CUT (LOSS MINIMIZED)"
-                    trade["exit_price"] = ltp
-                    trade["pnl_pct"] = round(((ltp - entry) / entry) * 100, 2)
-                    trade["pnl_inr"] = round((ltp - entry) * qty, 2)
-                    trade["unrealized_pnl_inr"] = 0.0
-                    saved_inr = round((ltp - sl) * qty, 2)
-                    trade["trade_management_note"] = f"Cut early below VWAP; saved Rs {saved_inr:,.0f}."
-                    closed_any = True
-                    self._recalculate_cash(self.portfolio)
-                    msg = f"⚠️ <b>TRADE COMPLETED — EARLY CUT ({sym}):</b> Sold @ ₹{ltp} (P&L: ₹{trade['pnl_inr']:+,.0f}), saving ₹{saved_inr:,.0f}!"
-                    actions_taken.append(msg)
-                    tg_ticket = (
-                        f"⚠️ <b>TRADE COMPLETED — EARLY EXIT TO MINIMIZE LOSS</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> (Closed BUY early below VWAP ₹{vwap})\n"
-                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
-                        f"📦 <b>Qty Sold:</b> {qty} Shares @ <b>₹{ltp}</b>\n"
-                        f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                        f"💡 <b>Capital Saved vs Full SL:</b> +₹{saved_inr:,.0f}\n"
-                        f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
-                    )
-
-            else:  # SELL (SHORT)
-                unrealized_per_share = entry - ltp
-                trade["unrealized_pnl_inr"] = round(unrealized_per_share * qty, 2)
-                r_multiple = unrealized_per_share / risk_unit
-
-                if ltp <= t1 or d_low <= t1:
-                    if ltp <= t1 and ltp < vwap and t1 > t2 and now_ist.hour < 15:
-                        new_sl = round(entry - (0.8 * risk_unit), 2)
-                        trade["stop_loss"] = min(sl, new_sl)
-                        trade["target_1"] = t2
-                        trade["trade_management_note"] = "Short target extended to T2; profit locked."
-                        msg = f"🚀 <b>SHORT TARGET EXTENDED ({sym}):</b> Dropped past ₹{t1}! New Target: <b>₹{t2}</b> | SL: <b>₹{trade['stop_loss']}</b>."
-                        actions_taken.append(msg)
-                        tg_ticket = (
-                            f"🚀 <b>LIVE SHORT MODIFIED — TARGET EXTENDED</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📌 <b>Stock:</b> <code>{sym}</code> (SHORT {qty} Qty)\n"
-                            f"📉 <b>Current LTP:</b> ₹{ltp} (Below VWAP ₹{vwap})\n"
-                            f"🎯 <b>New Extended Target:</b> <b>₹{t2}</b>\n"
-                            f"🛡️ <b>Profit-Locked SL:</b> <b>₹{trade['stop_loss']}</b>"
-                        )
-                    else:
-                        trade["status"] = "WIN (TARGET HIT)"
-                        trade["exit_price"] = t1
-                        trade["pnl_pct"] = round(((entry - t1) / entry) * 100, 2)
-                        trade["pnl_inr"] = round((entry - t1) * qty, 2)
-                        trade["unrealized_pnl_inr"] = 0.0
-                        trade["trade_management_note"] = "Booked full short target profit."
-                        trade["mistake_diagnosis"] = "Short target achieved cleanly."
-                        closed_any = True
-                        self._recalculate_cash(self.portfolio)
-                        msg = f"✅ <b>TRADE COMPLETED — SHORT TARGET HIT ({sym}):</b> Covered {qty} shares @ ₹{t1} for <b>+₹{trade['pnl_inr']:,.0f}</b>!"
-                        actions_taken.append(msg)
-                        tg_ticket = (
-                            f"✅ <b>TRADE COMPLETED — SHORT TARGET COVERED (BUY EXIT)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📌 <b>Stock:</b> <code>{sym}</code> (Closed SHORT)\n"
-                            f"🕒 <b>Exit Time:</b> {now_time} IST\n"
-                            f"📦 <b>Qty Covered:</b> {qty} Shares\n"
-                            f"🔢 <b>Short Entry:</b> ₹{entry} ➔ <b>Buy Cover:</b> <b>₹{t1}</b>\n"
-                            f"💰 <b>Net Realized Profit:</b> <b>+₹{trade['pnl_inr']:,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                            f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
-                        )
-
-                elif ltp >= sl:
-                    trade["status"] = "BREAKEVEN EXIT" if sl <= entry else "LOSS (SL HIT)"
-                    trade["exit_price"] = sl
-                    trade["pnl_pct"] = round(((entry - sl) / entry) * 100, 2)
-                    trade["pnl_inr"] = round((entry - sl) * qty, 2)
-                    trade["unrealized_pnl_inr"] = 0.0
-                    trade["trade_management_note"] = "Stopped out at active SL."
-                    closed_any = True
-                    self._recalculate_cash(self.portfolio)
-                    msg = f"🛑 <b>TRADE COMPLETED — SHORT SL HIT ({sym}):</b> Covered {qty} shares @ ₹{sl} (P&L: ₹{trade['pnl_inr']:+,.0f})."
-                    actions_taken.append(msg)
-                    tg_ticket = (
-                        f"🛑 <b>TRADE COMPLETED — SHORT STOP-LOSS EXIT</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> (Closed SHORT)\n"
-                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
-                        f"📦 <b>Qty Covered:</b> {qty} Shares\n"
-                        f"🔢 <b>Short Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{sl}</b>\n"
-                        f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                        f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
-                    )
-
-                elif r_multiple >= 0.8 and sl > entry:
-                    trade["stop_loss"] = entry
-                    trade["trade_management_note"] = "Trailed Short SL to Breakeven (Risk = Rs 0)."
-                    msg = f"🛡️ <b>SHORT SL TRAILED TO BREAKEVEN ({sym}):</b> Moved SL to ₹{entry}."
-                    actions_taken.append(msg)
-                    tg_ticket = (
-                        f"🛡️ <b>LIVE SHORT MODIFIED — SL TRAILED TO BREAKEVEN</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> (SHORT {qty} Qty)\n"
-                        f"📉 <b>Current LTP:</b> ₹{ltp}\n"
-                        f"🛡️ <b>Updated Stop-Loss:</b> <b>₹{entry}</b> <i>(Risk = ₹0)</i>"
-                    )
-
-                elif r_multiple <= -0.65 and ltp > vwap:
-                    trade["status"] = "EARLY CUT (LOSS MINIMIZED)"
-                    trade["exit_price"] = ltp
-                    trade["pnl_pct"] = round(((entry - ltp) / entry) * 100, 2)
-                    trade["pnl_inr"] = round((entry - ltp) * qty, 2)
-                    trade["unrealized_pnl_inr"] = 0.0
-                    saved_inr = round((sl - ltp) * qty, 2)
-                    trade["trade_management_note"] = f"Covered early above VWAP; saved Rs {saved_inr:,.0f}."
-                    closed_any = True
-                    self._recalculate_cash(self.portfolio)
-                    msg = f"⚠️ <b>TRADE COMPLETED — EARLY SHORT COVER ({sym}):</b> Covered @ ₹{ltp} (P&L: ₹{trade['pnl_inr']:+,.0f}), saving ₹{saved_inr:,.0f}!"
-                    actions_taken.append(msg)
-                    tg_ticket = (
-                        f"⚠️ <b>TRADE COMPLETED — EARLY SHORT COVER</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> (Covered above VWAP ₹{vwap})\n"
-                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
-                        f"📦 <b>Qty Covered:</b> {qty} Shares @ <b>₹{ltp}</b>\n"
-                        f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                        f"💡 <b>Saved vs Full SL:</b> +₹{saved_inr:,.0f}\n"
-                        f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
-                    )
-
-            if notify_telegram and tg_ticket:
-                self.notifier.send_message(tg_ticket)
+                    self.notifier.send_message(tg_ticket)
 
         self._save_ledger()
         self._save_portfolio()
-        if closed_any:
-            self._optimize_weights_from_history()
         return actions_taken
+
+    # ------------------------------------------------------------------
+    # 4. PER-TRADE RESEARCH, MISTAKE AUTOPSY & CONTINUOUS LEARNING
+    # ------------------------------------------------------------------
+    def _research_and_learn_from_trade(self, trade, pre_fetched_news=None):
+        """
+        Researches the stock's news, timing window, profit giveback, and signal accuracy
+        immediately upon trade completion so the AI improves on the very next trade.
+        """
+        sym = trade["symbol"]
+        pnl_inr = float(trade.get("pnl_inr", 0.0))
+        peak_pnl = float(trade.get("peak_pnl_inr", 0.0))
+        side = trade.get("action", "BUY")
+        session_used = trade.get("entry_session", self._get_session_bucket())
+        hold_mins = float(trade.get("hold_minutes", 0.0))
+
+        news_ctx = pre_fetched_news or self._analyze_live_news_emotion(sym)
+        latest_headline = news_ctx.get("top_headline", "No new headline")
+        latest_emotion = news_ctx.get("emotion", "NEUTRAL")
+
+        if pnl_inr < 0:
+            f_scores = trade.get("factor_scores", {})
+            culprit = max(f_scores.items(), key=lambda x: x[1])[0] if f_scores else "momentum"
+            entry_rsi = float(trade.get("entry_rsi", 50.0))
+
+            reasons = []
+            if (side == "BUY" and latest_emotion == "NEGATIVE") or (side.startswith("SELL") and latest_emotion == "POSITIVE"):
+                reasons.append(f"sudden {latest_emotion} news ('{latest_headline[:65]}')")
+            if peak_pnl > abs(pnl_inr) * 0.5 and peak_pnl > 200:
+                reasons.append(f"gave back +₹{peak_pnl:,.0f} peak profit before tightening giveback cutoff")
+            if side == "BUY" and entry_rsi > 68:
+                reasons.append(f"overbought entry RSI {entry_rsi}")
+            if not reasons:
+                reasons.append(f"over-weighted {culprit.upper()} ({f_scores.get(culprit, 50)}) in {session_used}")
+
+            lesson = (
+                f"MISTAKE AUTOPSY ({sym} {side}, ₹{pnl_inr:+,.0f}): Failed due to {', '.join(reasons)}. "
+                f"Action: Lowered {session_used} priority, tightened profit-giveback & {culprit} weight."
+            )
+            trade["mistake_diagnosis"] = lesson
+            self.portfolio["mistakes_identified"] = (
+                [lesson] + self.portfolio.get("mistakes_identified", [])
+            )[:20]
+        else:
+            lesson = (
+                f"WINNING EDGE ({sym} {side}, +₹{pnl_inr:,.0f} in {hold_mins:.0f}m): "
+                f"Confirmed edge in {session_used} with {latest_emotion} news alignment."
+            )
+            trade["mistake_diagnosis"] = lesson
+
+        self.weights.setdefault("trade_lessons_log", []).insert(0, {
+            "timestamp": self._now_ist().strftime("%Y-%m-%d %I:%M %p IST"),
+            "symbol": sym,
+            "pnl_inr": round(pnl_inr, 2),
+            "session": session_used,
+            "emotion_at_exit": latest_emotion,
+            "lesson": lesson
+        })
+        self.weights["trade_lessons_log"] = self.weights["trade_lessons_log"][:50]
+
+        self._optimize_weights_from_history(force_recalibrate=True)
+        return lesson
 
     def evaluate_open_trades_and_learn(self, notify_telegram=True):
         """
-        End-of-Day Settlement + Mistake Autopsy + 5-Layer Statistical Self-Learning Optimizer.
-        Safety guarantee: Any trade still OPEN is squared off using its exact 3:20 PM IST
-        intraday candle close (never NSE's 3:30 PM closing auction price).
+        Periodic Deep Calibration & Equity Snapshot (no forced price override).
+        Runs live management first, then logs equity and recalibrates all 6 learning layers.
         """
-        open_trades = [t for t in self.ledger if t.get("status") == "OPEN"]
-        if not open_trades:
-            learning_summary = self._optimize_weights_from_history(force_recalibrate=True)
-            return {"evaluated": 0, "message": f"All trades already settled by 3:20 PM IST. {learning_summary}"}
-
-        tickers = list({f"{t['symbol']}.NS" for t in open_trades})
-        data = yf.download(
-            tickers=tickers,
-            period="5d",
-            interval="1d",
-            group_by="ticker",
-            threads=True,
-            progress=False
-        )
-
-        evaluated_count = 0
-        new_mistakes = []
-
-        for trade in self.ledger:
-            if trade.get("status") != "OPEN":
-                continue
-
-            sym = trade["symbol"]
-            sym_ns = f"{sym}.NS"
-            try:
-                df = data[sym_ns].dropna(how="all") if len(tickers) > 1 else data.dropna(how="all")
-                if df.empty:
-                    continue
-
-                latest = df.iloc[-1]
-                day_high = float(latest["High"])
-                day_low = float(latest["Low"])
-                daily_close = float(latest["Close"])
-
-                # Strictly cap intraday square-off price to the 3:20 PM IST candle close
-                price_at_320pm = self._get_320pm_ist_price(sym, daily_close)
-
-                entry = float(trade["entry_price"])
-                t1 = float(trade["target_1"])
-                sl = float(trade["stop_loss"])
-                qty = int(trade.get("qty", max(1, int(30000 // entry))))
-                side = trade["action"]
-
-                if side == "BUY":
-                    hit_target = day_high >= t1
-                    hit_sl = day_low <= sl
-                    if hit_target and not hit_sl:
-                        status, exit_p = "WIN (TARGET HIT)", t1
-                    elif hit_sl and not hit_target:
-                        status, exit_p = "LOSS (SL HIT)", sl
-                    elif hit_target and hit_sl:
-                        status, exit_p = ("WIN (TARGET HIT)", t1) if price_at_320pm >= entry else ("LOSS (SL HIT)", sl)
-                    else:
-                        exit_p = price_at_320pm
-                        status = "3:20 PM WIN (AUTO SQUARE-OFF)" if exit_p >= entry else "3:20 PM LOSS (AUTO SQUARE-OFF)"
-                    pnl_pct = ((exit_p - entry) / entry) * 100.0
-                    pnl_inr = (exit_p - entry) * qty
-                    exit_action_label = "SELL (3:20 PM IST Cutoff)"
-                else:
-                    hit_target = day_low <= t1
-                    hit_sl = day_high >= sl
-                    if hit_target and not hit_sl:
-                        status, exit_p = "WIN (TARGET HIT)", t1
-                    elif hit_sl and not hit_target:
-                        status, exit_p = "LOSS (SL HIT)", sl
-                    elif hit_target and hit_sl:
-                        status, exit_p = ("WIN (TARGET HIT)", t1) if price_at_320pm <= entry else ("LOSS (SL HIT)", sl)
-                    else:
-                        exit_p = price_at_320pm
-                        status = "3:20 PM WIN (AUTO SQUARE-OFF)" if exit_p <= entry else "3:20 PM LOSS (AUTO SQUARE-OFF)"
-                    pnl_pct = ((entry - exit_p) / entry) * 100.0
-                    pnl_inr = (entry - exit_p) * qty
-                    exit_action_label = "BUY TO COVER (3:20 PM IST Cutoff)"
-
-                trade["status"] = status
-                trade["exit_price"] = round(exit_p, 2)
-                trade["current_price"] = round(price_at_320pm, 2)
-                trade["unrealized_pnl_inr"] = 0.0
-                trade["day_high"] = round(day_high, 2)
-                trade["day_low"] = round(day_low, 2)
-                trade["pnl_pct"] = round(pnl_pct, 2)
-                trade["pnl_inr"] = round(pnl_inr, 2)
-                trade["trade_management_note"] = f"Settled at 3:20 PM IST cutoff price ₹{exit_p:.2f}."
-
-                if pnl_inr < 0:
-                    f_scores = trade.get("factor_scores", {})
-                    culprit = max(f_scores.items(), key=lambda x: x[1])[0] if f_scores else "momentum"
-                    entry_rsi = float(trade.get("entry_rsi", 50.0))
-                    rsi_note = f" (Bought at high RSI {entry_rsi})" if (side == "BUY" and entry_rsi > 68) else ""
-                    diagnosis = (
-                        f"{sym} ({side}) lost ₹{abs(pnl_inr):,.0f}{rsi_note}: Over-relied on {culprit.upper()} "
-                        f"score ({f_scores.get(culprit, 50)}). Penalizing {sym} & {culprit} weight."
-                    )
-                    trade["mistake_diagnosis"] = diagnosis
-                    new_mistakes.append(diagnosis)
-                else:
-                    trade["mistake_diagnosis"] = "Execution aligned with trend & 3:20 PM risk rules."
-
-                evaluated_count += 1
-                self._recalculate_cash(self.portfolio)
-
-                if notify_telegram:
-                    result_icon = "✅ <b>TRADE COMPLETED (PROFIT)</b>" if pnl_inr >= 0 else "🔴 <b>TRADE COMPLETED (LOSS)</b>"
-                    close_ticket = (
-                        f"{result_icon}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> | <b>Order:</b> {exit_action_label}\n"
-                        f"🏷️ <b>Outcome:</b> {status}\n"
-                        f"🕒 <b>Cutoff Time:</b> 03:20 PM IST\n"
-                        f"📦 <b>Quantity:</b> {qty} Shares\n"
-                        f"🔢 <b>Entry Price:</b> ₹{entry} ➔ <b>Exit Price:</b> <b>₹{trade['exit_price']}</b>\n"
-                        f"📊 <b>Day Range:</b> High ₹{trade['day_high']} | Low ₹{trade['day_low']}\n"
-                        f"💰 <b>Net Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
-                        f"🏦 <b>New Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
-                        f"🧠 <b>AI Diagnosis:</b> <i>{trade['mistake_diagnosis']}</i>"
-                    )
-                    self.notifier.send_message(close_ticket)
-
-            except Exception as e:
-                print(f"[WARN] Could not evaluate {sym}: {e}")
-
-        if new_mistakes:
-            self.portfolio["mistakes_identified"] = (new_mistakes + self.portfolio.get("mistakes_identified", []))[:15]
-
-        self._save_ledger()
-        self._save_portfolio()
+        self.manage_live_positions(notify_telegram=notify_telegram)
+        learning_summary = self._optimize_weights_from_history(force_recalibrate=True)
 
         today_str = self._now_ist().strftime("%Y-%m-%d")
-        today_pnl = sum(float(t.get("pnl_inr", 0)) for t in self.ledger if t.get("date") == today_str and t.get("status") != "OPEN")
+        today_pnl = sum(
+            float(t.get("pnl_inr", 0))
+            for t in self.ledger
+            if t.get("date") == today_str and t.get("status") != "OPEN"
+        )
+        self._recalculate_cash(self.portfolio)
         eq_log = self.portfolio.get("daily_equity_log", [])
         if eq_log and eq_log[-1].get("date") == today_str:
             eq_log[-1]["equity"] = self.portfolio["current_equity"]
             eq_log[-1]["pnl"] = round(today_pnl, 2)
         else:
-            eq_log.append({"date": today_str, "equity": self.portfolio["current_equity"], "pnl": round(today_pnl, 2)})
+            eq_log.append({
+                "date": today_str,
+                "equity": self.portfolio["current_equity"],
+                "pnl": round(today_pnl, 2)
+            })
         self.portfolio["daily_equity_log"] = eq_log[-60:]
         self._save_portfolio()
 
-        learning_summary = self._optimize_weights_from_history(force_recalibrate=True)
-
-        if notify_telegram and evaluated_count > 0:
-            perf = self.get_performance_metrics()
-            summary_ticket = (
-                f"🏦 <b>CLOSED WALLET & 5-LAYER AI BRAIN UPDATED</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌱 <b>Original Seed Capital:</b> ₹{perf['initial_capital']:,.2f}\n"
-                f"💼 <b>New Total Wallet Equity:</b> <b>₹{perf['current_equity']:,.2f}</b> ({perf['total_pnl_pct']:+.2f}%)\n"
-                f"💵 <b>Next-Day Trading Budget:</b> <b>₹{perf['available_cash']:,.2f}</b>\n"
-                f"📈 <b>Cumulative Net P&L:</b> <b>₹{perf['total_pnl_inr']:+,.2f}</b>\n"
-                f"🎯 <b>Win Rate:</b> {perf['win_rate']}% ({perf['settled_trades']} settled)\n"
-                f"🧠 <b>Self-Learning Evolution:</b> <i>{learning_summary}</i>"
-            )
-            self.notifier.send_message(summary_ticket)
-
-        return {"evaluated": evaluated_count, "message": learning_summary}
+        open_count = sum(1 for t in self.ledger if t.get("status") == "OPEN")
+        return {
+            "evaluated": len(self.ledger) - open_count,
+            "open_positions": open_count,
+            "message": learning_summary
+        }
 
     def _optimize_weights_from_history(self, force_recalibrate=False):
         """
-        5-LAYER STATISTICAL SELF-LEARNING ENGINE:
-        Computes clean, idempotent parameter updates directly from all settled trades in `trade_history.json`:
-        1. Factor Pillar Expectancy (Volume vs News vs Pre-Market vs Momentum)
-        2. Per-Ticker Win Rate & Net P&L Memory (Auto-Blacklist & Preferred list)
-        3. Directional Bias (BUY vs SHORT accuracy)
-        4. ATR Stop-Loss & Target Multiplier Tuning (from SL hit rate vs Target hit rate)
-        5. RSI Overbought/Oversold Ceiling & Minimum Conviction Threshold Tuning
+        6-LAYER AUTONOMOUS SELF-LEARNING ENGINE:
+        1. Factor Pillar Expectancy (Volume vs News Emotion vs Pre-Market vs Momentum)
+        2. Per-Ticker Win Rate & Net P&L Memory (Auto-Blacklist & Star Performers)
+        3. Time-of-Day Session Window Learning (Teaches AI WHEN to take trades)
+        4. Directional Bias (BUY vs SHORT accuracy)
+        5. Dynamic Exit & Giveback Calibration (Teaches AI WHEN to cut trades)
+        6. Minimum Conviction & RSI Exhaustion Threshold Tuning
         """
         settled = [t for t in self.ledger if t.get("status") != "OPEN" and "factor_scores" in t]
         if not settled:
@@ -1058,36 +971,43 @@ class AdaptiveTradeEngine:
         if not force_recalibrate and len(settled) == int(self.weights.get("last_evaluated_count", 0)):
             return self.weights.get("learning_notes", "Model up to date.")
 
-        # ------------------------------------------------------------------
-        # LAYER 1: Clean Baseline Factor Weight Optimization
-        # ------------------------------------------------------------------
+        # LAYER 1: Factor Weights
         base = {"volume": 0.28, "sentiment": 0.28, "premarket": 0.22, "momentum": 0.22}
         adjustments = {"volume": 0.0, "sentiment": 0.0, "premarket": 0.0, "momentum": 0.0}
-        recent = settled[-40:]
+        recent = settled[-50:]
 
         wins_count = 0
         sl_hits = 0
         target_hits = 0
+        giveback_losses = 0
         winning_convictions = []
         losing_convictions = []
         losing_buy_rsis = []
+        winning_hold_times = []
 
         for t in recent:
             pnl = float(t.get("pnl_pct", 0.0))
+            pnl_inr = float(t.get("pnl_inr", 0.0))
+            peak_inr = float(t.get("peak_pnl_inr", 0.0))
             status_str = str(t.get("status", ""))
             conv = float(t.get("conviction", 60.0))
+            hold_m = float(t.get("hold_minutes", 0.0))
 
             if pnl > 0:
                 wins_count += 1
                 winning_convictions.append(conv)
+                if hold_m > 0:
+                    winning_hold_times.append(hold_m)
             else:
                 losing_convictions.append(conv)
+                if peak_inr > 250 and pnl_inr < 0:
+                    giveback_losses += 1
                 if t.get("action") == "BUY" and "entry_rsi" in t:
                     losing_buy_rsis.append(float(t["entry_rsi"]))
 
             if "SL HIT" in status_str:
                 sl_hits += 1
-            elif "TARGET HIT" in status_str:
+            elif "TARGET" in status_str or "PROFIT LOCKED" in status_str:
                 target_hits += 1
 
             direction = 1.0 if pnl > 0 else (-1.25 if pnl < 0 else 0.0)
@@ -1112,9 +1032,7 @@ class AdaptiveTradeEngine:
             self.weights["premarket_weight"]
         ), 3)
 
-        # ------------------------------------------------------------------
-        # LAYER 2: Ticker Memory, Auto-Blacklisting & Star Performers
-        # ------------------------------------------------------------------
+        # LAYER 2: Per-Ticker Memory
         ticker_stats = {}
         for t in settled:
             sym = t["symbol"]
@@ -1140,9 +1058,26 @@ class AdaptiveTradeEngine:
         self.weights["blacklisted_tickers"] = blacklisted
         self.weights["preferred_tickers"] = preferred
 
-        # ------------------------------------------------------------------
-        # LAYER 3: Directional Bias Calibration (BUY vs SHORT Accuracy)
-        # ------------------------------------------------------------------
+        # LAYER 3: Learned Time-of-Day Session Windows
+        session_stats = {}
+        for t in settled:
+            sess = t.get("entry_session", "MORNING_TREND (09:45-11:30)")
+            pnl_inr = float(t.get("pnl_inr", 0.0))
+            if sess not in session_stats:
+                session_stats[sess] = {"trades": 0, "wins": 0, "net_pnl_inr": 0.0, "score_adj": 0.0}
+            session_stats[sess]["trades"] += 1
+            if pnl_inr > 0:
+                session_stats[sess]["wins"] += 1
+            session_stats[sess]["net_pnl_inr"] = round(session_stats[sess]["net_pnl_inr"] + pnl_inr, 2)
+
+        for sess, s_data in session_stats.items():
+            wr = (s_data["wins"] / s_data["trades"]) * 100.0
+            s_data["win_rate"] = round(wr, 1)
+            s_data["score_adj"] = round(max(-12.0, min(8.0, (wr - 50.0) * 0.25)), 1) if s_data["trades"] >= 2 else 0.0
+
+        self.weights["session_memory"] = session_stats
+
+        # LAYER 4: Directional Bias
         buy_trades = [t for t in recent if t.get("action") == "BUY"]
         short_trades = [t for t in recent if str(t.get("action", "")).startswith("SELL")]
 
@@ -1152,9 +1087,7 @@ class AdaptiveTradeEngine:
         self.weights["buy_bias_bonus"] = round(max(-6.0, min(6.0, (buy_wr - 50.0) * 0.15)), 2) if len(buy_trades) >= 2 else 0.0
         self.weights["short_bias_bonus"] = round(max(-6.0, min(6.0, (short_wr - 50.0) * 0.15)), 2) if len(short_trades) >= 2 else 0.0
 
-        # ------------------------------------------------------------------
-        # LAYER 4: Adaptive ATR Stop-Loss & Target Multiplier Tuning
-        # ------------------------------------------------------------------
+        # LAYER 5: Dynamic Exit, Profit Giveback & Hold-Horizon Tuning
         sl_rate = (sl_hits / len(recent)) * 100.0
         tp_rate = (target_hits / len(recent)) * 100.0
 
@@ -1170,9 +1103,15 @@ class AdaptiveTradeEngine:
         else:
             self.weights["atr_tp_multiplier"] = 1.60
 
-        # ------------------------------------------------------------------
-        # LAYER 5: Minimum Conviction Threshold & RSI Ceiling Calibration
-        # ------------------------------------------------------------------
+        # Tighten profit giveback cutoff if winning trades reversed into losses
+        if giveback_losses >= 2:
+            self.weights["max_profit_giveback_pct"] = max(25.0, round(45.0 - (giveback_losses * 5.0), 1))
+
+        if winning_hold_times:
+            avg_win_hold = sum(winning_hold_times) / len(winning_hold_times)
+            self.weights["learned_max_hold_mins"] = round(max(45.0, min(240.0, avg_win_hold * 1.5)), 1)
+
+        # LAYER 6: Minimum Conviction & RSI Ceiling Calibration
         if losing_convictions and winning_convictions:
             avg_loss_conv = sum(losing_convictions) / len(losing_convictions)
             avg_win_conv = sum(winning_convictions) / len(winning_convictions)
@@ -1180,36 +1119,33 @@ class AdaptiveTradeEngine:
                 learned_cutoff = (avg_loss_conv + avg_win_conv) / 2.0
                 self.weights["min_conviction_threshold"] = round(max(50.0, min(68.0, learned_cutoff)), 1)
 
-        if losing_buy_rsis:
-            high_rsi_losses = [r for r in losing_buy_rsis if r >= 67.0]
-            if len(high_rsi_losses) >= 2:
-                self.weights["buy_rsi_ceiling"] = 66.0
+        if losing_buy_rsis and len([r for r in losing_buy_rsis if r >= 67.0]) >= 2:
+            self.weights["buy_rsi_ceiling"] = 66.0
 
         recent_win_rate = (wins_count / len(recent)) * 100.0
-        if recent_win_rate >= 60.0 and self.portfolio["current_equity"] >= INITIAL_CAPITAL:
+        total_contrib = float(self.portfolio.get("total_capital_contributed", INITIAL_CAPITAL))
+        if recent_win_rate >= 60.0 and self.portfolio["current_equity"] >= total_contrib:
             self.weights["risk_per_trade_pct"] = min(1.5, round(1.0 + ((recent_win_rate - 50.0) * 0.015), 2))
-        elif recent_win_rate < 45.0 or self.portfolio["current_equity"] < INITIAL_CAPITAL:
+        elif recent_win_rate < 45.0 or self.portfolio["current_equity"] < total_contrib:
             self.weights["risk_per_trade_pct"] = max(0.6, round(1.0 - ((50.0 - recent_win_rate) * 0.015), 2))
 
         self.weights["generation"] = len(settled) + 1
         self.weights["last_evaluated_count"] = len(settled)
-        self.weights["last_updated"] = self._now_ist().strftime("%Y-%m-%d %I:%M %p")
+        self.weights["last_updated"] = self._now_ist().strftime("%Y-%m-%d %I:%M %p IST")
 
         best_pillar = max(
             [("Volume", self.weights["volume_weight"]),
-             ("News AI", self.weights["sentiment_weight"]),
+             ("News Emotion", self.weights["sentiment_weight"]),
              ("Pre-Market", self.weights["premarket_weight"]),
              ("Chart/Tech", self.weights["momentum_weight"])],
             key=lambda x: x[1]
         )
-        bl_note = f" | Blocked: {', '.join(blacklisted)}" if blacklisted else ""
-        pref_note = f" | Top Edge: {', '.join(preferred[:3])}" if preferred else ""
         note = (
-            f"Gen #{self.weights['generation']} ({len(settled)} trades analyzed): "
-            f"Best Pillar={best_pillar[0]} ({int(best_pillar[1]*100)}%), "
+            f"Gen #{self.weights['generation']} ({len(settled)} trades): "
+            f"Top Edge={best_pillar[0]} ({int(best_pillar[1]*100)}%), "
             f"Min Conviction={self.weights['min_conviction_threshold']}, "
-            f"ATR SL={self.weights['atr_sl_multiplier']}x / TP={self.weights['atr_tp_multiplier']}x"
-            f"{pref_note}{bl_note}"
+            f"Giveback Cutoff={self.weights['max_profit_giveback_pct']}%, "
+            f"Max Hold={self.weights['learned_max_hold_mins']}m"
         )
         self.weights["learning_notes"] = note
         self._save_weights()
@@ -1221,13 +1157,16 @@ class AdaptiveTradeEngine:
         open_trades = [t for t in self.ledger if t.get("status") == "OPEN"]
         unrealized_total = sum(float(t.get("unrealized_pnl_inr", 0.0)) for t in open_trades)
 
+        total_contributed = float(self.portfolio.get("total_capital_contributed", INITIAL_CAPITAL))
         wins = [t for t in settled if float(t.get("pnl_inr", 0)) > 0]
         win_rate = round((len(wins) / len(settled)) * 100.0, 1) if settled else 0.0
         total_pnl_inr = round(sum(float(t.get("pnl_inr", 0)) for t in settled), 2)
-        roi_pct = round((total_pnl_inr / INITIAL_CAPITAL) * 100.0, 2)
+        roi_pct = round((total_pnl_inr / total_contributed) * 100.0, 2) if total_contributed > 0 else 0.0
 
         return {
             "initial_capital": INITIAL_CAPITAL,
+            "manual_deposits": self.portfolio.get("manual_deposits", 0.0),
+            "total_capital_contributed": total_contributed,
             "current_equity": self.portfolio["current_equity"],
             "available_cash": self.portfolio["available_cash"],
             "allocated_capital": self.portfolio["allocated_capital"],

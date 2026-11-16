@@ -1,32 +1,31 @@
+import base64
 import json
 import os
+import urllib.request
 from datetime import datetime
-import pytz
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import streamlit as st
+from trade_engine import AdaptiveTradeEngine
 
-# ---------------------------------------------------------
-# 1. PAGE CONFIG & CLEAN RESPONSIVE CSS (Fixes Clipping)
-# ---------------------------------------------------------
+IST = ZoneInfo("Asia/Kolkata")
+
 st.set_page_config(
-    page_title="PulseAI — NSE Paper Portfolio",
+    page_title="PulseAI — Autonomous NSE Portfolio",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-IST = pytz.timezone("Asia/Kolkata")
-
 st.markdown(
     """
     <style>
-        /* Fix top tab clipping below Streamlit header */
         .block-container {
             padding-top: 3.5rem !important;
             padding-bottom: 2rem !important;
-            max-width: 1280px;
+            max-width: 1320px;
         }
-        /* Clean readable tabs */
         .stTabs [data-baseweb="tab-list"] {
             gap: 10px;
             border-bottom: 1px solid rgba(255,255,255,0.12);
@@ -39,7 +38,6 @@ st.markdown(
             font-weight: 600;
             font-size: 0.95rem;
         }
-        /* Hero banner */
         .hero-card {
             background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
             border: 1px solid rgba(56, 189, 248, 0.25);
@@ -58,7 +56,6 @@ st.markdown(
             border: 1px solid rgba(16, 185, 129, 0.35);
             margin-top: 8px;
         }
-        /* Metric cards */
         div[data-testid="stMetric"] {
             background-color: rgba(30, 41, 59, 0.55);
             border: 1px solid rgba(255, 255, 255, 0.08);
@@ -70,119 +67,149 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------------------------------------------------------
-# 2. SAFE JSON LOADERS
-# ---------------------------------------------------------
-def load_json(filepath, default):
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return default
-    return default
+
+def persist_portfolio_to_github(portfolio_dict: dict) -> bool:
+    """
+    Persists user-deposited funds back to portfolio_state.json in GitHub
+    so Streamlit Cloud container restarts never reset manual deposits.
+    """
+    token = st.secrets.get("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", ""))
+    repo = st.secrets.get("GITHUB_REPO", "sohilaftab/ai-stock-screener")
+    if not token:
+        return False
+
+    api_url = f"https://api.github.com/repos/{repo}/contents/portfolio_state.json"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "PulseAI-Streamlit",
+    }
+    try:
+        req = urllib.request.Request(api_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            existing = json.loads(resp.read().decode("utf-8"))
+        sha = existing.get("sha")
+
+        encoded = base64.b64encode(json.dumps(portfolio_dict, indent=2).encode("utf-8")).decode("utf-8")
+        payload = json.dumps({
+            "message": "chore(user): manual capital deposit via PulseAI dashboard",
+            "content": encoded,
+            "sha": sha,
+            "branch": "main",
+        }).encode("utf-8")
+
+        put_req = urllib.request.Request(api_url, data=payload, headers=headers, method="PUT")
+        with urllib.request.urlopen(put_req, timeout=8):
+            return True
+    except Exception:
+        return False
 
 
-portfolio = load_json(
-    "portfolio_state.json",
-    {"starting_capital": 150000.0, "available_cash": 150000.0, "realized_pnl": 0.0},
-)
-trades = load_json("trade_history.json", [])
-watchlist = load_json("morning_watchlist.json", [])
-
+engine = AdaptiveTradeEngine()
+perf = engine.get_performance_metrics()
+trades = engine.ledger
 open_trades = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
 closed_trades = [t for t in trades if str(t.get("status", "")).upper() != "OPEN"]
 
-starting_cap = float(portfolio.get("starting_capital", 150000.0))
-available_cash = float(portfolio.get("available_cash", starting_cap))
-invested_cash = sum(float(t.get("allocated_capital", t.get("entry_price", 0) * t.get("qty", 0))) for t in open_trades)
-unrealized_pnl = sum(float(t.get("unrealized_pnl", 0.0)) for t in open_trades)
-realized_pnl = float(portfolio.get("realized_pnl", sum(float(t.get("pnl", 0.0)) for t in closed_trades)))
-current_equity = available_cash + invested_cash + unrealized_pnl
-total_return_pct = ((current_equity - starting_cap) / starting_cap * 100) if starting_cap else 0.0
-
-wins = sum(1 for t in closed_trades if float(t.get("pnl", 0.0)) > 0)
-win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0.0
+watchlist_data = []
+if os.path.exists("morning_watchlist.json"):
+    try:
+        with open("morning_watchlist.json", "r", encoding="utf-8") as f:
+            raw_wl = json.load(f)
+            watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else raw_wl
+    except Exception:
+        watchlist_data = []
 
 # ---------------------------------------------------------
-# 4. CLEAN SIDEBAR (No Truncated Numbers)
+# SIDEBAR: WALLET & USER-ONLY MANUAL DEPOSIT FORM
 # ---------------------------------------------------------
 with st.sidebar:
     st.markdown("### 💼 Wallet Summary")
     st.metric(
         label="Total Portfolio Value",
-        value=f"₹{current_equity:,.0f}",
-        delta=f"{total_return_pct:+.2f}% overall",
+        value=f"₹{perf['current_equity']:,.0f}",
+        delta=f"{perf['total_pnl_pct']:+.2f}% net return",
     )
-    # Full-width metrics prevent "₹142,..." truncation
-    st.metric(label="Free Cash Ready to Trade", value=f"₹{available_cash:,.0f}")
-    st.metric(label="Money Currently in Stocks", value=f"₹{invested_cash:,.0f}")
+    st.metric(label="Free Cash Ready to Trade", value=f"₹{perf['available_cash']:,.0f}")
+    st.metric(label="Money Currently in Stocks", value=f"₹{perf['allocated_capital']:,.0f}")
+    st.caption(
+        f"Base Seed: ₹{perf['initial_capital']:,.0f} • "
+        f"Your Manual Deposits: ₹{perf['manual_deposits']:,.0f}"
+    )
 
     st.divider()
-    st.markdown("### 🕒 Daily AI Schedule (IST)")
-    st.caption(
-        "• **08:30 AM** — Scans overnight news & filings\n"
-        "• **09:10 AM** — Confirms gap-up & enters trades\n"
-        "• **10:15 / 12:15 / 02:15** — Protects profits & SL\n"
-        "• **03:40 PM** — Closes day & trains AI model"
-    )
+    st.markdown("### ➕ Add Money Manually")
+    st.caption("Only you can add capital here. The AI never adds funds on its own.")
+    with st.form("manual_deposit_form", clear_on_submit=True):
+        deposit_amt = st.number_input(
+            "Deposit Amount (₹)",
+            min_value=1000,
+            max_value=10000000,
+            value=25000,
+            step=5000,
+        )
+        deposit_note = st.text_input("Deposit Note (Optional)", placeholder="e.g., Added extra trading funds")
+        if st.form_submit_button("Deposit Into Wallet", use_container_width=True):
+            updated_port = engine.add_manual_funds(
+                deposit_amt,
+                note=deposit_note or "Manual deposit via Dashboard",
+                notify_telegram=True,
+            )
+            synced = persist_portfolio_to_github(updated_port)
+            if synced:
+                st.success(f"Added ₹{deposit_amt:,.0f} and synced permanently to GitHub!")
+            else:
+                st.success(f"Added ₹{deposit_amt:,.0f} to wallet! (Add GITHUB_TOKEN in Streamlit Secrets to auto-sync to GitHub.)")
+            st.rerun()
 
     st.divider()
     with st.expander("⚙️ Developer Controls (Keep OFF)", expanded=False):
-        st.caption("GitHub Actions runs automatically on schedule. Keep these OFF to avoid duplicate trades.")
+        st.caption("Cloud Autopilot runs via GitHub Actions. Keep browser overrides OFF.")
         st.toggle("Enable Browser Autopilot", value=False, key="ui_autopilot")
         st.checkbox("Simulate After-Hours Entry", value=False, key="ui_sim")
 
 # ---------------------------------------------------------
-# 5. MAIN HEADER & BEGINNER GUIDE
+# MAIN HEADER & KPI CARDS
 # ---------------------------------------------------------
 now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
 st.markdown(
     f"""
     <div class="hero-card">
-        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Smart NSE Paper Trading Dashboard</h2>
+        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Autonomous Emotion & Timing Portfolio Manager</h2>
         <p style="margin:6px 0 0 0; color:#94a3b8; font-size:0.95rem;">
-            Tracks a virtual <strong>₹1,50,000</strong> intraday portfolio using verified NSE corporate filings, news sentiment, and volume breakouts.
+            Self-learning NSE paper trading engine that learns optimal market timing, monitors live news emotion shifts, and researches every trade outcome.
         </p>
-        <div class="status-pill">● Cloud Autopilot Active • Last Synced: {now_ist}</div>
+        <div class="status-pill">● Autonomous Brain Gen #{engine.weights.get('generation', 1)} • Last Synced: {now_ist}</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-with st.expander("ℹ️ New here? Click to understand how this dashboard works in 30 seconds", expanded=False):
-    st.markdown(
-        """
-        1. **No Real Money Is Used:** This is a 100% virtual ₹1,50,000 paper wallet used to test AI stock picks safely.
-        2. **How Stocks Are Picked:** Every morning before market open, the AI reads Indian financial news, verifies announcements against official NSE filings, and checks pre-market volume.
-        3. **Automatic Risk Protection:** Every trade has a fixed **Target Price** (to book profit) and **Stop-Loss** (to cap losses automatically).
-        """
-    )
-
-# Top 4 KPI Cards
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Portfolio Value", f"₹{current_equity:,.0f}", f"Start: ₹{starting_cap:,.0f}")
-c2.metric("Available Cash", f"₹{available_cash:,.0f}", f"In Trades: ₹{invested_cash:,.0f}")
-c3.metric("Open Trade P&L", f"₹{unrealized_pnl:+,.0f}", f"{len(open_trades)} Active Positions")
-c4.metric("Win Rate", f"{win_rate:.0f}%", f"{wins}W / {len(closed_trades) - wins}L ({len(closed_trades)} Closed)")
+c1.metric("Portfolio Value", f"₹{perf['current_equity']:,.0f}", f"Contributed: ₹{perf['total_capital_contributed']:,.0f}")
+c2.metric("Available Cash", f"₹{perf['available_cash']:,.0f}", f"In Trades: ₹{perf['allocated_capital']:,.0f}")
+c3.metric("Open Trade P&L", f"₹{perf['unrealized_pnl_inr']:+,.0f}", f"{len(open_trades)} Active Positions")
+c4.metric("Settled Win Rate", f"{perf['win_rate']:.1f}%", f"Realized P&L: ₹{perf['total_pnl_inr']:+,.0f}")
 
 st.write("")
 
 # ---------------------------------------------------------
-# 6. CLEAN HUMAN-READABLE TABS
+# TABS: TRADES, POST-TRADE RESEARCH & LEARNED TIMING
 # ---------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(
+tab1, tab2, tab3, tab4 = st.tabs(
     [
         f"📊 Active & Past Trades ({len(open_trades)} Open)",
-        f"🌅 Morning AI Watchlist ({len(watchlist)})",
-        "🧠 How the AI Scores Stocks",
+        "🧠 AI Research & Mistake Autopsy",
+        "⏱️ Learned Entry & Exit Timing",
+        f"🌅 Watchlist ({len(watchlist_data)})",
     ]
 )
 
 with tab1:
     st.subheader("Currently Open Positions")
     if not open_trades:
-        st.info("No active trades right now. New positions are evaluated automatically at 09:10 AM IST on market days.")
+        st.info("No active trades right now. The AI enters automatically when a setup passes its learned conviction and time-of-day filters.")
     else:
         rows = []
         for t in open_trades:
@@ -190,80 +217,106 @@ with tab1:
             target = float(t.get("target_1", t.get("initial_target", 0)))
             sl = float(t.get("stop_loss", 0))
             qty = int(t.get("qty", 0))
-            invested = float(t.get("allocated_capital", entry * qty))
+            invested = float(t.get("capital_used", entry * qty))
+            unrl = float(t.get("unrealized_pnl_inr", 0))
+            peak = float(t.get("peak_pnl_inr", 0))
+            conv = float(t.get("conviction", 0))
 
-            # Use Online SGD win probability first, falling back to overall conviction
-            prob = float(t.get("ml_win_prob", t.get("conviction", 0)))
-            if prob <= 1.0:
-                prob *= 100
-
-            # Combine verified news headline with any live trailing SL/target note
             headline = str(t.get("headline", "")).strip()
-            mgmt_note = str(t.get("trade_management_note", "")).strip()
-            if headline and mgmt_note:
-                why_picked = f"{headline} ({mgmt_note})"
-            else:
-                why_picked = headline or mgmt_note or "Verified filing + volume breakout"
+            note = str(t.get("trade_management_note", "")).strip()
+            why_text = f"{headline} — {note}" if (headline and note) else (headline or note)
 
             rows.append(
                 {
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
-                    "Buy Price (₹)": f"₹{entry:,.2f}",
+                    "Side": t.get("action", "BUY"),
+                    "Entry Window": t.get("entry_session", t.get("timestamp", "—")),
+                    "Buy/Entry (₹)": f"₹{entry:,.2f}",
                     "Target (₹)": f"₹{target:,.2f}",
                     "Stop-Loss (₹)": f"₹{sl:,.2f}",
                     "Shares": qty,
                     "Invested (₹)": f"₹{invested:,.0f}",
-                    "AI Win Prob": f"{prob:.0f}%",
-                    "Why AI Picked It": why_picked,
+                    "Live P&L (₹)": f"₹{unrl:+,.0f} (Peak ₹{peak:+,.0f})",
+                    "AI Conviction": f"{conv:.1f}/100",
+                    "Catalyst & Live AI Note": why_text,
                 }
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    st.subheader("Completed Trade History")
+    st.subheader("Completed Trade History & Lessons")
     if not closed_trades:
-        st.caption("No settled trades yet. Open positions settle automatically at 03:40 PM IST.")
+        st.caption("No settled trades yet. Whenever the AI closes a trade, its exact exit reason and research lesson appear here.")
     else:
         closed_rows = []
-        for t in reversed(closed_trades[-20:]):
-            pnl = float(t.get("pnl", 0))
+        for t in reversed(closed_trades[-30:]):
+            pnl = float(t.get("pnl_inr", 0))
             closed_rows.append(
                 {
-                    "Date": t.get("date", t.get("entry_time", "—")),
+                    "Date": t.get("date", "—"),
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
-                    "Buy (₹)": f"₹{float(t.get('entry_price', 0)):,.2f}",
+                    "Side": t.get("action", "BUY"),
+                    "Entry (₹)": f"₹{float(t.get('entry_price', 0)):,.2f}",
                     "Exit (₹)": f"₹{float(t.get('exit_price', 0)):,.2f}",
-                    "Profit / Loss": f"₹{pnl:+,.0f}",
-                    "Result": "✅ Profit" if pnl > 0 else "❌ Stop-Loss / Exit",
+                    "Hold": f"{float(t.get('hold_minutes', 0)):.0f}m",
+                    "Profit / Loss": f"₹{pnl:+,.0f} ({float(t.get('pnl_pct', 0)):+.2f}%)",
+                    "AI Exit Reason": t.get("status", "CLOSED"),
+                    "Post-Trade Research Lesson": t.get("mistake_diagnosis", "—"),
                 }
             )
         st.dataframe(pd.DataFrame(closed_rows), use_container_width=True, hide_index=True)
+
 with tab2:
-    st.subheader("Today's Pre-Market AI Shortlist (08:30 AM Scan)")
-    if not watchlist:
-        st.info("Watchlist updates every weekday at 08:30 AM IST before the NSE pre-open session.")
+    st.subheader("🧠 Live Post-Trade Research & Mistake Autopsy Log")
+    st.caption(
+        "Immediately after every trade closes, the AI scans breaking news emotion for that stock, "
+        "identifies why it won or lost, and recalibrates its 6 learning layers."
+    )
+    lessons = engine.weights.get("trade_lessons_log", [])
+    if not lessons:
+        st.info("No post-trade research lessons recorded yet. They populate automatically as trades settle.")
     else:
-        st.dataframe(pd.DataFrame(watchlist), use_container_width=True, hide_index=True)
+        for item in lessons[:15]:
+            icon = "✅" if float(item.get("pnl_inr", 0)) >= 0 else "🔍"
+            st.markdown(f"{icon} **{item.get('timestamp', '')}** — {item.get('lesson', '')}")
+
+    st.divider()
+    st.subheader("💰 Manual Deposit History")
+    deposits = engine.portfolio.get("deposit_history", [])
+    if not deposits:
+        st.caption("No manual deposits added yet. Use the 'Add Money Manually' form in the left sidebar whenever you want to add funds.")
+    else:
+        st.dataframe(pd.DataFrame(deposits), use_container_width=True, hide_index=True)
 
 with tab3:
-    st.subheader("How PulseAI Filters Out Fake News & Bad Setups")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown(
-            """
-            **Step 1: Official NSE Filing Cross-Check**
-            Headlines from financial news are cross-checked against official NSE corporate announcements so rumors without filings are ignored.
+    st.subheader("⏱️ Learned Time-of-Day Session Performance")
+    st.caption("The AI tracks win rate and net P&L across 5 intraday windows and automatically avoids windows where it loses.")
+    sess_mem = engine.weights.get("session_memory", {})
+    if not sess_mem:
+        st.info("Session timing stats will appear automatically once trades complete across different market windows.")
+    else:
+        sess_rows = [
+            {
+                "Market Window (IST)": k,
+                "Trades Taken": v.get("trades", 0),
+                "Win Rate": f"{v.get('win_rate', 0)}%",
+                "Net P&L (₹)": f"₹{v.get('net_pnl_inr', 0):+,.0f}",
+                "AI Score Adjustment": f"{v.get('score_adj', 0):+.1f} pts",
+            }
+            for k, v in sess_mem.items()
+        ]
+        st.dataframe(pd.DataFrame(sess_rows), use_container_width=True, hide_index=True)
 
-            **Step 2: FinBERT Sentiment Scoring**
-            An Indian market NLP model (`finbert-sentfin`) reads whether the news is genuinely bullish (order wins, earnings beat) or just noise.
-            """
-        )
-    with col_b:
-        st.markdown(
-            """
-            **Step 3: Volume & Pre-Market Confirmation**
-            Even good news is skipped unless real buyer volume shows up at 09:10 AM IST.
+    st.divider()
+    st.subheader("🎛️ Current Learned AI Parameters (Auto-Updated After Every Trade)")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Min Conviction Bar", f"{engine.weights.get('min_conviction_threshold', 52.0)}/100")
+    p2.metric("Profit Giveback Cutoff", f"{engine.weights.get('max_profit_giveback_pct', 45.0)}%")
+    p3.metric("Optimal Max Hold", f"{engine.weights.get('learned_max_hold_mins', 180.0):.0f} mins")
+    p4.metric("ATR SL / Target", f"{engine.weights.get('atr_sl_multiplier', 0.55)}x / {engine.weights.get('atr_tp_multiplier', 1.60)}x")
 
-            **Step 4: Self-Improving Daily Learning**
-            At 03:40 PM IST, the model compares its morning predictions against actual closing prices and adjusts its weights automatically.
-            """
-        )
+with tab4:
+    st.subheader("Latest AI Watchlist Snapshot")
+    if not watchlist_data:
+        st.info("Watchlist updates automatically during market scans.")
+    else:
+        st.dataframe(pd.DataFrame(watchlist_data), use_container_width=True, hide_index=True)

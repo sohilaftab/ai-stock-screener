@@ -1,171 +1,141 @@
-import argparse
+import os
+import sys
 from datetime import datetime
-from dotenv import load_dotenv
-from nse_client import NSEClient
+from zoneinfo import ZoneInfo
+import pandas as pd
+
 from market_data import MarketDataScanner
 from sentiment_engine import FinBERTSentimentEngine
 from telegram_notifier import TelegramNotifier
 from trade_engine import AdaptiveTradeEngine
 
-load_dotenv()
+IST = ZoneInfo("Asia/Kolkata")
+
+# Official NSE Equity Trading Holidays (YYYY-MM-DD)
+NSE_HOLIDAYS = {
+    "2026-11-24",  # Guru Nanak Jayanti
+    "2026-12-25",  # Christmas
+    "2027-01-26",  # Republic Day
+    "2027-03-08",  # Mahashivratri
+    "2027-03-22",  # Holi
+    "2027-03-26",  # Good Friday
+    "2027-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+    "2027-05-01",  # Maharashtra Day
+    "2027-08-15",  # Independence Day
+    "2027-10-02",  # Mahatma Gandhi Jayanti
+}
 
 
-def enrich_dataframe_cli(df, sentiment_ai):
-    if df.empty:
-        return df
-    raw_labels, confs, headlines = [], [], []
-    for _, row in df.iterrows():
-        res = sentiment_ai.analyze_stock_sentiment(row["symbol"])
-        raw_labels.append(res["sentiment"])
-        confs.append(int(res["confidence"] * 100))
-        headlines.append(res["top_headline"])
-    enriched = df.copy()
-    enriched["raw_sentiment"] = raw_labels
-    enriched["AI Confidence"] = confs
-    enriched["Why Is It Moving? (Latest News)"] = headlines
-    return enriched
+def is_nse_open_day(now_ist: datetime) -> bool:
+    today_str = now_ist.strftime("%Y-%m-%d")
+    if now_ist.weekday() >= 5 or today_str in NSE_HOLIDAYS:
+        print(f"[INFO] NSE is closed today ({today_str} - Weekend/Holiday). Exiting cleanly.")
+        return False
+    return True
 
 
-def run_morning_prep_workflow(notifier):
-    """08:30 AM IST (Before 9 AM): Scans overnight news + multi-timeframe charts to build morning watchlist."""
-    nse = NSEClient()
-    tickers = nse.get_nifty_universe_tickers()
-    scanner = MarketDataScanner(tickers)
-    candidates, _ = scanner.scan_volume_breakouts(vol_multiplier=1.2, min_price_change_pct=0.8, top_n=10)
-
-    if candidates.empty:
-        return
-
-    sentiment_ai = FinBERTSentimentEngine()
-    enriched = enrich_dataframe_cli(candidates, sentiment_ai)
-
-    engine = AdaptiveTradeEngine()
-    recs = engine.generate_intraday_recommendations(enriched, top_k=5)
-    engine.save_morning_watchlist(recs)
-
-    perf = engine.get_performance_metrics()
-    lines = [
-        f"🌅 <b>PRE-9 AM MORNING RESEARCH & WATCHLIST ({datetime.now().strftime('%d %b')})</b>",
-        f"💰 <b>Autonomous Wallet:</b> ₹{perf['current_equity']:,.0f} (Available: ₹{perf['available_cash']:,.0f})\n"
-    ]
-    for _, r in recs.iterrows():
-        icon = "🟢 BUY" if r["action"] == "BUY" else "🔴 SHORT"
-        lines.append(
-            f"{icon} <b>{r['symbol']}</b> | Chart: <code>{r['chart_trend']}</code> (Score: <b>{r['conviction']}/100</b>)\n"
-            f"   • Plan: Qty <b>{r['qty']}</b> (₹{r['capital_used']:,.0f}) @ ₹{r['entry_price']} | T1: ₹{r['target_1']} | SL: ₹{r['stop_loss']}\n"
-            f"   • News ({r['sentiment']}): {r['headline']}\n"
-        )
-    lines.append("⏳ <i>Next update at 09:10 AM after NSE Pre-Market order book confirmation.</i>")
-    notifier.send_message("\n".join(lines))
+def is_live_market_hours(now_ist: datetime) -> bool:
+    mins = now_ist.hour * 60 + now_ist.minute
+    # NSE continuous trading session: 09:15 AM to 03:25 PM IST
+    return (9 * 60 + 15) <= mins <= (15 * 60 + 25)
 
 
-def run_premarket_update_workflow(notifier):
-    """09:10 AM IST: Checks NSE Pre-Market, detects changes vs Pre-9 AM list, and executes virtual trades."""
-    nse = NSEClient()
-    pre_df = nse.get_pre_open_movers(key="FO", min_gap_pct=1.5, min_volume=25000, top_n=8)
-    tickers = nse.get_nifty_universe_tickers()
-    scanner = MarketDataScanner(tickers)
-    candidates, _ = scanner.scan_volume_breakouts(vol_multiplier=1.2, min_price_change_pct=0.8, top_n=10)
+def scan_and_score_market(engine: AdaptiveTradeEngine, scanner: MarketDataScanner, sentiment_ai: FinBERTSentimentEngine):
+    """Scans NSE movers, enriches technicals + FinBERT news sentiment, and scores via the 6-Layer AI."""
+    raw_df = scanner.scan_market_movers() if hasattr(scanner, "scan_market_movers") else scanner.get_top_movers()
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-    sentiment_ai = FinBERTSentimentEngine()
-    enriched = enrich_dataframe_cli(candidates, sentiment_ai)
+    enriched_df = sentiment_ai.analyze_candidates(raw_df) if hasattr(sentiment_ai, "analyze_candidates") else sentiment_ai.enrich_with_sentiment(raw_df)
+    premarket_df = scanner.fetch_premarket_data() if hasattr(scanner, "fetch_premarket_data") else pd.DataFrame()
 
-    engine = AdaptiveTradeEngine()
-    recs = engine.generate_intraday_recommendations(enriched, premarket_df=pre_df, top_k=5)
-    changes = engine.compare_with_morning_watchlist(recs)
-    logged_count = engine.record_recommendations(recs)
-    perf = engine.get_performance_metrics()
-
-    lines = [f"🚀 <b>9:10 AM PRE-MARKET UPDATE & VIRTUAL EXECUTION</b>\n"]
-    if changes:
-        lines.append("🔄 <b>Momentum Shifts vs Pre-9 AM List:</b>")
-        for c in changes[:4]:
-            lines.append(f"• {c}")
-        lines.append("")
-
-    lines.append(f"💼 <b>Executed {logged_count} Trades | Allocated: ₹{perf['allocated_capital']:,.0f} / ₹{perf['current_equity']:,.0f}</b>\n")
-    for _, r in recs.iterrows():
-        icon = "🟢 BUY" if r["action"] == "BUY" else "🔴 SHORT"
-        lines.append(
-            f"{icon} <b>{r['symbol']}</b> — Qty: <b>{r['qty']}</b> (₹{r['capital_used']:,.0f})\n"
-            f"   • Entry: <b>₹{r['entry_price']}</b> | T1: <b>₹{r['target_1']}</b> | T2: <b>₹{r['target_2']}</b> | SL: <b>₹{r['stop_loss']}</b>\n"
-            f"   • Max Risk: -₹{r['max_loss_inr']:,.0f} | Reward: +₹{r['expected_profit_inr']:,.0f}\n"
-        )
-    notifier.send_message("\n".join(lines))
+    rec_df = engine.generate_intraday_recommendations(enriched_df, premarket_df=premarket_df, top_k=5)
+    return enriched_df, rec_df
 
 
-def run_live_manage_workflow(notifier):
-    """During Market Hours: Monitors active positions, trails SLs, extends targets, cuts losers early."""
-    engine = AdaptiveTradeEngine()
-    open_trades = [t for t in engine.ledger if t.get("status") == "OPEN"]
+def run_autonomous_cycle(engine: AdaptiveTradeEngine, scanner: MarketDataScanner, sentiment_ai: FinBERTSentimentEngine, notifier: TelegramNotifier):
+    """
+    Unified AI Decision Loop (No rigid entry/exit clock triggers):
+    1. Evaluates all OPEN positions against live ticks, news emotion shifts, and profit-giveback rules.
+       Any closed position immediately triggers post-trade research and weight updates.
+    2. During live market hours, scans for fresh setups and enters ONLY if learned conviction
+       and learned time-of-day window rules approve.
+    """
+    now_ist = datetime.now(IST)
+    print(f"[PULSEAI] Running autonomous cycle at {now_ist.strftime('%Y-%m-%d %I:%M:%S %p IST')}")
 
-    # If no trades were opened yet today, generate and open them
-    if not open_trades:
-        run_premarket_update_workflow(notifier)
-        return
-
-    actions = engine.manage_live_positions()
-    perf = engine.get_performance_metrics()
-
-    now_str = datetime.now().strftime("%I:%M %p")
-    lines = [
-        f"📡 <b>LIVE AUTONOMOUS TRADE MANAGER ({now_str})</b>",
-        f"💰 <b>Live Equity:</b> ₹{perf['current_equity'] + perf['unrealized_pnl_inr']:,.0f} (Unrealized: ₹{perf['unrealized_pnl_inr']:+,.0f})\n"
-    ]
+    # Step 1: Manage open trades, cut on emotion reversals/givebacks, and learn from any exits
+    actions = engine.manage_live_positions(notify_telegram=True)
     if actions:
-        lines.append("⚡ <b>Dynamic Trade Adjustments Made:</b>")
-        for act in actions:
-            lines.append(f"• {act}")
-        lines.append("")
+        print(f"[PULSEAI] Executed {len(actions)} live position action(s).")
+
+    # Step 2: Scan for new setups if market is open and wallet has available cash
+    if is_live_market_hours(now_ist):
+        perf = engine.get_performance_metrics()
+        if perf["available_cash"] >= 1000 and perf["open_trades"] < 5:
+            _, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
+            if not rec_df.empty:
+                added = engine.record_recommendations(rec_df, notify_telegram=True)
+                print(f"[PULSEAI] AI autonomously entered {added} new trade(s).")
+            else:
+                print("[PULSEAI] AI chose to wait — no setup met learned conviction/timing criteria.")
     else:
-        lines.append("✅ <i>All open positions holding within normal target/SL bands.</i>\n")
-
-    still_open = [t for t in engine.ledger if t.get("status") == "OPEN"]
-    for t in still_open:
-        lines.append(
-            f"• <b>{t['symbol']} ({t['action']})</b>: LTP ₹{t.get('current_price', t['entry_price'])} | "
-            f"Active T1: ₹{t['target_1']} | Active SL: ₹{t['stop_loss']} | "
-            f"Live P&L: <b>₹{t.get('unrealized_pnl_inr', 0):+,.0f}</b>"
-        )
-    notifier.send_message("\n".join(lines))
+        print("[PULSEAI] Outside live 09:15–15:25 IST trading window; skipping new entries.")
 
 
-def run_eod_workflow(notifier):
-    """03:35 PM / 04:15 PM IST: Squares off remaining trades, runs Mistake Autopsy, updates Rs 1.5L wallet."""
+def main():
+    now_ist = datetime.now(IST)
+    if not is_nse_open_day(now_ist):
+        sys.exit(0)
+
+    mode = os.getenv("RUN_MODE", "autonomous_cycle").strip().lower()
+    if len(sys.argv) > 1 and sys.argv[1].strip():
+        mode = sys.argv[1].strip().lower()
+
     engine = AdaptiveTradeEngine()
-    eval_result = engine.evaluate_open_trades_and_learn()
-    perf = engine.get_performance_metrics()
+    scanner = MarketDataScanner()
+    sentiment_ai = FinBERTSentimentEngine()
+    notifier = TelegramNotifier()
 
-    lines = [
-        f"🏁 <b>EOD PORTFOLIO AUTOPSY & ₹1.5L WALLET REPORT</b>\n",
-        f"💼 <b>Starting Capital:</b> ₹{perf['initial_capital']:,.0f}",
-        f"🏦 <b>Current Wallet Equity:</b> <b>₹{perf['current_equity']:,.0f}</b> ({perf['total_pnl_pct']:+.2f}%)",
-        f"📊 <b>Net Realized Profit/Loss:</b> <b>₹{perf['total_pnl_inr']:+,.0f}</b>",
-        f"🎯 <b>Win Rate:</b> {perf['win_rate']}% ({perf['settled_trades']} settled trades)\n",
-        f"🧠 <b>Self-Learning Update:</b> <i>{eval_result['message']}</i>"
-    ]
-    mistakes = engine.portfolio.get("mistakes_identified", [])
-    if mistakes:
-        lines.append(f"\n🔍 <b>Latest Mistake Diagnosis:</b>\n• <i>{mistakes[0]}</i>")
+    if mode in ("autonomous_cycle", "live_manage", "intraday"):
+        run_autonomous_cycle(engine, scanner, sentiment_ai, notifier)
 
-    notifier.send_message("\n".join(lines))
+    elif mode in ("morning_prep", "premarket", "premarket_update"):
+        _, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
+        if mode == "morning_prep":
+            engine.save_morning_watchlist(rec_df)
+            if not rec_df.empty:
+                lines = [
+                    f"• <code>{r['symbol']}</code> ({r['action']}) — Conviction {r['conviction']}/100 @ ₹{r['entry_price']}"
+                    for _, r in rec_df.iterrows()
+                ]
+                notifier.send_message(
+                    f"🌅 <b>PRE-MARKET AI RESEARCH WATCHLIST</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines)
+                )
+        else:
+            changes = engine.compare_with_morning_watchlist(rec_df)
+            engine.save_morning_watchlist(rec_df)
+            if changes:
+                notifier.send_message("⚡ <b>PRE-OPEN MARKET SHIFTS</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(changes))
+            if is_live_market_hours(now_ist) and not rec_df.empty:
+                engine.record_recommendations(rec_df, notify_telegram=True)
+
+    elif mode == "eod":
+        result = engine.evaluate_open_trades_and_learn(notify_telegram=True)
+        perf = engine.get_performance_metrics()
+        notifier.send_message(
+            f"📊 <b>DAILY PORTFOLIO & AI LEARNING SNAPSHOT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💼 <b>Total Wallet Equity:</b> <b>₹{perf['current_equity']:,.2f}</b> ({perf['total_pnl_pct']:+.2f}%)\n"
+            f"💵 <b>Available Cash:</b> ₹{perf['available_cash']:,.2f} | <b>Open Positions:</b> {perf['open_trades']}\n"
+            f"🎯 <b>Win Rate:</b> {perf['win_rate']}% ({perf['settled_trades']} settled)\n"
+            f"🧠 <b>AI Evolution:</b> <i>{result['message']}</i>"
+        )
+
+    else:
+        print(f"[WARN] Unknown mode '{mode}', defaulting to autonomous_cycle.")
+        run_autonomous_cycle(engine, scanner, sentiment_ai, notifier)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Autonomous Rs 1,50,000 AI Stock Trader")
-    parser.add_argument(
-        "--mode",
-        choices=["morning_prep", "premarket_update", "live_manage", "intraday", "premarket", "eod"],
-        default="live_manage"
-    )
-    args = parser.parse_args()
-
-    telegram = TelegramNotifier()
-    if args.mode == "morning_prep":
-        run_morning_prep_workflow(telegram)
-    elif args.mode in ["premarket_update", "premarket"]:
-        run_premarket_update_workflow(telegram)
-    elif args.mode in ["live_manage", "intraday"]:
-        run_live_manage_workflow(telegram)
-    elif args.mode == "eod":
-        run_eod_workflow(telegram)
+    main()
