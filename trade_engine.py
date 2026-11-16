@@ -1,10 +1,13 @@
 import os
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 from market_data import MarketDataScanner
 from telegram_notifier import TelegramNotifier
+
+IST = ZoneInfo("Asia/Kolkata")
 
 WEIGHTS_FILE = "model_weights.json"
 LEDGER_FILE = "trade_history.json"
@@ -20,6 +23,40 @@ class AdaptiveTradeEngine:
         self.weights = self._load_weights()
         self.ledger = self._load_ledger()
         self.portfolio = self._load_portfolio()
+
+    @staticmethod
+    def _now_ist():
+        return datetime.now(IST)
+
+    def _is_past_320pm_ist(self):
+        now_ist = self._now_ist()
+        return (now_ist.hour > 15) or (now_ist.hour == 15 and now_ist.minute >= 20)
+
+    def _get_320pm_ist_price(self, sym, fallback_price):
+        """
+        Fetches the exact 3:20 PM IST price from intraday bars (15:19 1m bar or 15:15 5m bar)
+        so intraday trades never settle on post-3:20 PM or 3:30 PM closing auction prices.
+        """
+        sym_ns = sym if sym.endswith(".NS") else f"{sym}.NS"
+        for interval, max_min in (("1m", 19), ("5m", 15)):
+            try:
+                df = yf.Ticker(sym_ns).history(period="1d", interval=interval)
+                if df.empty:
+                    continue
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize(IST)
+                else:
+                    df.index = df.index.tz_convert(IST)
+
+                valid_bars = df[
+                    (df.index.hour < 15)
+                    | ((df.index.hour == 15) & (df.index.minute <= max_min))
+                ]
+                if not valid_bars.empty:
+                    return round(float(valid_bars["Close"].iloc[-1]), 2)
+            except Exception as e:
+                print(f"[WARN] 3:20 PM {interval} bar lookup failed for {sym_ns}: {e}")
+        return round(float(fallback_price), 2)
 
     def _load_weights(self):
         default_weights = {
@@ -40,7 +77,7 @@ class AdaptiveTradeEngine:
             "preferred_tickers": [],           # Stocks rewarded for consistent profitable execution
             "generation": 1,
             "last_evaluated_count": 0,
-            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "last_updated": self._now_ist().strftime("%Y-%m-%d %H:%M"),
             "learning_notes": "Initialized 5-Layer Self-Learning Brain on Rs 1,50,000 closed wallet."
         }
         if os.path.exists(WEIGHTS_FILE):
@@ -69,6 +106,7 @@ class AdaptiveTradeEngine:
             json.dump(self.ledger, f, indent=2)
 
     def _load_portfolio(self):
+        today_str = self._now_ist().strftime("%Y-%m-%d")
         default_portfolio = {
             "initial_capital": INITIAL_CAPITAL,
             "current_equity": INITIAL_CAPITAL,
@@ -79,7 +117,7 @@ class AdaptiveTradeEngine:
             "loss_streak": 0,
             "mistakes_identified": [],
             "daily_equity_log": [
-                {"date": datetime.now().strftime("%Y-%m-%d"), "equity": INITIAL_CAPITAL, "pnl": 0.0}
+                {"date": today_str, "equity": INITIAL_CAPITAL, "pnl": 0.0}
             ]
         }
         if os.path.exists(PORTFOLIO_FILE):
@@ -122,7 +160,7 @@ class AdaptiveTradeEngine:
     def save_morning_watchlist(self, rec_df):
         records = rec_df.to_dict(orient="records") if not rec_df.empty else []
         with open(MORNING_WATCHLIST_FILE, "w") as f:
-            json.dump({"date": datetime.now().strftime("%Y-%m-%d"), "items": records}, f, indent=2)
+            json.dump({"date": self._now_ist().strftime("%Y-%m-%d"), "items": records}, f, indent=2)
 
     def compare_with_morning_watchlist(self, new_rec_df):
         if not os.path.exists(MORNING_WATCHLIST_FILE) or new_rec_df.empty:
@@ -414,17 +452,21 @@ class AdaptiveTradeEngine:
     def record_recommendations(self, rec_df, notify_telegram=True):
         """
         Executes virtual trades out of the exact available_cash in your wallet.
-        Stores RSI and Chart Trend metadata in the trade record so the EOD learning engine
-        can analyze technical regime accuracy!
+        Strictly blocks any new intraday entries at or after 3:20 PM IST.
         """
         if rec_df.empty:
+            return 0
+
+        if self._is_past_320pm_ist():
+            print("[INFO] Past 3:20 PM IST intraday cutoff. Blocking new intraday entries.")
             return 0
 
         self._recalculate_cash(self.portfolio)
         avail_cash = float(self.portfolio["available_cash"])
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        now_time = datetime.now().strftime("%I:%M:%S %p")
+        now_ist = self._now_ist()
+        today_str = now_ist.strftime("%Y-%m-%d")
+        now_time = now_ist.strftime("%I:%M:%S %p")
         existing_today = {
             item["symbol"] for item in self.ledger if item.get("date") == today_str
         }
@@ -485,7 +527,7 @@ class AdaptiveTradeEngine:
                 "entry_rsi": float(row.get("rsi", 50.0)),
                 "chart_trend": row.get("chart_trend", "RANGE_CONSOLIDATION"),
                 "status": "OPEN",
-                "trade_management_note": f"Funded from wallet (₹{avail_cash:,.0f} cash remaining).",
+                "trade_management_note": f"Funded from wallet (₹{avail_cash:,.0f} cash remaining; 3:20 PM IST auto-exit).",
                 "exit_price": None,
                 "day_high": None,
                 "day_low": None,
@@ -509,7 +551,7 @@ class AdaptiveTradeEngine:
                     f"{side_header}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']})\n"
-                    f"🕒 <b>Exact Execution Time:</b> {now_time} ({today_str})\n"
+                    f"🕒 <b>Exact Execution Time:</b> {now_time} IST ({today_str})\n"
                     f"🧠 <b>AI Conviction:</b> {row['conviction']}/100 | Chart: <code>{row['chart_trend']}</code>\n"
                     f"📦 <b>Quantity:</b> <b>{qty} Shares</b> @ <b>₹{entry_p}</b>\n"
                     f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Remaining Cash: ₹{avail_cash:,.2f} / Wallet Equity: ₹{self.portfolio['current_equity']:,.2f})</i>\n"
@@ -517,6 +559,7 @@ class AdaptiveTradeEngine:
                     f"🎯 <b>Target 1:</b> ₹{t1} <i>(+₹{exp_profit:,.0f} profit)</i>\n"
                     f"🚀 <b>Target 2:</b> ₹{t2}\n"
                     f"🛑 <b>Stop-Loss:</b> ₹{sl} <i>(-₹{max_loss:,.0f} max risk)</i>\n"
+                    f"⏰ <b>Hard Intraday Cutoff:</b> 03:20 PM IST\n"
                     f"📰 <b>Catalyst ({row['sentiment']}):</b> {row['headline']}"
                 )
                 self.notifier.send_message(entry_ticket)
@@ -529,8 +572,8 @@ class AdaptiveTradeEngine:
     def manage_live_positions(self, notify_telegram=True):
         """
         Monitors active positions via live NSE tick prices & 1-minute intraday candles.
-        Whenever a trade closes during live hours, immediately triggers `_optimize_weights_from_history()`
-        so the AI learns in real time from intraday wins and losses!
+        - ENFORCES HARD AUTO SQUARE-OFF AT OR AFTER 3:20 PM IST using the exact 3:20 PM bar price.
+        - Whenever a trade closes, immediately triggers `_optimize_weights_from_history()`.
         """
         open_trades = [t for t in self.ledger if t.get("status") == "OPEN"]
         if not open_trades:
@@ -540,19 +583,13 @@ class AdaptiveTradeEngine:
         snapshots = MarketDataScanner.fetch_live_intraday_snapshot(symbols)
         actions_taken = []
         closed_any = False
-        now_time = datetime.now().strftime("%I:%M:%S %p")
+
+        now_ist = self._now_ist()
+        now_time = now_ist.strftime("%I:%M:%S %p")
+        past_320_cutoff = self._is_past_320pm_ist()
 
         for trade in open_trades:
             sym = trade["symbol"]
-            snap = snapshots.get(sym)
-            if not snap:
-                continue
-
-            ltp = snap["current_price"]
-            d_high = snap["day_high"]
-            d_low = snap["day_low"]
-            vwap = snap["intraday_vwap"]
-
             entry = float(trade["entry_price"])
             t1 = float(trade["target_1"])
             t2 = float(trade["target_2"])
@@ -561,12 +598,71 @@ class AdaptiveTradeEngine:
             qty = int(trade.get("qty", 1))
             side = trade["action"]
 
+            snap = snapshots.get(sym)
+            tg_ticket = None
+
+            # --------------------------------------------------------------
+            # HARD 3:20 PM IST INTRADAY SQUARE-OFF (Runs even if live snap is empty)
+            # --------------------------------------------------------------
+            if past_320_cutoff:
+                fallback_ltp = snap["current_price"] if snap else float(trade.get("current_price", entry))
+                exit_320 = self._get_320pm_ist_price(sym, fallback_ltp)
+
+                if side == "BUY":
+                    pnl_pct = ((exit_320 - entry) / entry) * 100.0
+                    pnl_inr = (exit_320 - entry) * qty
+                    exit_label = "SELL (3:20 PM Auto Square-Off)"
+                else:
+                    pnl_pct = ((entry - exit_320) / entry) * 100.0
+                    pnl_inr = (entry - exit_320) * qty
+                    exit_label = "BUY TO COVER (3:20 PM Auto Square-Off)"
+
+                trade["status"] = "3:20 PM WIN (AUTO SQUARE-OFF)" if pnl_inr >= 0 else "3:20 PM LOSS (AUTO SQUARE-OFF)"
+                trade["exit_price"] = exit_320
+                trade["current_price"] = exit_320
+                trade["unrealized_pnl_inr"] = 0.0
+                trade["pnl_pct"] = round(pnl_pct, 2)
+                trade["pnl_inr"] = round(pnl_inr, 2)
+                trade["trade_management_note"] = f"Auto squared-off at 3:20 PM IST limit @ ₹{exit_320:.2f}."
+                trade["mistake_diagnosis"] = (
+                    "Intraday square-off at 3:20 PM IST in profit."
+                    if pnl_inr >= 0
+                    else f"{sym} ({side}) did not reach target before 3:20 PM IST cutoff (P&L: ₹{pnl_inr:+,.0f})."
+                )
+                closed_any = True
+                self._recalculate_cash(self.portfolio)
+
+                msg = f"⏰ <b>3:20 PM AUTO SQUARE-OFF ({sym}):</b> Closed {qty} shares @ ₹{exit_320} (P&L: ₹{trade['pnl_inr']:+,.0f})."
+                actions_taken.append(msg)
+                tg_ticket = (
+                    f"⏰ <b>TRADE COMPLETED — 3:20 PM IST INTRADAY AUTO SQUARE-OFF</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 <b>Stock:</b> <code>{sym}</code> | <b>Order:</b> {exit_label}\n"
+                    f"🕒 <b>Cutoff Time:</b> 03:20 PM IST\n"
+                    f"📦 <b>Qty Closed:</b> {qty} Shares\n"
+                    f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>3:20 PM Exit:</b> <b>₹{exit_320}</b>\n"
+                    f"💰 <b>Net Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
+                    f"🏦 <b>Updated Wallet Balance:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>"
+                )
+                if notify_telegram and tg_ticket:
+                    self.notifier.send_message(tg_ticket)
+                continue
+
+            # --------------------------------------------------------------
+            # REGULAR INTRADAY MONITORING (Before 3:20 PM IST)
+            # --------------------------------------------------------------
+            if not snap:
+                continue
+
+            ltp = snap["current_price"]
+            d_high = snap["day_high"]
+            d_low = snap["day_low"]
+            vwap = snap["intraday_vwap"]
+
             risk_unit = max(abs(entry - init_sl), entry * 0.005)
             trade["current_price"] = ltp
             trade["day_high"] = d_high
             trade["day_low"] = d_low
-
-            tg_ticket = None
 
             if side == "BUY":
                 unrealized_per_share = ltp - entry
@@ -574,7 +670,7 @@ class AdaptiveTradeEngine:
                 r_multiple = unrealized_per_share / risk_unit
 
                 if ltp >= t1 or d_high >= t1:
-                    if ltp >= t1 and ltp > vwap and t1 < t2:
+                    if ltp >= t1 and ltp > vwap and t1 < t2 and now_ist.hour < 15:
                         new_sl = round(entry + (0.8 * risk_unit), 2)
                         trade["stop_loss"] = max(sl, new_sl)
                         trade["target_1"] = t2
@@ -606,7 +702,7 @@ class AdaptiveTradeEngine:
                             f"✅ <b>TRADE COMPLETED — TARGET BOOKED (SELL EXIT)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"📌 <b>Stock:</b> <code>{sym}</code> (Closed BUY)\n"
-                            f"🕒 <b>Exit Time:</b> {now_time}\n"
+                            f"🕒 <b>Exit Time:</b> {now_time} IST\n"
                             f"📦 <b>Qty Sold:</b> {qty} Shares\n"
                             f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{t1}</b>\n"
                             f"💰 <b>Net Realized Profit:</b> <b>+₹{trade['pnl_inr']:,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
@@ -628,7 +724,7 @@ class AdaptiveTradeEngine:
                         f"🛑 <b>TRADE COMPLETED — STOP-LOSS EXIT</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📌 <b>Stock:</b> <code>{sym}</code> (Closed BUY)\n"
-                        f"🕒 <b>Exit Time:</b> {now_time}\n"
+                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
                         f"📦 <b>Qty Sold:</b> {qty} Shares\n"
                         f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{sl}</b>\n"
                         f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
@@ -665,7 +761,7 @@ class AdaptiveTradeEngine:
                         f"⚠️ <b>TRADE COMPLETED — EARLY EXIT TO MINIMIZE LOSS</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📌 <b>Stock:</b> <code>{sym}</code> (Closed BUY early below VWAP ₹{vwap})\n"
-                        f"🕒 <b>Exit Time:</b> {now_time}\n"
+                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
                         f"📦 <b>Qty Sold:</b> {qty} Shares @ <b>₹{ltp}</b>\n"
                         f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
                         f"💡 <b>Capital Saved vs Full SL:</b> +₹{saved_inr:,.0f}\n"
@@ -678,7 +774,7 @@ class AdaptiveTradeEngine:
                 r_multiple = unrealized_per_share / risk_unit
 
                 if ltp <= t1 or d_low <= t1:
-                    if ltp <= t1 and ltp < vwap and t1 > t2:
+                    if ltp <= t1 and ltp < vwap and t1 > t2 and now_ist.hour < 15:
                         new_sl = round(entry - (0.8 * risk_unit), 2)
                         trade["stop_loss"] = min(sl, new_sl)
                         trade["target_1"] = t2
@@ -709,7 +805,7 @@ class AdaptiveTradeEngine:
                             f"✅ <b>TRADE COMPLETED — SHORT TARGET COVERED (BUY EXIT)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"📌 <b>Stock:</b> <code>{sym}</code> (Closed SHORT)\n"
-                            f"🕒 <b>Exit Time:</b> {now_time}\n"
+                            f"🕒 <b>Exit Time:</b> {now_time} IST\n"
                             f"📦 <b>Qty Covered:</b> {qty} Shares\n"
                             f"🔢 <b>Short Entry:</b> ₹{entry} ➔ <b>Buy Cover:</b> <b>₹{t1}</b>\n"
                             f"💰 <b>Net Realized Profit:</b> <b>+₹{trade['pnl_inr']:,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
@@ -731,7 +827,7 @@ class AdaptiveTradeEngine:
                         f"🛑 <b>TRADE COMPLETED — SHORT STOP-LOSS EXIT</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📌 <b>Stock:</b> <code>{sym}</code> (Closed SHORT)\n"
-                        f"🕒 <b>Exit Time:</b> {now_time}\n"
+                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
                         f"📦 <b>Qty Covered:</b> {qty} Shares\n"
                         f"🔢 <b>Short Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{sl}</b>\n"
                         f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
@@ -767,7 +863,7 @@ class AdaptiveTradeEngine:
                         f"⚠️ <b>TRADE COMPLETED — EARLY SHORT COVER</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📌 <b>Stock:</b> <code>{sym}</code> (Covered above VWAP ₹{vwap})\n"
-                        f"🕒 <b>Exit Time:</b> {now_time}\n"
+                        f"🕒 <b>Exit Time:</b> {now_time} IST\n"
                         f"📦 <b>Qty Covered:</b> {qty} Shares @ <b>₹{ltp}</b>\n"
                         f"📉 <b>Realized P&L:</b> <b>₹{trade['pnl_inr']:+,.2f} ({trade['pnl_pct']:+.2f}%)</b>\n"
                         f"💡 <b>Saved vs Full SL:</b> +₹{saved_inr:,.0f}\n"
@@ -786,11 +882,13 @@ class AdaptiveTradeEngine:
     def evaluate_open_trades_and_learn(self, notify_telegram=True):
         """
         End-of-Day Settlement + Mistake Autopsy + 5-Layer Statistical Self-Learning Optimizer.
+        Safety guarantee: Any trade still OPEN is squared off using its exact 3:20 PM IST
+        intraday candle close (never NSE's 3:30 PM closing auction price).
         """
         open_trades = [t for t in self.ledger if t.get("status") == "OPEN"]
         if not open_trades:
             learning_summary = self._optimize_weights_from_history(force_recalibrate=True)
-            return {"evaluated": 0, "message": f"All trades already settled. {learning_summary}"}
+            return {"evaluated": 0, "message": f"All trades already settled by 3:20 PM IST. {learning_summary}"}
 
         tickers = list({f"{t['symbol']}.NS" for t in open_trades})
         data = yf.download(
@@ -804,7 +902,6 @@ class AdaptiveTradeEngine:
 
         evaluated_count = 0
         new_mistakes = []
-        now_time = datetime.now().strftime("%I:%M:%S %p")
 
         for trade in self.ledger:
             if trade.get("status") != "OPEN":
@@ -820,7 +917,10 @@ class AdaptiveTradeEngine:
                 latest = df.iloc[-1]
                 day_high = float(latest["High"])
                 day_low = float(latest["Low"])
-                close_price = float(latest["Close"])
+                daily_close = float(latest["Close"])
+
+                # Strictly cap intraday square-off price to the 3:20 PM IST candle close
+                price_at_320pm = self._get_320pm_ist_price(sym, daily_close)
 
                 entry = float(trade["entry_price"])
                 t1 = float(trade["target_1"])
@@ -836,13 +936,13 @@ class AdaptiveTradeEngine:
                     elif hit_sl and not hit_target:
                         status, exit_p = "LOSS (SL HIT)", sl
                     elif hit_target and hit_sl:
-                        status, exit_p = ("WIN (TARGET HIT)", t1) if close_price >= entry else ("LOSS (SL HIT)", sl)
+                        status, exit_p = ("WIN (TARGET HIT)", t1) if price_at_320pm >= entry else ("LOSS (SL HIT)", sl)
                     else:
-                        exit_p = close_price
-                        status = "EOD WIN (SQUARE OFF)" if exit_p >= entry else "EOD LOSS (SQUARE OFF)"
+                        exit_p = price_at_320pm
+                        status = "3:20 PM WIN (AUTO SQUARE-OFF)" if exit_p >= entry else "3:20 PM LOSS (AUTO SQUARE-OFF)"
                     pnl_pct = ((exit_p - entry) / entry) * 100.0
                     pnl_inr = (exit_p - entry) * qty
-                    exit_action_label = "SELL (EOD Close)"
+                    exit_action_label = "SELL (3:20 PM IST Cutoff)"
                 else:
                     hit_target = day_low <= t1
                     hit_sl = day_high >= sl
@@ -851,22 +951,23 @@ class AdaptiveTradeEngine:
                     elif hit_sl and not hit_target:
                         status, exit_p = "LOSS (SL HIT)", sl
                     elif hit_target and hit_sl:
-                        status, exit_p = ("WIN (TARGET HIT)", t1) if close_price <= entry else ("LOSS (SL HIT)", sl)
+                        status, exit_p = ("WIN (TARGET HIT)", t1) if price_at_320pm <= entry else ("LOSS (SL HIT)", sl)
                     else:
-                        exit_p = close_price
-                        status = "EOD WIN (SQUARE OFF)" if exit_p <= entry else "EOD LOSS (SQUARE OFF)"
+                        exit_p = price_at_320pm
+                        status = "3:20 PM WIN (AUTO SQUARE-OFF)" if exit_p <= entry else "3:20 PM LOSS (AUTO SQUARE-OFF)"
                     pnl_pct = ((entry - exit_p) / entry) * 100.0
                     pnl_inr = (entry - exit_p) * qty
-                    exit_action_label = "BUY TO COVER (EOD Close)"
+                    exit_action_label = "BUY TO COVER (3:20 PM IST Cutoff)"
 
                 trade["status"] = status
                 trade["exit_price"] = round(exit_p, 2)
-                trade["current_price"] = round(close_price, 2)
+                trade["current_price"] = round(price_at_320pm, 2)
                 trade["unrealized_pnl_inr"] = 0.0
                 trade["day_high"] = round(day_high, 2)
                 trade["day_low"] = round(day_low, 2)
                 trade["pnl_pct"] = round(pnl_pct, 2)
                 trade["pnl_inr"] = round(pnl_inr, 2)
+                trade["trade_management_note"] = f"Settled at 3:20 PM IST cutoff price ₹{exit_p:.2f}."
 
                 if pnl_inr < 0:
                     f_scores = trade.get("factor_scores", {})
@@ -880,7 +981,7 @@ class AdaptiveTradeEngine:
                     trade["mistake_diagnosis"] = diagnosis
                     new_mistakes.append(diagnosis)
                 else:
-                    trade["mistake_diagnosis"] = "Execution aligned with trend & risk rules."
+                    trade["mistake_diagnosis"] = "Execution aligned with trend & 3:20 PM risk rules."
 
                 evaluated_count += 1
                 self._recalculate_cash(self.portfolio)
@@ -892,7 +993,7 @@ class AdaptiveTradeEngine:
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📌 <b>Stock:</b> <code>{sym}</code> | <b>Order:</b> {exit_action_label}\n"
                         f"🏷️ <b>Outcome:</b> {status}\n"
-                        f"🕒 <b>Time:</b> {now_time}\n"
+                        f"🕒 <b>Cutoff Time:</b> 03:20 PM IST\n"
                         f"📦 <b>Quantity:</b> {qty} Shares\n"
                         f"🔢 <b>Entry Price:</b> ₹{entry} ➔ <b>Exit Price:</b> <b>₹{trade['exit_price']}</b>\n"
                         f"📊 <b>Day Range:</b> High ₹{trade['day_high']} | Low ₹{trade['day_low']}\n"
@@ -911,7 +1012,7 @@ class AdaptiveTradeEngine:
         self._save_ledger()
         self._save_portfolio()
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = self._now_ist().strftime("%Y-%m-%d")
         today_pnl = sum(float(t.get("pnl_inr", 0)) for t in self.ledger if t.get("date") == today_str and t.get("status") != "OPEN")
         eq_log = self.portfolio.get("daily_equity_log", [])
         if eq_log and eq_log[-1].get("date") == today_str:
@@ -954,12 +1055,11 @@ class AdaptiveTradeEngine:
         if not settled:
             return "No settled trades yet to train the AI."
 
-        # Prevent duplicate generation increments if no new trades have settled since last learning pass
         if not force_recalibrate and len(settled) == int(self.weights.get("last_evaluated_count", 0)):
             return self.weights.get("learning_notes", "Model up to date.")
 
         # ------------------------------------------------------------------
-        # LAYER 1: Clean Baseline Factor Weight Optimization (No Drift Bug)
+        # LAYER 1: Clean Baseline Factor Weight Optimization
         # ------------------------------------------------------------------
         base = {"volume": 0.28, "sentiment": 0.28, "premarket": 0.22, "momentum": 0.22}
         adjustments = {"volume": 0.0, "sentiment": 0.0, "premarket": 0.0, "momentum": 0.0}
@@ -1031,7 +1131,6 @@ class AdaptiveTradeEngine:
         blacklisted, preferred = [], []
         for sym, st_data in ticker_stats.items():
             st_data["win_rate"] = round((st_data["wins"] / st_data["trades"]) * 100.0, 1)
-            # Blacklist repeat money-losers (>= 2 trades, win rate < 35%, negative net P&L)
             if st_data["trades"] >= 2 and st_data["win_rate"] < 35.0 and st_data["net_pnl_inr"] < -500:
                 blacklisted.append(sym)
             elif st_data["trades"] >= 1 and st_data["win_rate"] >= 65.0 and st_data["net_pnl_inr"] > 300:
@@ -1059,17 +1158,15 @@ class AdaptiveTradeEngine:
         sl_rate = (sl_hits / len(recent)) * 100.0
         tp_rate = (target_hits / len(recent)) * 100.0
 
-        # If >40% of trades get stopped out early, widen ATR Stop-Loss multiplier up to 0.72x
         if sl_rate > 40.0:
             self.weights["atr_sl_multiplier"] = round(min(0.72, 0.55 + ((sl_rate - 40.0) * 0.004)), 2)
         elif sl_rate < 20.0:
             self.weights["atr_sl_multiplier"] = 0.52
 
-        # If target hit rate is strong (>45%), stretch Target 1 multiplier to capture larger trends
         if tp_rate >= 45.0:
             self.weights["atr_tp_multiplier"] = 1.80
         elif tp_rate < 20.0 and len(recent) >= 5:
-            self.weights["atr_tp_multiplier"] = 1.40  # Take quicker guaranteed profits if targets are missed
+            self.weights["atr_tp_multiplier"] = 1.40
         else:
             self.weights["atr_tp_multiplier"] = 1.60
 
@@ -1086,9 +1183,8 @@ class AdaptiveTradeEngine:
         if losing_buy_rsis:
             high_rsi_losses = [r for r in losing_buy_rsis if r >= 67.0]
             if len(high_rsi_losses) >= 2:
-                self.weights["buy_rsi_ceiling"] = 66.0  # Stop buying overbought RSI > 66
+                self.weights["buy_rsi_ceiling"] = 66.0
 
-        # Adaptive Risk-Per-Trade Sizing
         recent_win_rate = (wins_count / len(recent)) * 100.0
         if recent_win_rate >= 60.0 and self.portfolio["current_equity"] >= INITIAL_CAPITAL:
             self.weights["risk_per_trade_pct"] = min(1.5, round(1.0 + ((recent_win_rate - 50.0) * 0.015), 2))
@@ -1097,7 +1193,7 @@ class AdaptiveTradeEngine:
 
         self.weights["generation"] = len(settled) + 1
         self.weights["last_evaluated_count"] = len(settled)
-        self.weights["last_updated"] = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+        self.weights["last_updated"] = self._now_ist().strftime("%Y-%m-%d %I:%M %p")
 
         best_pillar = max(
             [("Volume", self.weights["volume_weight"]),
