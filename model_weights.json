@@ -98,7 +98,7 @@
     "dii_net_cr": -4859.8,
     "buy_adj": 5.0,
     "short_adj": -5.5,
-    "size_multiplier": 0.77,
+    "size_multiplier": 0.85,
     "sl_multiplier_adj": 1.0,
     "global_macro": {
       "macro_regime": "RISK_OFF",
@@ -124,22 +124,9 @@
         "^CNXMETAL": -2.5
       },
       "summary": "RISK_OFF | Brent $89.9 (-2.2%) | US10Y 4.91% (-14.0bps) | USD/INR 92.66 (-0.68%) | Nasdaq -5.28%",
-      "updated_at": "01:42 AM IST"
+      "updated_at": "02:29 AM IST"
     },
-    "expiry_status": {
-      "is_expiry_day": true,
-      "expiry_type": "MONTHLY_EXPIRY",
-      "expiry_phase": "EXPIRY_MORNING",
-      "shifted_from_holiday": true,
-      "scheduled_tuesday": "2026-11-24",
-      "block_new_entries": false,
-      "conviction_hurdle_add": 1.5,
-      "size_multiplier": 0.9,
-      "giveback_cap_pct": 35.0,
-      "next_day_holiday": true,
-      "note": "MONTHLY_EXPIRY (Holiday-shifted from Tue 2026-11-24): Active morning expiry awareness (90% size)."
-    },
-    "updated_at": "01:42 AM IST"
+    "updated_at": "02:29 AM IST"
   },
   "generation": 6,
   "last_evaluated_count": 5,

@@ -1,7 +1,7 @@
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -10,54 +10,74 @@ import yfinance as yf
 
 IST = ZoneInfo("Asia/Kolkata")
 
-DEFAULT_NIFTY_UNIVERSE = [
+# Minimum average daily cash turnover (₹150 Crore) for clean intraday fills
+MIN_DAILY_TURNOVER_INR = 150_00_00_000.0
+
+# Liquid F&O-eligible NSE equity universe for cash intraday screening
+DEFAULT_FNO_CASH_UNIVERSE = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "BHARTIARTL",
     "ITC", "LT", "AXISBANK", "KOTAKBANK", "TMPV", "SUNPHARMA", "MARUTI",
-    "NTPC", "ONGC", "POWERGRID", "BAJFINANCE", "TITAN", "ADANIENT", "ADANIPORTS",
-    "HAL", "BEL", "MAZDOCK", "TRENT", "ETERNAL", "JIOFIN", "VBL", "CHOLAFIN",
-    "INDHOTEL", "DIXON", "POLYCAB", "PERSISTENT", "COFORGE", "MPHASIS", "TATASTEEL",
-    "JSWSTEEL", "HINDALCO", "COALINDIA", "BPCL", "IOC", "GAIL", "DLF", "LODHA",
-    "BANKBARODA", "PNB", "CANBK", "PFC", "RECLTD", "IRCTC"
+    "NTPC", "ONGC", "POWERGRID", "BAJFINANCE", "BAJAJFINSV", "TITAN",
+    "ADANIENT", "ADANIPORTS", "HAL", "BEL", "MAZDOCK", "TRENT", "ETERNAL",
+    "JIOFIN", "VBL", "CHOLAFIN", "INDHOTEL", "DIXON", "POLYCAB", "PERSISTENT",
+    "COFORGE", "MPHASIS", "WIPRO", "HCLTECH", "TECHM", "TATASTEEL", "JSWSTEEL",
+    "HINDALCO", "COALINDIA", "BPCL", "IOC", "GAIL", "DLF", "LODHA",
+    "BANKBARODA", "PNB", "CANBK", "PFC", "RECLTD", "IRCTC", "M&M",
+    "EICHERMOT", "HEROMOTOCO", "TVSMOTOR", "CIPLA", "DRREDDY", "LUPIN",
+    "APOLLOHOSP", "ASIANPAINT", "PIDILITIND", "HAVELLS", "SIEMENS", "ABB"
 ]
 
-# Official 2026 NSE Equity & F&O Weekday Trading Holidays (YYYY-MM-DD)
-NSE_HOLIDAYS_2026 = {
-    "2026-01-15",  # Municipal Corporation Elections - Maharashtra
-    "2026-01-26",  # Republic Day
-    "2026-03-03",  # Holi
-    "2026-03-26",  # Shri Ram Navami
-    "2026-03-31",  # Shri Mahavir Jayanti
-    "2026-04-03",  # Good Friday
-    "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
-    "2026-05-01",  # Maharashtra Day
-    "2026-05-28",  # Bakri Id
-    "2026-06-26",  # Muharram
-    "2026-09-14",  # Ganesh Chaturthi
-    "2026-10-02",  # Mahatma Gandhi Jayanti
-    "2026-10-20",  # Dussehra
-    "2026-11-10",  # Diwali-Balipratipada
-    "2026-11-24",  # Prakash Gurpurb Sri Guru Nanak Dev
-    "2026-12-25",  # Christmas
+# Official NSE Equity Trading Holidays (YYYY-MM-DD)
+NSE_HOLIDAYS = {
+    "2026-01-15",
+    "2026-01-26",
+    "2026-03-03",
+    "2026-03-26",
+    "2026-03-31",
+    "2026-04-03",
+    "2026-04-14",
+    "2026-05-01",
+    "2026-05-28",
+    "2026-06-26",
+    "2026-09-14",
+    "2026-10-02",
+    "2026-10-20",
+    "2026-11-10",
+    "2026-11-24",
+    "2026-12-25",
+    "2027-01-26",
+    "2027-03-08",
+    "2027-03-22",
+    "2027-03-26",
+    "2027-04-14",
+    "2027-05-01",
+    "2027-08-15",
+    "2027-10-02",
 }
 
 GLOBAL_MACRO_TICKERS = ["BZ=F", "^TNX", "INR=X", "^IXIC", "^GSPC"]
 
 SYMBOL_TO_SECTOR_INDEX = {
     "HDFCBANK": "^NSEBANK", "ICICIBANK": "^NSEBANK", "AXISBANK": "^NSEBANK",
-    "KOTAKBANK": "^NSEBANK", "BAJFINANCE": "^NSEBANK", "JIOFIN": "^NSEBANK",
-    "CHOLAFIN": "^NSEBANK", "PFC": "^NSEBANK", "RECLTD": "^NSEBANK",
+    "KOTAKBANK": "^NSEBANK", "BAJFINANCE": "^NSEBANK", "BAJAJFINSV": "^NSEBANK",
+    "JIOFIN": "^NSEBANK", "CHOLAFIN": "^NSEBANK", "PFC": "^NSEBANK", "RECLTD": "^NSEBANK",
     "SBIN": "^CNXPSUBANK", "BANKBARODA": "^CNXPSUBANK", "PNB": "^CNXPSUBANK", "CANBK": "^CNXPSUBANK",
-    "TCS": "^CNXIT", "INFY": "^CNXIT", "PERSISTENT": "^CNXIT", "COFORGE": "^CNXIT", "MPHASIS": "^CNXIT",
-    "TMPV": "^CNXAUTO", "MARUTI": "^CNXAUTO",
-    "SUNPHARMA": "^CNXPHARMA",
+    "TCS": "^CNXIT", "INFY": "^CNXIT", "PERSISTENT": "^CNXIT", "COFORGE": "^CNXIT",
+    "MPHASIS": "^CNXIT", "WIPRO": "^CNXIT", "HCLTECH": "^CNXIT", "TECHM": "^CNXIT",
+    "TMPV": "^CNXAUTO", "MARUTI": "^CNXAUTO", "M&M": "^CNXAUTO",
+    "EICHERMOT": "^CNXAUTO", "HEROMOTOCO": "^CNXAUTO", "TVSMOTOR": "^CNXAUTO",
+    "SUNPHARMA": "^CNXPHARMA", "CIPLA": "^CNXPHARMA", "DRREDDY": "^CNXPHARMA",
+    "LUPIN": "^CNXPHARMA", "APOLLOHOSP": "^CNXPHARMA",
     "TATASTEEL": "^CNXMETAL", "JSWSTEEL": "^CNXMETAL", "HINDALCO": "^CNXMETAL", "COALINDIA": "^CNXMETAL",
     "RELIANCE": "^CNXENERGY", "NTPC": "^CNXENERGY", "ONGC": "^CNXENERGY",
     "POWERGRID": "^CNXENERGY", "BPCL": "^CNXENERGY", "IOC": "^CNXENERGY", "GAIL": "^CNXENERGY",
     "ITC": "^CNXFMCG", "VBL": "^CNXFMCG", "TRENT": "^CNXFMCG", "TITAN": "^CNXFMCG",
+    "ASIANPAINT": "^CNXFMCG", "PIDILITIND": "^CNXFMCG",
     "DLF": "^CNXREALTY", "LODHA": "^CNXREALTY",
     "LT": "^CNXINFRA", "ADANIPORTS": "^CNXINFRA", "ADANIENT": "^CNXINFRA",
     "HAL": "^CNXINFRA", "BEL": "^CNXINFRA", "MAZDOCK": "^CNXINFRA",
     "BHARTIARTL": "^CNXINFRA", "POLYCAB": "^CNXINFRA", "DIXON": "^CNXINFRA",
+    "HAVELLS": "^CNXINFRA", "SIEMENS": "^CNXINFRA", "ABB": "^CNXINFRA",
     "IRCTC": "^CNXINFRA", "INDHOTEL": "^CNXINFRA", "ETERNAL": "^CNXINFRA",
 }
 
@@ -82,11 +102,6 @@ SECTOR_INDEX_TICKERS = [
 
 
 class NSESessionClient:
-    """
-    Persistent session client for direct nseindia.com JSON endpoints with automatic
-    cookie initialization, rate throttling, and graceful fallback on cloud IPs.
-    """
-
     BASE_URL = "https://www.nseindia.com"
     HEADERS = {
         "User-Agent": (
@@ -147,21 +162,26 @@ _NSE_CLIENT = NSESessionClient()
 
 class MarketDataScanner:
     """
-    Hybrid NSE Direct + Multi-Timeframe Intraday + Global Macro Scanner providing:
-    1. Live NSE quotes, circuit bands (lowerCP/upperCP), Delivery %, & Order-Book Imbalance (OBI)
-    2. 5m/15m Multi-Timeframe VWAP, VWAP Slope, EMA9/EMA21 Alignment, ORB & Time-Normalized RVOL
-    3. Live NSE Sectoral Index alignment & Stock Option Chain Max Call/Put OI walls
-    4. Overnight Global Macro cues (Brent Crude, US 10Y Yield, USD/INR, Nasdaq, S&P 500)
-    5. NSE Tuesday Expiry-Day Shield (including holiday-shifted Monday weekly/monthly expiries)
+    Cash-Intraday Equity Scanner over F&O-Eligible NSE Stocks:
+    - Dynamically fetches live F&O equity constituents from NSE with fallback list
+    - Enforces >= ₹150 Cr average daily turnover filter & circuit-band guard
+    - Computes 5m/15m VWAP, VWAP slope, EMA9/EMA21, ORB & time-normalized RVOL
+    - Tracks sectoral index alignment, NSE order-book imbalance, delivery %, & global macro cues
     """
 
     _sector_cache_ts = 0.0
     _sector_cache_data = {}
     _macro_cache_ts = 0.0
     _macro_cache_data = {}
+    _fno_list_cache_ts = 0.0
+    _fno_list_cache_set = set()
 
-    def __init__(self, universe=None):
-        self.universe = universe or DEFAULT_NIFTY_UNIVERSE
+    def __init__(self, universe=None, min_turnover_inr: float = MIN_DAILY_TURNOVER_INR):
+        self.min_turnover_inr = float(min_turnover_inr)
+        if universe is not None:
+            self.universe = [self._clean_sym(s) for s in universe]
+        else:
+            self.universe = self.get_dynamic_fno_universe()
 
     @staticmethod
     def _clean_sym(symbol: str) -> str:
@@ -177,6 +197,35 @@ class MarketDataScanner:
             return float(default)
 
     @classmethod
+    def get_dynamic_fno_universe(cls, force_refresh: bool = False) -> list:
+        now = time.time()
+        if not force_refresh and cls._fno_list_cache_set and (now - cls._fno_list_cache_ts) < 21600.0:
+            return sorted(cls._fno_list_cache_set)
+
+        live_syms = set()
+        payload = _NSE_CLIENT.get_json(
+            "/api/equity-stockIndices?index=" + urllib.parse.quote("SECURITIES IN F&O")
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            for row in payload["data"]:
+                raw_sym = str(row.get("symbol", "")).strip().upper()
+                if not raw_sym or raw_sym.startswith("NIFTY") or raw_sym.startswith("FINNIFTY") or raw_sym.startswith("MIDCPNIFTY"):
+                    continue
+                live_syms.add(raw_sym)
+
+        merged = set(DEFAULT_FNO_CASH_UNIVERSE) | live_syms if live_syms else set(DEFAULT_FNO_CASH_UNIVERSE)
+        cls._fno_list_cache_set = merged
+        cls._fno_list_cache_ts = now
+        return sorted(merged)
+
+    @classmethod
+    def is_fno_eligible(cls, symbol: str) -> bool:
+        clean = cls._clean_sym(symbol)
+        if cls._fno_list_cache_set:
+            return clean in cls._fno_list_cache_set
+        return clean in set(DEFAULT_FNO_CASH_UNIVERSE)
+
+    @classmethod
     def get_sector_index_for_stock(cls, symbol: str, yahoo_sector: str = "") -> str:
         clean = cls._clean_sym(symbol)
         if clean in SYMBOL_TO_SECTOR_INDEX:
@@ -189,106 +238,7 @@ class MarketDataScanner:
     def is_nse_trading_day(d: date) -> bool:
         if d.weekday() >= 5:
             return False
-        return d.strftime("%Y-%m-%d") not in NSE_HOLIDAYS_2026
-
-    @classmethod
-    def _effective_expiry_for_tuesday(cls, tuesday_date: date) -> date:
-        eff = tuesday_date
-        while not cls.is_nse_trading_day(eff):
-            eff -= timedelta(days=1)
-        return eff
-
-    @staticmethod
-    def _is_last_tuesday_of_month(tuesday_date: date) -> bool:
-        return (tuesday_date + timedelta(days=7)).month != tuesday_date.month
-
-    @classmethod
-    def is_next_weekday_holiday(cls, dt: datetime = None) -> bool:
-        now_dt = dt or datetime.now(IST)
-        nxt = now_dt.date() + timedelta(days=1)
-        while nxt.weekday() >= 5:
-            nxt += timedelta(days=1)
-        return nxt.strftime("%Y-%m-%d") in NSE_HOLIDAYS_2026
-
-    @classmethod
-    def get_nse_expiry_status(cls, dt: datetime = None) -> dict:
-        now_dt = dt or datetime.now(IST)
-        today = now_dt.date()
-        mins = now_dt.hour * 60 + now_dt.minute
-
-        mon_this_week = today - timedelta(days=today.weekday())
-        candidate_tuesdays = [
-            mon_this_week + timedelta(days=1),
-            mon_this_week + timedelta(days=8),
-        ]
-
-        is_expiry = False
-        expiry_type = "NONE"
-        shifted_from_holiday = False
-        scheduled_tue_str = ""
-
-        for tue in candidate_tuesdays:
-            eff = cls._effective_expiry_for_tuesday(tue)
-            if today == eff:
-                is_expiry = True
-                shifted_from_holiday = (eff != tue)
-                scheduled_tue_str = tue.strftime("%Y-%m-%d")
-                expiry_type = "MONTHLY_EXPIRY" if cls._is_last_tuesday_of_month(tue) else "WEEKLY_EXPIRY"
-                break
-
-        if not is_expiry:
-            return {
-                "is_expiry_day": False,
-                "expiry_type": "NONE",
-                "expiry_phase": "NORMAL",
-                "shifted_from_holiday": False,
-                "scheduled_tuesday": "",
-                "block_new_entries": False,
-                "conviction_hurdle_add": 0.0,
-                "size_multiplier": 1.0,
-                "giveback_cap_pct": 45.0,
-                "next_day_holiday": cls.is_next_weekday_holiday(now_dt),
-                "note": "Normal NSE session",
-            }
-
-        is_monthly = (expiry_type == "MONTHLY_EXPIRY")
-        shift_tag = f" (Holiday-shifted from Tue {scheduled_tue_str})" if shifted_from_holiday else ""
-
-        if mins >= (14 * 60 + 45):
-            phase = "EXPIRY_FINAL_HOUR_LOCK"
-            block_new = True
-            hurdle_add = 99.0
-            size_mult = 0.0
-            giveback_cap = 22.0 if is_monthly else 25.0
-            note = f"{expiry_type}{shift_tag}: Final-hour gamma/VWAP lock active (no new entries after 14:45 IST)."
-        elif mins >= (13 * 60 + 30):
-            phase = "EXPIRY_PIN_WINDOW"
-            block_new = False
-            hurdle_add = 4.0 if is_monthly else 2.5
-            size_mult = 0.70 if is_monthly else 0.80
-            giveback_cap = 28.0 if is_monthly else 32.0
-            note = f"{expiry_type}{shift_tag}: Afternoon gamma-pin shield (+{hurdle_add} conv hurdle, {int(size_mult*100)}% size)."
-        else:
-            phase = "EXPIRY_MORNING"
-            block_new = False
-            hurdle_add = 1.5 if is_monthly else 0.0
-            size_mult = 0.90 if is_monthly else 0.95
-            giveback_cap = 35.0 if is_monthly else 40.0
-            note = f"{expiry_type}{shift_tag}: Active morning expiry awareness ({int(size_mult*100)}% size)."
-
-        return {
-            "is_expiry_day": True,
-            "expiry_type": expiry_type,
-            "expiry_phase": phase,
-            "shifted_from_holiday": shifted_from_holiday,
-            "scheduled_tuesday": scheduled_tue_str,
-            "block_new_entries": block_new,
-            "conviction_hurdle_add": hurdle_add,
-            "size_multiplier": size_mult,
-            "giveback_cap_pct": giveback_cap,
-            "next_day_holiday": cls.is_next_weekday_holiday(now_dt),
-            "note": note,
-        }
+        return d.strftime("%Y-%m-%d") not in NSE_HOLIDAYS
 
     @classmethod
     def fetch_global_macro_cues(cls, force_refresh: bool = False) -> dict:
@@ -357,78 +307,39 @@ class MarketDataScanner:
             risk_on = (sp500_chg >= 0.7) and (brent_chg <= 1.5) and (us10y_bps_chg <= 4.0) and (usdinr_chg <= 0.30)
 
             if inflation_shock and risk_off:
-                macro_regime = "INFLATION_RATE_SHOCK"
-                macro_buy_adj = -5.0
-                macro_short_adj = 4.0
-                macro_size_mult = 0.80
+                macro_regime, macro_buy_adj, macro_short_adj, macro_size_mult = "INFLATION_RATE_SHOCK", -5.0, 4.0, 0.80
             elif inflation_shock:
-                macro_regime = "INFLATION_RATE_SHOCK"
-                macro_buy_adj = -3.0
-                macro_short_adj = 2.0
-                macro_size_mult = 0.90
+                macro_regime, macro_buy_adj, macro_short_adj, macro_size_mult = "INFLATION_RATE_SHOCK", -3.0, 2.0, 0.90
             elif risk_off:
-                macro_regime = "RISK_OFF"
-                macro_buy_adj = -4.0
-                macro_short_adj = 3.5
-                macro_size_mult = 0.85
+                macro_regime, macro_buy_adj, macro_short_adj, macro_size_mult = "RISK_OFF", -4.0, 3.5, 0.85
             elif risk_on:
-                macro_regime = "RISK_ON"
-                macro_buy_adj = 3.0
-                macro_short_adj = -2.5
-                macro_size_mult = 1.0
+                macro_regime, macro_buy_adj, macro_short_adj, macro_size_mult = "RISK_ON", 3.0, -2.5, 1.0
             else:
-                macro_regime = "NEUTRAL"
-                macro_buy_adj = 0.0
-                macro_short_adj = 0.0
-                macro_size_mult = 1.0
+                macro_regime, macro_buy_adj, macro_short_adj, macro_size_mult = "NEUTRAL", 0.0, 0.0, 1.0
 
             sec_adj = {}
-
-            it_adj = 0.0
-            if nasdaq_chg >= 0.9:
-                it_adj += 3.0
-            elif nasdaq_chg <= -1.1:
-                it_adj -= 3.5
-            if usdinr_chg >= 0.25:
-                it_adj += 2.0
-            elif usdinr_chg <= -0.35:
-                it_adj -= 1.5
+            it_adj = (3.0 if nasdaq_chg >= 0.9 else (-3.5 if nasdaq_chg <= -1.1 else 0.0)) + (
+                2.0 if usdinr_chg >= 0.25 else (-1.5 if usdinr_chg <= -0.35 else 0.0)
+            )
             sec_adj["^CNXIT"] = round(max(-5.5, min(5.5, it_adj)), 1)
 
-            rate_adj = 0.0
-            if us10y_bps_chg >= 6.0:
-                rate_adj -= 3.0
-            elif us10y_bps_chg <= -6.0:
-                rate_adj += 2.5
-            if brent_chg >= 2.0:
-                rate_adj -= 2.0
-            elif brent_chg <= -2.0:
-                rate_adj += 1.5
-            if usdinr_chg >= 0.45:
-                rate_adj -= 1.5
+            rate_adj = (-3.0 if us10y_bps_chg >= 6.0 else (2.5 if us10y_bps_chg <= -6.0 else 0.0)) + (
+                -2.0 if brent_chg >= 2.0 else (1.5 if brent_chg <= -2.0 else 0.0)
+            ) + (-1.5 if usdinr_chg >= 0.45 else 0.0)
             sec_adj["^NSEBANK"] = round(max(-5.5, min(5.5, rate_adj)), 1)
             sec_adj["^CNXPSUBANK"] = round(max(-5.5, min(5.5, rate_adj)), 1)
             sec_adj["^CNXREALTY"] = round(max(-6.0, min(6.0, rate_adj * 1.15)), 1)
 
-            crude_adj = 0.0
-            if brent_chg >= 2.0:
-                crude_adj -= 3.5
-            elif brent_chg <= -2.0:
-                crude_adj += 3.0
+            crude_adj = -3.5 if brent_chg >= 2.0 else (3.0 if brent_chg <= -2.0 else 0.0)
             sec_adj["^CNXAUTO"] = round(crude_adj, 1)
             sec_adj["^CNXENERGY"] = round(crude_adj * 0.6, 1)
-
-            pharma_adj = 1.5 if (usdinr_chg >= 0.25 or risk_off) else 0.0
-            sec_adj["^CNXPHARMA"] = round(pharma_adj, 1)
-
-            metal_adj = 2.0 if sp500_chg >= 0.9 else (-2.5 if sp500_chg <= -1.1 else 0.0)
-            sec_adj["^CNXMETAL"] = round(metal_adj, 1)
+            sec_adj["^CNXPHARMA"] = round(1.5 if (usdinr_chg >= 0.25 or risk_off) else 0.0, 1)
+            sec_adj["^CNXMETAL"] = round(2.0 if sp500_chg >= 0.9 else (-2.5 if sp500_chg <= -1.1 else 0.0), 1)
 
             summary = (
                 f"{macro_regime} | Brent ${brent_ltp:.1f} ({brent_chg:+.1f}%) | "
                 f"US10Y {us10y_cur:.2f}% ({us10y_bps_chg:+.1f}bps) | "
-                f"USD/INR {usdinr_ltp:.2f} ({usdinr_chg:+.2f}%) | "
-                f"Nasdaq {nasdaq_chg:+.2f}%"
+                f"USD/INR {usdinr_ltp:.2f} ({usdinr_chg:+.2f}%) | Nasdaq {nasdaq_chg:+.2f}%"
             )
 
             macro_res = {
@@ -497,7 +408,6 @@ class MarketDataScanner:
     def _parse_order_book(cls, ob: dict, ltp: float) -> tuple:
         if not isinstance(ob, dict):
             return 0.0, 0.0
-
         tot_buy = cls._safe_float(ob.get("totalBuyQuantity", ob.get("totalBuyQty", 0.0)))
         tot_sell = cls._safe_float(ob.get("totalSellQuantity", ob.get("totalSellQty", 0.0)))
         denom = tot_buy + tot_sell
@@ -511,7 +421,6 @@ class MarketDataScanner:
         spread_pct = 0.0
         if best_bid > 0 and best_ask > best_bid and ltp > 0:
             spread_pct = round(((best_ask - best_bid) / ltp) * 100.0, 3)
-
         return obi_ratio, spread_pct
 
     @classmethod
@@ -546,7 +455,6 @@ class MarketDataScanner:
                         sec_dp.get("deliveryToTradedQuantity") or t_info.get("deliveryToTradedQuantity"), 0.0
                     )
                     obi_ratio, spread_pct = cls._parse_order_book(ob, ltp)
-
                     return {
                         "symbol": clean,
                         "current_price": round(ltp, 2),
@@ -606,54 +514,8 @@ class MarketDataScanner:
         }
 
     @classmethod
-    def fetch_option_chain_walls(cls, symbol: str, spot_price: float) -> dict:
-        clean = cls._clean_sym(symbol)
-        encoded = urllib.parse.quote(clean)
-        oc = _NSE_CLIENT.get_json(f"/api/option-chain-equities?symbol={encoded}")
-        if not isinstance(oc, dict) or "records" not in oc:
-            return {"max_call_oi_strike": 0.0, "max_put_oi_strike": 0.0, "pcr": 1.0}
-
-        records = oc.get("records", {})
-        expiry_dates = records.get("expiryDates", [])
-        if not expiry_dates:
-            return {"max_call_oi_strike": 0.0, "max_put_oi_strike": 0.0, "pcr": 1.0}
-
-        nearest_exp = expiry_dates[0]
-        rows = [r for r in records.get("data", []) if r.get("expiryDate") == nearest_exp]
-
-        max_ce_oi = -1.0
-        max_ce_strike = 0.0
-        max_pe_oi = -1.0
-        max_pe_strike = 0.0
-        total_ce = 0.0
-        total_pe = 0.0
-
-        for r in rows:
-            strike = cls._safe_float(r.get("strikePrice"), 0.0)
-            ce_oi = cls._safe_float((r.get("CE") or {}).get("openInterest"), 0.0)
-            pe_oi = cls._safe_float((r.get("PE") or {}).get("openInterest"), 0.0)
-            total_ce += ce_oi
-            total_pe += pe_oi
-
-            if strike >= spot_price and ce_oi > max_ce_oi:
-                max_ce_oi = ce_oi
-                max_ce_strike = strike
-            if strike <= spot_price and pe_oi > max_pe_oi:
-                max_pe_oi = pe_oi
-                max_pe_strike = strike
-
-        pcr = round(total_pe / max(total_ce, 1.0), 2)
-        return {
-            "max_call_oi_strike": round(max_ce_strike, 2),
-            "max_put_oi_strike": round(max_pe_strike, 2),
-            "pcr": pcr,
-        }
-
-    @classmethod
     def fetch_nse_microstructure(cls, symbol: str, spot_price: float = 0.0) -> dict:
         q = cls.fetch_nse_equity_quote(symbol)
-        ltp = q.get("current_price", spot_price)
-        walls = cls.fetch_option_chain_walls(symbol, ltp) if ltp > 0 else {}
         return {
             "delivery_pct": q.get("delivery_pct", 0.0),
             "lower_cp": q.get("lower_cp", 0.0),
@@ -661,9 +523,6 @@ class MarketDataScanner:
             "obi_ratio": q.get("obi_ratio", 0.0),
             "bid_ask_spread_pct": q.get("bid_ask_spread_pct", 0.0),
             "nse_live_vwap": q.get("intraday_vwap", 0.0),
-            "max_call_oi_strike": walls.get("max_call_oi_strike", 0.0),
-            "max_put_oi_strike": walls.get("max_put_oi_strike", 0.0),
-            "pcr": walls.get("pcr", 1.0),
         }
 
     @staticmethod
@@ -746,8 +605,7 @@ class MarketDataScanner:
                 tp_5m = (today_5m["High"] + today_5m["Low"] + today_5m["Close"]) / 3.0
                 cum_vol = today_5m["Volume"].cumsum()
                 cum_pv = (tp_5m * today_5m["Volume"]).cumsum()
-                vwap_series = cum_pv / cum_vol.replace(0, pd.NA)
-                vwap_series = vwap_series.ffill().fillna(ltp)
+                vwap_series = (cum_pv / cum_vol.replace(0, pd.NA)).ffill().fillna(ltp)
                 vwap_intraday = float(vwap_series.iloc[-1])
 
                 df_15m = df.resample("15min").agg({
@@ -763,12 +621,10 @@ class MarketDataScanner:
 
                 vwap_15m_today = vwap_series.resample("15min").last().dropna()
                 if len(vwap_15m_today) >= 3:
-                    v_now = float(vwap_15m_today.iloc[-1])
-                    v_prev = float(vwap_15m_today.iloc[-3])
+                    v_now, v_prev = float(vwap_15m_today.iloc[-1]), float(vwap_15m_today.iloc[-3])
                     vwap_slope_pct = ((v_now - v_prev) / v_prev) * 100.0 if v_prev > 0 else 0.0
                 elif len(vwap_series) >= 3:
-                    v_now = float(vwap_series.iloc[-1])
-                    v_prev = float(vwap_series.iloc[-3])
+                    v_now, v_prev = float(vwap_series.iloc[-1]), float(vwap_series.iloc[-3])
                     vwap_slope_pct = ((v_now - v_prev) / v_prev) * 100.0 if v_prev > 0 else 0.0
                 else:
                     vwap_slope_pct = 0.0
@@ -781,10 +637,7 @@ class MarketDataScanner:
                     mtf_15m_trend = "NEUTRAL"
 
                 orb_mask = (today_5m.index.hour * 60 + today_5m.index.minute) < (9 * 60 + 30)
-                orb_bars = today_5m[orb_mask]
-                if orb_bars.empty:
-                    orb_bars = today_5m.head(3)
-
+                orb_bars = today_5m[orb_mask] if not today_5m[orb_mask].empty else today_5m.head(3)
                 orb_high = float(orb_bars["High"].max())
                 orb_low = float(orb_bars["Low"].min())
                 last_5m_close = float(today_5m["Close"].iloc[-1])
@@ -853,9 +706,6 @@ class MarketDataScanner:
             else:
                 missing.append(sym)
 
-        if not missing:
-            return snapshots
-
         for sym in missing:
             ns_sym = sym if sym.endswith(".NS") else f"{sym}.NS"
             try:
@@ -914,7 +764,8 @@ class MarketDataScanner:
         return pd.DataFrame(rows)
 
     def scan_volume_breakouts(self, top_n: int = 15) -> pd.DataFrame:
-        ns_tickers = [f"{s}.NS" for s in self.universe]
+        active_syms = self.universe or self.get_dynamic_fno_universe()
+        ns_tickers = [f"{s}.NS" for s in active_syms]
         raw = yf.download(
             tickers=ns_tickers,
             period="1mo",
@@ -927,7 +778,7 @@ class MarketDataScanner:
             return pd.DataFrame()
 
         candidates = []
-        for sym in self.universe:
+        for sym in active_syms:
             ns_sym = f"{sym}.NS"
             try:
                 if not isinstance(raw.columns, pd.MultiIndex) or ns_sym not in raw.columns.get_level_values(0):
@@ -945,6 +796,12 @@ class MarketDataScanner:
                 cur_vol = float(df["Volume"].iloc[-1])
                 avg_vol_10 = float(df["Volume"].iloc[-11:-1].mean())
                 raw_vol_ratio = cur_vol / max(avg_vol_10, 1.0)
+
+                hist_closes = df["Close"].iloc[-11:-1]
+                hist_vols = df["Volume"].iloc[-11:-1]
+                avg_turnover_inr = float((hist_closes * hist_vols).mean()) if len(hist_closes) > 0 else (ltp * cur_vol)
+                if ltp < 50.0 or avg_turnover_inr < self.min_turnover_inr:
+                    continue
 
                 tr = pd.concat([
                     df["High"] - df["Low"],
@@ -966,6 +823,8 @@ class MarketDataScanner:
 
                 candidates.append({
                     "symbol": sym,
+                    "fno_eligible": self.is_fno_eligible(sym),
+                    "avg_daily_turnover_cr": round(avg_turnover_inr / 1_00_00_000.0, 2),
                     "ltp": round(ltp, 2),
                     "change_pct": round(chg_pct, 2),
                     "vol_ratio": round(raw_vol_ratio, 2),
