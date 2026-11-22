@@ -9,3 +9,5 @@ numpy
 feedparser
 python-dotenv
 streamlit
+requests
+google-genai

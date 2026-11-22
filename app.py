@@ -150,11 +150,13 @@ nifty_ltp = float(regime_info.get("nifty_ltp", 0.0))
 nifty_chg = float(regime_info.get("nifty_chg_pct", 0.0))
 vix_ltp = float(regime_info.get("vix_ltp", 14.0))
 vix_chg = float(regime_info.get("vix_chg_pct", 0.0))
+fii_net = float(regime_info.get("fii_net_cr", 0.0))
 size_mult = float(regime_info.get("size_multiplier", 1.0))
 r_icon, r_bg, r_fg, r_border = get_regime_style(regime_name)
 
 nifty_str = f"Nifty {nifty_ltp:,.2f} ({nifty_chg:+.2f}%)" if nifty_ltp > 0 else f"Nifty {nifty_chg:+.2f}%"
-regime_badge_text = f"{r_icon} Regime: {regime_name} • {nifty_str} • India VIX {vix_ltp:.2f} ({vix_chg:+.1f}%)"
+fii_str = f" • FII Net ₹{fii_net:+,.0f} Cr" if fii_net != 0 else ""
+regime_badge_text = f"{r_icon} Regime: {regime_name} • {nifty_str} • VIX {vix_ltp:.2f}{fii_str}"
 
 watchlist_data = []
 if os.path.exists("morning_watchlist.json"):
@@ -184,13 +186,14 @@ with st.sidebar:
     )
 
     st.divider()
-    st.markdown("### 🌐 Live Market Regime")
+    st.markdown("### 🌐 Live Market & FII Regime")
     st.markdown(
         f"""
         <div style="background:{r_bg}; border:1px solid {r_border}; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
             <div style="color:{r_fg}; font-weight:700; font-size:0.92rem;">{r_icon} {regime_name}</div>
             <div style="color:#e2e8f0; font-size:0.82rem; margin-top:4px;">{nifty_str}</div>
-            <div style="color:#cbd5e1; font-size:0.82rem;">India VIX: {vix_ltp:.2f} ({vix_chg:+.1f}%) • Size Scale: {int(size_mult * 100)}%</div>
+            <div style="color:#cbd5e1; font-size:0.82rem;">India VIX: {vix_ltp:.2f} ({vix_chg:+.1f}%) • Size: {int(size_mult * 100)}%</div>
+            <div style="color:#cbd5e1; font-size:0.82rem;">FII Cash Net: ₹{fii_net:+,.0f} Cr</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -223,7 +226,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("⚙️ Developer Controls (Keep OFF)", expanded=False):
-        st.caption("Cloud Autopilot runs via GitHub Actions. Keep browser overrides OFF.")
+        st.caption("Cloud Autopilot runs via GitHub Actions / Warm Worker. Keep browser overrides OFF.")
         st.toggle("Enable Browser Autopilot", value=False, key="ui_autopilot")
         st.checkbox("Simulate After-Hours Entry", value=False, key="ui_sim")
 
@@ -234,9 +237,9 @@ now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
 st.markdown(
     f"""
     <div class="hero-card">
-        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Global Quant & NSE Autonomous Portfolio Manager</h2>
+        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Institutional NSE & Quantitative Bandit Portfolio Manager</h2>
         <p style="margin:6px 0 0 0; color:#94a3b8; font-size:0.95rem;">
-            Powered by Thompson Sampling Bandits, Qlib TRA Archetype Routing, Adversarial Bear Critic Vetoes, Half-Kelly Sizing, Counterfactual Shadow Learning, and 2026 NSE Tax Accounting.
+            Direct NSE Quotes & Circuit Bands • Delivery % & F&O OI Walls • Gemini Bull/Bear Debate • Page-Hinkley Drift Detection • Thompson Sampling & Half-Kelly Sizing.
         </p>
         <div class="pill-row">
             <span class="status-pill">● Brain Gen #{engine.weights.get('generation', 1)} ({shadow_learned} Shadow Setups Learned) • {now_ist}</span>
@@ -246,6 +249,10 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+drift_msg = engine.weights.get("drift_alert", "")
+if drift_msg:
+    st.warning(f"⚡ **Concept-Drift Auto-Reset Active:** {drift_msg}")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Net Portfolio Value", f"₹{current_eq:,.0f}", f"Contributed: ₹{total_contrib:,.0f}")
@@ -270,7 +277,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
 with tab1:
     st.subheader("Currently Open Positions")
     if not open_trades:
-        st.info("No active trades right now. The AI enters automatically when a setup passes its Bear Critic, Bandit, Mansfield RS, Regime, and Sector filters.")
+        st.info("No active trades right now. The AI enters automatically when a setup passes its NSE Delivery %, Circuit Band, Gemini Bull/Bear Debate, Bandit, and Sector filters.")
     else:
         rows = []
         sector_summary = {}
@@ -285,6 +292,7 @@ with tab1:
             conv = float(t.get("conviction", 0))
             sec = str(t.get("sector", "General"))
             mrs = float(t.get("mansfield_rs", 0.0))
+            deliv = float(t.get("delivery_pct", 0.0))
             kelly = float(t.get("kelly_pct", 15.0))
 
             sector_summary.setdefault(sec, {"count": 0, "capital": 0.0})
@@ -299,8 +307,8 @@ with tab1:
                 {
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
                     "Sector": sec,
-                    "TRA Archetype": t.get("archetype", "MOMENTUM_MOVER"),
                     "Side": t.get("action", "BUY"),
+                    "Delivery %": f"{deliv:.1f}%" if deliv > 0 else "—",
                     "Bandit Arm": t.get("strategy_arm", "MOMENTUM_BREAKOUT"),
                     "Mansfield RS": f"{mrs:+.2f}%",
                     "Buy/Entry (₹)": f"₹{entry:,.2f}",
@@ -310,7 +318,7 @@ with tab1:
                     "Invested (₹)": f"₹{invested:,.0f} ({kelly:.0f}% Kelly)",
                     "Live P&L (₹)": f"₹{unrl:+,.0f} (Peak ₹{peak:+,.0f})",
                     "Conviction": f"{conv:.1f}/100",
-                    "Catalyst & Live AI Note": why_text,
+                    "Catalyst, Debate & Live AI Note": why_text,
                 }
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -322,7 +330,7 @@ with tab1:
         ]
         st.caption("🛡️ **Sector Correlation Guard (Max 2 trades / 40% equity per sector):** " + " | ".join(sec_tags))
 
-    st.subheader("Completed Trade History (Net After 2026 NSE Taxes & Brokerage)")
+    st.subheader("Completed Trade History (Net After 2026 NSE Taxes & Slippage)")
     if not closed_trades:
         st.caption("No settled trades yet. Whenever the AI closes a trade, its net after-tax P&L and research lesson appear here.")
     else:
@@ -364,8 +372,8 @@ with tab2:
             st.markdown(f"{icon} **{item.get('timestamp', '')}**{regime_tag} — {item.get('lesson', '')}")
 
     st.divider()
-    st.subheader("👻 Counterfactual Shadow-Trade Learning (Skipped Setups Evaluated)")
-    st.caption("Near-miss and Bear-Critic vetoed setups are tracked silently and evaluated so the AI learns 5× faster without risking money.")
+    st.subheader("👻 Counterfactual Shadow-Trade Learning (Skipped & Vetoed Setups)")
+    st.caption("Near-miss and Bear-Critic / Gemini Debate vetoed setups are tracked silently and evaluated so the AI learns 5× faster without risking money.")
     shadows = getattr(engine, "shadow_ledger", [])
     if not shadows:
         st.caption("No shadow setups logged yet.")

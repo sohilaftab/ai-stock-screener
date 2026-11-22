@@ -1,5 +1,7 @@
 import os
 import sys
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import pandas as pd
