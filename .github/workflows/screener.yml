@@ -53,9 +53,9 @@ jobs:
         run: |
           git config user.name "PulseAI Bot"
           git config user.email "actions@github.com"
-          git add portfolio_state.json trade_history.json model_weights.json morning_watchlist.json shadow_ledger.json sector_cache.json || true
+          git add portfolio_state.json trade_history.json model_weights.json morning_watchlist.json shadow_ledger.json sector_cache.json ml_feature_log.json ml_context_model.pkl || true
           if ! git diff --cached --quiet; then
-            git commit -m "chore(pulseai): update portfolio, ledger, shadow memory & learned weights [${{ github.event.inputs.mode || 'autonomous_cycle' }}]"
+            git commit -m "chore(pulseai): update portfolio, ledger, shadow memory, ML model & weights [${{ github.event.inputs.mode || 'autonomous_cycle' }}]"
             git pull --rebase origin main
             git push origin main
           else

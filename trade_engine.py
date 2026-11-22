@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 from market_data import MarketDataScanner
+from ml_context_model import ContextualMLPredictor
 from telegram_notifier import TelegramNotifier
 
 try:
@@ -30,7 +31,7 @@ SECTOR_CACHE_FILE = "sector_cache.json"
 INITIAL_CAPITAL = 150000.0
 MAX_POSITIONS_PER_SECTOR = 2
 MAX_SECTOR_EXPOSURE_PCT = 0.40   # Max 40% of portfolio equity in one sector
-MIN_OVERNIGHT_CUSHION_PCT = 1.0  # Require >= +1.0% unrealized gain to hold overnight
+MIN_OVERNIGHT_CUSHION_PCT = 1.0  # Require >= +1.0% unrealized gain to hold overnight (+1.5% before a holiday)
 
 BULLISH_KEYWORDS = {
     "surge", "soar", "jump", "gain", "profit", "beat", "order", "win", "won",
@@ -47,6 +48,7 @@ BEARISH_KEYWORDS = {
 class AdaptiveTradeEngine:
     def __init__(self):
         self.notifier = TelegramNotifier()
+        self.ml_model = ContextualMLPredictor()
         self.weights = self._load_weights()
         self.ledger = self._load_ledger()
         self.shadow_ledger = self._load_shadow_ledger()
@@ -144,13 +146,14 @@ class AdaptiveTradeEngine:
         return round(max(-1.0, min(1.0, clv)), 3)
 
     # ------------------------------------------------------------------
-    # ADVERSARIAL BEAR CRITIC (UPGRADE 1: OBI, SPREAD, 15m MTF & SECTOR)
+    # ADVERSARIAL BEAR CRITIC (UPGRADE 1 + UPGRADE 2 MACRO & EXPIRY)
     # ------------------------------------------------------------------
     @staticmethod
     def _adversarial_bear_critic(
         side, ltp, atr, chg_pct, rsi, clv, intraday_alpha, archetype, regime_name,
         mtf_15m_trend="NEUTRAL", vwap_slope_pct=0.0, obi_ratio=0.0,
-        bid_ask_spread_pct=0.0, sector_chg_pct=0.0
+        bid_ask_spread_pct=0.0, sector_chg_pct=0.0, macro_regime="NEUTRAL",
+        macro_sector_adj=0.0, expiry_phase="NORMAL", orb_signal="INSIDE_ORB"
     ):
         red_flags = []
         atr_pct = (atr / ltp) * 100.0 if ltp > 0 else 1.5
@@ -170,6 +173,10 @@ class AdaptiveTradeEngine:
                 red_flags.append(f"Heavy NSE ask wall (OBI {obi_ratio:+.2f})")
             if sector_chg_pct < -1.0:
                 red_flags.append(f"Fighting falling sector ({sector_chg_pct:+.2f}%)")
+            if macro_regime == "INFLATION_RATE_SHOCK" and macro_sector_adj <= -3.0:
+                red_flags.append("Global crude/yield shock opposing rate-sensitive BUY")
+            if expiry_phase == "EXPIRY_PIN_WINDOW" and orb_signal != "ORB_BREAKOUT_UP":
+                red_flags.append("Expiry afternoon gamma-pin zone without ORB breakout")
         else:
             if atr_pct > 0 and chg_pct < -(2.1 * atr_pct):
                 red_flags.append("Chasing exhausted >2.1x ATR drop")
@@ -185,6 +192,10 @@ class AdaptiveTradeEngine:
                 red_flags.append(f"Heavy NSE bid wall (OBI {obi_ratio:+.2f})")
             if sector_chg_pct > 1.0:
                 red_flags.append(f"Shorting strong sector ({sector_chg_pct:+.2f}%)")
+            if macro_regime == "RISK_ON" and macro_sector_adj >= 3.0:
+                red_flags.append("Global Risk-On tailwind opposing SHORT")
+            if expiry_phase == "EXPIRY_PIN_WINDOW" and orb_signal != "ORB_BREAKDOWN_DOWN":
+                red_flags.append("Expiry afternoon gamma-pin zone without ORB breakdown")
 
         if bid_ask_spread_pct > 0.35:
             red_flags.append(f"Illiquid NSE spread ({bid_ask_spread_pct:.2f}%)")
@@ -201,12 +212,17 @@ class AdaptiveTradeEngine:
         if not api_key or not HAS_GENAI:
             return {"veto": False, "conviction_adj": 0.0, "debate_note": "Quantitative Bear Critic passed"}
 
+        macro = regime_info.get("global_macro", {})
+        exp = regime_info.get("expiry_status", {})
+
         prompt = (
             "You are an institutional NSE risk committee running a Bull vs. Bear adversarial debate "
             "before executing an Indian intraday equity trade. Analyze this candidate strictly in JSON:\n"
             f"- Stock: {candidate['symbol']} | Action: {candidate['action']} | LTP: ₹{candidate['entry_price']}\n"
             f"- Nifty Regime: {regime_info.get('regime')} (Nifty {regime_info.get('nifty_chg_pct')}%, "
             f"VIX {regime_info.get('vix_ltp')}, FII Net ₹{regime_info.get('fii_net_cr', 0)} Cr)\n"
+            f"- Global Overnight Macro: {macro.get('summary', 'Neutral')} | Sector Macro Bias={candidate.get('macro_sector_adj', 0):+.1f}\n"
+            f"- NSE Expiry Shield: {exp.get('note', 'Normal session')}\n"
             f"- 5m/15m Chart Flow: 15m Trend={candidate.get('mtf_15m_trend')}, VWAP Slope={candidate.get('vwap_slope_pct')}%, "
             f"ORB={candidate.get('orb_signal')}, Time-Norm RVOL={candidate.get('rvol_normalized')}x\n"
             f"- Sector Alignment: {candidate.get('sector_index')} ({candidate.get('sector_chg_pct'):+.2f}%), "
@@ -277,9 +293,18 @@ class AdaptiveTradeEngine:
         return False
 
     # ------------------------------------------------------------------
-    # NIFTY 50, INDIA VIX & FII/DII MARKET REGIME ENGINE
+    # NIFTY 50 + INDIA VIX + FII/DII + GLOBAL MACRO + EXPIRY SHIELD REGIME
     # ------------------------------------------------------------------
     def _detect_market_regime(self):
+        now_ist = self._now_ist()
+        macro_cues = MarketDataScanner.fetch_global_macro_cues()
+        expiry_status = MarketDataScanner.get_nse_expiry_status(now_ist)
+
+        macro_buy_adj = float(macro_cues.get("macro_buy_adj", 0.0))
+        macro_short_adj = float(macro_cues.get("macro_short_adj", 0.0))
+        macro_size_mult = float(macro_cues.get("macro_size_multiplier", 1.0))
+        exp_size_mult = float(expiry_status.get("size_multiplier", 1.0))
+
         default_regime = {
             "regime": "NEUTRAL",
             "nifty_ltp": 0.0,
@@ -288,11 +313,13 @@ class AdaptiveTradeEngine:
             "vix_chg_pct": 0.0,
             "fii_net_cr": 0.0,
             "dii_net_cr": 0.0,
-            "buy_adj": 0.0,
-            "short_adj": 0.0,
-            "size_multiplier": 1.0,
+            "buy_adj": macro_buy_adj,
+            "short_adj": macro_short_adj,
+            "size_multiplier": round(min(macro_size_mult, exp_size_mult if exp_size_mult > 0 else 1.0), 2),
             "sl_multiplier_adj": 1.0,
-            "updated_at": self._now_ist().strftime("%I:%M %p IST")
+            "global_macro": macro_cues,
+            "expiry_status": expiry_status,
+            "updated_at": now_ist.strftime("%I:%M %p IST")
         }
         try:
             nifty_df = yf.Ticker("^NSEI").history(period="5d", interval="15m")
@@ -302,6 +329,7 @@ class AdaptiveTradeEngine:
             dii_net = float(fii_dii.get("dii_net_cr", 0.0))
 
             if nifty_df.empty:
+                self.weights["last_market_regime"] = default_regime
                 return default_regime
 
             if nifty_df.index.tz is None:
@@ -332,28 +360,31 @@ class AdaptiveTradeEngine:
 
             if vix_ltp >= 18.5 or vix_chg_pct >= 8.0:
                 regime = "HIGH_VOLATILITY_PANIC"
-                buy_adj = -8.0 + fii_bias
-                short_adj = -3.0 - fii_bias
-                size_mult = 0.50
+                buy_adj = -8.0 + fii_bias + macro_buy_adj
+                short_adj = -3.0 - fii_bias + macro_short_adj
+                base_size_mult = 0.50
                 sl_adj = 1.25
             elif nifty_chg_pct <= -0.45 and nifty_ltp < intraday_mid and nifty_ltp < ema_20:
                 regime = "BEAR_TREND"
-                buy_adj = -8.0 + fii_bias
-                short_adj = 6.0 - fii_bias
-                size_mult = 0.85
+                buy_adj = -8.0 + fii_bias + macro_buy_adj
+                short_adj = 6.0 - fii_bias + macro_short_adj
+                base_size_mult = 0.85
                 sl_adj = 1.05
             elif nifty_chg_pct >= 0.40 and nifty_ltp > intraday_mid and nifty_ltp > ema_20:
                 regime = "BULL_TREND"
-                buy_adj = 6.0 + fii_bias
-                short_adj = -6.0 - fii_bias
-                size_mult = 1.0
+                buy_adj = 6.0 + fii_bias + macro_buy_adj
+                short_adj = -6.0 - fii_bias + macro_short_adj
+                base_size_mult = 1.0
                 sl_adj = 1.0
             else:
                 regime = "SIDEWAYS_CHOP"
-                buy_adj = -2.0 + fii_bias
-                short_adj = -2.0 - fii_bias
-                size_mult = 0.80
+                buy_adj = -2.0 + fii_bias + macro_buy_adj
+                short_adj = -2.0 - fii_bias + macro_short_adj
+                base_size_mult = 0.80
                 sl_adj = 0.95
+
+            effective_exp_mult = exp_size_mult if exp_size_mult > 0 else 0.50
+            combined_size_mult = round(max(0.35, min(1.0, base_size_mult * macro_size_mult * effective_exp_mult)), 2)
 
             info = {
                 "regime": regime,
@@ -365,14 +396,17 @@ class AdaptiveTradeEngine:
                 "dii_net_cr": dii_net,
                 "buy_adj": round(buy_adj, 1),
                 "short_adj": round(short_adj, 1),
-                "size_multiplier": size_mult,
+                "size_multiplier": combined_size_mult,
                 "sl_multiplier_adj": sl_adj,
-                "updated_at": self._now_ist().strftime("%I:%M %p IST")
+                "global_macro": macro_cues,
+                "expiry_status": expiry_status,
+                "updated_at": now_ist.strftime("%I:%M %p IST")
             }
             self.weights["last_market_regime"] = info
             return info
         except Exception as e:
             print(f"[WARN] Market regime detection fallback: {e}")
+            self.weights["last_market_regime"] = default_regime
             return default_regime
 
     # ------------------------------------------------------------------
@@ -505,7 +539,7 @@ class AdaptiveTradeEngine:
         return clamped_fraction, round(payoff_b, 2)
 
     # ------------------------------------------------------------------
-    # COUNTERFACTUAL SHADOW-TRADE LEDGER (LOGS FULL UPGRADE 1 FEATURES)
+    # COUNTERFACTUAL SHADOW-TRADE LEDGER (LOGS FULL UPGRADE 1 + 2 + 3)
     # ------------------------------------------------------------------
     def _load_shadow_ledger(self):
         if os.path.exists(SHADOW_LEDGER_FILE):
@@ -543,21 +577,42 @@ class AdaptiveTradeEngine:
             if sym in existing_today or float(item.get("conviction", 0)) < 40.0:
                 continue
 
-            self.shadow_ledger.append({
+            entry_iso = now_ist.isoformat()
+            shadow_id = item.get("shadow_id") or f"SHADOW_{today_str}_{sym}_{entry_iso}"
+
+            rec = {
+                "shadow_id": shadow_id,
                 "date": today_str,
-                "entry_iso": now_ist.isoformat(),
+                "entry_iso": entry_iso,
                 "entry_session": session_bucket,
                 "symbol": sym,
                 "action": item["action"],
                 "strategy_arm": item.get("strategy_arm", "MOMENTUM_BREAKOUT"),
                 "archetype": item.get("archetype", "MOMENTUM_MOVER"),
                 "rvol_normalized": float(item.get("rvol_normalized", 1.0)),
+                "vol_accel_5m": float(item.get("vol_accel_5m", 1.0)),
                 "vwap_slope_pct": float(item.get("vwap_slope_pct", 0.0)),
                 "mtf_15m_trend": item.get("mtf_15m_trend", "NEUTRAL"),
                 "orb_signal": item.get("orb_signal", "INSIDE_ORB"),
+                "clv": float(item.get("clv", 0.0)),
+                "rsi": float(item.get("rsi", 50.0)),
+                "mansfield_rs": float(item.get("mansfield_rs", 0.0)),
+                "sector_chg_pct": float(item.get("sector_chg_pct", 0.0)),
                 "obi_ratio": float(item.get("obi_ratio", 0.0)),
+                "bid_ask_spread_pct": float(item.get("bid_ask_spread_pct", 0.0)),
+                "delivery_pct": float(item.get("delivery_pct", 0.0)),
+                "vix_ltp": float(item.get("vix_ltp", 14.0)),
+                "fii_net_cr": float(item.get("fii_net_cr", 0.0)),
                 "sector_index": item.get("sector_index", "^NSEI"),
                 "sector_alpha": float(item.get("sector_alpha", 0.0)),
+                "macro_regime": item.get("macro_regime", "NEUTRAL"),
+                "macro_sector_adj": float(item.get("macro_sector_adj", 0.0)),
+                "brent_chg_pct": float(item.get("brent_chg_pct", 0.0)),
+                "us10y_bps_chg": float(item.get("us10y_bps_chg", 0.0)),
+                "usdinr_chg_pct": float(item.get("usdinr_chg_pct", 0.0)),
+                "nasdaq_chg_pct": float(item.get("nasdaq_chg_pct", 0.0)),
+                "is_expiry_day": bool(item.get("is_expiry_day", False)),
+                "expiry_type": item.get("expiry_type", "NONE"),
                 "entry_price": float(item["entry_price"]),
                 "target_1": float(item["target_1"]),
                 "stop_loss": float(item["stop_loss"]),
@@ -565,7 +620,9 @@ class AdaptiveTradeEngine:
                 "skip_reason": item.get("skip_reason", "Below conviction threshold"),
                 "status": "SHADOW_OPEN",
                 "shadow_pnl_pct": 0.0
-            })
+            }
+            self.shadow_ledger.append(rec)
+            self.ml_model.log_setup_observation(shadow_id, "SHADOW_TRADE", rec)
             existing_today.add(sym)
             added += 1
 
@@ -680,7 +737,7 @@ class AdaptiveTradeEngine:
             rec["sl_mult_adj"] = 0.95
 
     # ------------------------------------------------------------------
-    # SECTOR CORRELATION & OVERNIGHT GAP GUARDS
+    # SECTOR CORRELATION & OVERNIGHT GAP GUARDS (WITH HOLIDAY GAP CHECK)
     # ------------------------------------------------------------------
     def _load_sector_cache(self):
         if os.path.exists(SECTOR_CACHE_FILE):
@@ -757,6 +814,8 @@ class AdaptiveTradeEngine:
         entry = float(trade["entry_price"])
         unrealized_pct = (((ltp - entry) / entry) * 100.0) if side == "BUY" else (((entry - ltp) / entry) * 100.0)
         regime = market_regime_info.get("regime", "NEUTRAL")
+        exp = market_regime_info.get("expiry_status", {})
+        next_day_holiday = bool(exp.get("next_day_holiday", MarketDataScanner.is_next_weekday_holiday(now_ist)))
 
         if self._has_upcoming_corporate_event(sym):
             return True, f"Overnight Event Guard: {sym} has earnings/results within 48h; closed before bell."
@@ -767,10 +826,12 @@ class AdaptiveTradeEngine:
         if (side == "BUY" and regime == "BEAR_TREND") or (side.startswith("SELL") and regime == "BULL_TREND"):
             return True, f"Overnight Regime Guard: Nifty regime ({regime}) opposes {side}; closed before bell."
 
-        if unrealized_pct < MIN_OVERNIGHT_CUSHION_PCT:
+        req_cushion = 1.5 if next_day_holiday else MIN_OVERNIGHT_CUSHION_PCT
+        if unrealized_pct < req_cushion:
+            holiday_note = " (next trading day is an NSE holiday — 2-night global gap risk)" if next_day_holiday else ""
             return True, (
                 f"Overnight Cushion Guard: Profit buffer ({unrealized_pct:+.2f}%) is below "
-                f"+{MIN_OVERNIGHT_CUSHION_PCT:.1f}% required to absorb overnight gap risk."
+                f"+{req_cushion:.1f}% required{holiday_note}."
             )
 
         return False, ""
@@ -840,6 +901,7 @@ class AdaptiveTradeEngine:
             "bandit_arms": self._default_bandit_arms(),
             "archetype_memory": {},
             "shadow_samples_learned": 0,
+            "ml_model_summary": "Collecting walk-forward samples",
             "session_memory": {},
             "ticker_memory": {},
             "blacklisted_tickers": [],
@@ -850,7 +912,7 @@ class AdaptiveTradeEngine:
             "generation": 1,
             "last_evaluated_count": 0,
             "last_updated": self._now_ist().strftime("%Y-%m-%d %H:%M"),
-            "learning_notes": "Initialized Upgrade 1 (5m/15m MTF VWAP, ORB, Time-Norm RVOL, OBI, Sector Alignment)."
+            "learning_notes": "Initialized Upgrade 1+2+3 (MTF Flow, RVOL, OBI, Sector, Global Macro, Expiry Shield & Contextual ML)."
         }
         if os.path.exists(WEIGHTS_FILE):
             try:
@@ -1011,7 +1073,7 @@ class AdaptiveTradeEngine:
         return changes
 
     # ------------------------------------------------------------------
-    # 1. FULL QUANTITATIVE + UPGRADE 1 CHART-FLOW + MICROSTRUCTURE SCORER
+    # 1. FULL QUANTITATIVE + UPGRADE 1 + 2 + 3 SCORER
     # ------------------------------------------------------------------
     def generate_intraday_recommendations(self, enriched_df, premarket_df=None, top_k=5):
         if enriched_df.empty:
@@ -1024,10 +1086,26 @@ class AdaptiveTradeEngine:
         regime_info = self._detect_market_regime()
         regime_name = regime_info["regime"]
         nifty_chg_pct = float(regime_info.get("nifty_chg_pct", 0.0))
+        vix_ltp = float(regime_info.get("vix_ltp", 14.0))
+        fii_net_cr = float(regime_info.get("fii_net_cr", 0.0))
         regime_buy_adj = float(regime_info["buy_adj"])
         regime_short_adj = float(regime_info["short_adj"])
         regime_size_mult = float(regime_info["size_multiplier"])
         regime_sl_adj = float(regime_info["sl_multiplier_adj"])
+
+        macro_cues = regime_info.get("global_macro", {})
+        macro_regime = macro_cues.get("macro_regime", "NEUTRAL")
+        sec_macro_map = macro_cues.get("sector_macro_adjustments", {})
+
+        expiry_status = regime_info.get("expiry_status", {})
+        is_expiry_day = bool(expiry_status.get("is_expiry_day", False))
+        expiry_type = str(expiry_status.get("expiry_type", "NONE"))
+        expiry_phase = str(expiry_status.get("expiry_phase", "NORMAL"))
+
+        if expiry_status.get("block_new_entries", False):
+            print(f"[EXPIRY SHIELD] {expiry_status.get('note')} Skipping new entries.")
+            self._save_weights()
+            return pd.DataFrame()
 
         current_session = self._get_session_bucket()
         session_mem = self.weights.get("session_memory", {}).get(current_session, {})
@@ -1036,11 +1114,8 @@ class AdaptiveTradeEngine:
 
         candidate_syms = enriched_df["symbol"].tolist()
         mansfield_rs_map = self._batch_compute_mansfield_rs(candidate_syms)
-
-        # Ensure live sectoral snapshot is available even if caller didn't pre-populate sector columns
         sector_snap = MarketDataScanner.fetch_sectoral_indices_snapshot()
 
-        # Backfill 5m/15m intraday chart flow if caller passed a dataframe without Upgrade 1 columns
         intraday_flow_fallback = {}
         if "rvol_normalized" not in enriched_df.columns or "orb_signal" not in enriched_df.columns:
             intraday_flow_fallback = MarketDataScanner.compute_intraday_chart_flow(candidate_syms)
@@ -1063,7 +1138,9 @@ class AdaptiveTradeEngine:
         atr_tp_mult = float(self.weights.get("atr_tp_multiplier", 1.60))
         buy_rsi_max = float(self.weights.get("buy_rsi_ceiling", 72.0))
         short_rsi_min = float(self.weights.get("short_rsi_floor", 28.0))
-        min_conviction = float(self.weights.get("min_conviction_threshold", 52.0))
+        min_conviction = float(self.weights.get("min_conviction_threshold", 52.0)) + float(
+            expiry_status.get("conviction_hurdle_add", 0.0)
+        )
         buy_bonus = float(self.weights.get("buy_bias_bonus", 0.0))
         short_bonus = float(self.weights.get("short_bias_bonus", 0.0))
 
@@ -1096,14 +1173,13 @@ class AdaptiveTradeEngine:
             d_low = float(row.get("day_low", flow.get("day_low_intraday", ltp)))
             chart_trend = row.get("chart_trend", "RANGE_CONSOLIDATION")
 
-            # Live Sector Index alignment
             sec_idx = str(row.get("sector_index", "") or MarketDataScanner.get_sector_index_for_stock(sym))
             sec_chg_pct = float(
                 row.get("sector_chg_pct", sector_snap.get(sec_idx, {}).get("change_pct", nifty_chg_pct))
             )
             sector_alpha = round(chg - sec_chg_pct, 2)
+            raw_macro_sec_adj = float(row.get("macro_sector_adj", sec_macro_map.get(sec_idx, 0.0)))
 
-            # Direct NSE Microstructure & Order-Book Imbalance fields
             delivery_pct = float(row.get("delivery_pct", 0.0) or 0.0)
             obi_ratio = float(row.get("obi_ratio", 0.0) or 0.0)
             bid_ask_spread_pct = float(row.get("bid_ask_spread_pct", 0.0) or 0.0)
@@ -1126,7 +1202,6 @@ class AdaptiveTradeEngine:
             else:
                 side = "BUY" if chg >= 0 else "SELL (SHORT)"
 
-            # Circuit-Breaker Proximity Veto
             if side == "BUY" and upper_cp > 0 and ltp >= (upper_cp * 0.985):
                 continue
             if side.startswith("SELL") and lower_cp > 0 and ltp <= (lower_cp * 1.015):
@@ -1141,11 +1216,9 @@ class AdaptiveTradeEngine:
             mansfield_rs = float(mansfield_rs_map.get(sym, 0.0))
             intraday_alpha = round(chg - nifty_chg_pct, 2)
 
-            # Priced-In News / Institutional Distribution Trap Filter
             if side == "BUY" and raw_sent == "POSITIVE" and ltp < vwap and intraday_alpha < -0.5:
                 continue
 
-            # Upgrade 1 Adversarial Bear Critic (with 15m MTF, OBI, Spread & Sector checks)
             vetoed, critic_penalty, red_flags = self._adversarial_bear_critic(
                 side, ltp, atr, chg, rsi, clv, intraday_alpha, archetype, regime_name,
                 mtf_15m_trend=mtf_15m_trend,
@@ -1153,9 +1226,12 @@ class AdaptiveTradeEngine:
                 obi_ratio=obi_ratio,
                 bid_ask_spread_pct=bid_ask_spread_pct,
                 sector_chg_pct=sec_chg_pct,
+                macro_regime=macro_regime,
+                macro_sector_adj=raw_macro_sec_adj,
+                expiry_phase=expiry_phase,
+                orb_signal=orb_signal,
             )
 
-            # Time-Normalized RVOL + 5m Volume Acceleration + Delivery % Multiplier
             deliv_mult = 1.20 if delivery_pct >= 50.0 else (0.75 if (0 < delivery_pct < 22.0) else 1.0)
             accel_bonus = 8.0 if vol_accel_5m >= 1.5 else 0.0
             vol_score = min(100.0, ((rvol_norm / 2.4) * 100.0 * deliv_mult) + accel_bonus)
@@ -1178,7 +1254,6 @@ class AdaptiveTradeEngine:
             else:
                 pre_score = 55.0
 
-            # Multi-Timeframe 5m/15m Chart Flow + ORB + VWAP Slope Scoring
             if side == "BUY":
                 trend_bonus = 18.0 if chart_trend == "BULLISH_UPTREND" else 0.0
                 mtf_bonus = 14.0 if mtf_15m_trend == "BULLISH" else (-12.0 if mtf_15m_trend == "BEARISH" else 0.0)
@@ -1195,6 +1270,7 @@ class AdaptiveTradeEngine:
                 rs_adj = max(-6.0, min(8.0, (mansfield_rs * 1.4) + (intraday_alpha * 1.0)))
                 sector_adj = max(-7.0, min(7.0, (sec_chg_pct * 2.5) + (sector_alpha * 1.2)))
                 obi_adj = max(-5.0, min(5.0, obi_ratio * 8.0))
+                macro_sec_applied = max(-6.0, min(6.0, raw_macro_sec_adj))
             else:
                 trend_bonus = 18.0 if chart_trend == "BEARISH_DOWNTREND" else 0.0
                 mtf_bonus = 14.0 if mtf_15m_trend == "BEARISH" else (-12.0 if mtf_15m_trend == "BULLISH" else 0.0)
@@ -1211,6 +1287,7 @@ class AdaptiveTradeEngine:
                 rs_adj = max(-6.0, min(8.0, (-mansfield_rs * 1.4) + (-intraday_alpha * 1.0)))
                 sector_adj = max(-7.0, min(7.0, (-sec_chg_pct * 2.5) + (-sector_alpha * 1.2)))
                 obi_adj = max(-5.0, min(5.0, -obi_ratio * 8.0))
+                macro_sec_applied = max(-6.0, min(6.0, -raw_macro_sec_adj))
 
             base_conviction = (
                 (w_vol * vol_score) +
@@ -1245,7 +1322,8 @@ class AdaptiveTradeEngine:
                     min(
                         99.0,
                         base_conviction + ticker_adj + dir_adj + session_adj + chop_adj +
-                        rs_adj + sector_adj + obi_adj + bandit_adj + arch_score_adj - critic_penalty
+                        rs_adj + sector_adj + obi_adj + macro_sec_applied + bandit_adj +
+                        arch_score_adj - critic_penalty
                     )
                 ),
                 1
@@ -1291,8 +1369,10 @@ class AdaptiveTradeEngine:
                 "calibrated_win_prob": calibrated_p,
                 "strategy_arm": strategy_arm,
                 "archetype": archetype,
+                "entry_session": current_session,
                 "clv": clv,
                 "rvol_normalized": round(rvol_norm, 2),
+                "vol_accel_5m": round(vol_accel_5m, 2),
                 "vwap_slope_pct": round(vwap_slope_pct, 3),
                 "mtf_15m_trend": mtf_15m_trend,
                 "orb_signal": orb_signal,
@@ -1303,6 +1383,17 @@ class AdaptiveTradeEngine:
                 "sector_index": sec_idx,
                 "sector_chg_pct": sec_chg_pct,
                 "sector_alpha": sector_alpha,
+                "vix_ltp": vix_ltp,
+                "fii_net_cr": fii_net_cr,
+                "macro_regime": macro_regime,
+                "macro_sector_adj": round(macro_sec_applied, 1),
+                "brent_chg_pct": float(macro_cues.get("brent_chg_pct", 0.0)),
+                "us10y_bps_chg": float(macro_cues.get("us10y_bps_chg", 0.0)),
+                "usdinr_chg_pct": float(macro_cues.get("usdinr_chg_pct", 0.0)),
+                "nasdaq_chg_pct": float(macro_cues.get("nasdaq_chg_pct", 0.0)),
+                "is_expiry_day": is_expiry_day,
+                "expiry_type": expiry_type,
+                "expiry_phase": expiry_phase,
                 "delivery_pct": delivery_pct,
                 "lower_cp": lower_cp,
                 "upper_cp": upper_cp,
@@ -1330,14 +1421,27 @@ class AdaptiveTradeEngine:
                 "debate_note": "Quantitative Bear Critic passed",
             }
 
+            # UPGRADE 3: Walk-forward Contextual ML probability & bounded conviction adjustment
+            ml_res = self.ml_model.predict_setup_edge(cand_obj)
+            cand_obj["ml_prob"] = ml_res["ml_prob"]
+            cand_obj["ml_conv_adj"] = ml_res["ml_conv_adj"]
+            cand_obj["ml_status"] = ml_res["ml_status"]
+            if ml_res["ml_active"]:
+                cand_obj["conviction"] = round(
+                    max(1.0, min(99.0, cand_obj["conviction"] + ml_res["ml_conv_adj"])), 1
+                )
+                cand_obj["calibrated_win_prob"] = round(
+                    0.35 * posterior_prob + 0.35 * (cand_obj["conviction"] / 100.0) + 0.30 * ml_res["ml_prob"], 4
+                )
+
             if vetoed:
                 cand_obj["skip_reason"] = f"Bear Critic Veto: {', '.join(red_flags)}"
                 skipped_for_shadow.append(cand_obj)
                 continue
 
-            if session_blocked or conviction < min_conviction or avail_cash < 500:
+            if session_blocked or cand_obj["conviction"] < min_conviction or avail_cash < 500:
                 cand_obj["skip_reason"] = (
-                    "Low-win-rate session window" if session_blocked else f"Conviction {conviction} < {min_conviction}"
+                    "Low-win-rate session window" if session_blocked else f"Conviction {cand_obj['conviction']} < {min_conviction}"
                 )
                 skipped_for_shadow.append(cand_obj)
                 continue
@@ -1351,7 +1455,6 @@ class AdaptiveTradeEngine:
 
         scored_candidates.sort(key=lambda x: x["conviction"], reverse=True)
 
-        # Gemini Flash Bull-vs-Bear Debate on top 2 finalists
         debate_approved = []
         for idx, item in enumerate(scored_candidates):
             if idx < 2:
@@ -1373,7 +1476,6 @@ class AdaptiveTradeEngine:
         if not debate_approved:
             return pd.DataFrame()
 
-        # Sector Correlation Guard
         sector_counts, sector_capital = self._get_open_sector_exposure()
         max_sector_cap = current_equity * MAX_SECTOR_EXPOSURE_PCT
 
@@ -1391,7 +1493,6 @@ class AdaptiveTradeEngine:
         if not filtered_by_sector:
             return pd.DataFrame()
 
-        # Half-Kelly Criterion Capital Allocation
         remaining_wallet_cash = avail_cash
         risk_pct_allowed = (float(self.weights.get("risk_per_trade_pct", 1.0)) / 100.0) * regime_size_mult
         max_risk_inr_per_trade = current_equity * risk_pct_allowed
@@ -1433,10 +1534,23 @@ class AdaptiveTradeEngine:
                 "sector_chg_pct": item["sector_chg_pct"],
                 "sector_alpha": item["sector_alpha"],
                 "market_regime": regime_name,
+                "vix_ltp": item["vix_ltp"],
+                "fii_net_cr": item["fii_net_cr"],
+                "macro_regime": item["macro_regime"],
+                "macro_sector_adj": item["macro_sector_adj"],
+                "brent_chg_pct": item["brent_chg_pct"],
+                "us10y_bps_chg": item["us10y_bps_chg"],
+                "usdinr_chg_pct": item["usdinr_chg_pct"],
+                "nasdaq_chg_pct": item["nasdaq_chg_pct"],
+                "is_expiry_day": item["is_expiry_day"],
+                "expiry_type": item["expiry_type"],
+                "expiry_phase": item["expiry_phase"],
                 "strategy_arm": item["strategy_arm"],
                 "archetype": item["archetype"],
+                "entry_session": item["entry_session"],
                 "clv": item["clv"],
                 "rvol_normalized": item["rvol_normalized"],
+                "vol_accel_5m": item["vol_accel_5m"],
                 "vwap_slope_pct": item["vwap_slope_pct"],
                 "mtf_15m_trend": item["mtf_15m_trend"],
                 "orb_signal": item["orb_signal"],
@@ -1447,6 +1561,9 @@ class AdaptiveTradeEngine:
                 "upper_cp": item["upper_cp"],
                 "oi_capped": item["oi_capped"],
                 "debate_note": item["debate_note"],
+                "ml_prob": item["ml_prob"],
+                "ml_conv_adj": item["ml_conv_adj"],
+                "ml_status": item["ml_status"],
                 "mansfield_rs": item["mansfield_rs"],
                 "intraday_alpha": item["intraday_alpha"],
                 "kelly_pct": round(kelly_frac * regime_size_mult * 100.0, 1),
@@ -1537,21 +1654,29 @@ class AdaptiveTradeEngine:
             exp_profit = round(abs(t1 - entry_p) * qty, 2)
 
             regime_tag = row.get("market_regime", self.weights.get("last_market_regime", {}).get("regime", "NEUTRAL"))
+            macro_tag = str(row.get("macro_regime", "NEUTRAL"))
+            macro_sec_adj = float(row.get("macro_sector_adj", 0.0) or 0.0)
+            is_exp = bool(row.get("is_expiry_day", False))
+            exp_type = str(row.get("expiry_type", "NONE"))
             arm_tag = row.get("strategy_arm", "MOMENTUM_BREAKOUT")
             arch_tag = row.get("archetype", "MOMENTUM_MOVER")
             mrs_val = float(row.get("mansfield_rs", 0.0))
             kelly_pct = float(row.get("kelly_pct", 15.0))
             deliv_pct = float(row.get("delivery_pct", snap.get("delivery_pct", 0.0)) or 0.0)
             rvol_norm = float(row.get("rvol_normalized", row.get("vol_ratio", 1.0)) or 1.0)
+            vol_accel = float(row.get("vol_accel_5m", 1.0) or 1.0)
             vwap_slope = float(row.get("vwap_slope_pct", 0.0) or 0.0)
             mtf_trend = str(row.get("mtf_15m_trend", "NEUTRAL"))
             orb_sig = str(row.get("orb_signal", "INSIDE_ORB"))
             obi_val = float(row.get("obi_ratio", snap.get("obi_ratio", 0.0)) or 0.0)
+            spread_val = float(row.get("bid_ask_spread_pct", snap.get("bid_ask_spread_pct", 0.0)) or 0.0)
             sec_idx = str(row.get("sector_index", "^NSEI"))
+            sec_chg = float(row.get("sector_chg_pct", 0.0) or 0.0)
             sec_alpha = float(row.get("sector_alpha", 0.0) or 0.0)
             lower_cp = float(row.get("lower_cp", snap.get("lower_cp", 0.0)) or 0.0)
             upper_cp = float(row.get("upper_cp", snap.get("upper_cp", 0.0)) or 0.0)
             debate_note = str(row.get("debate_note", "Passed risk debate"))
+            ml_status = str(row.get("ml_status", "Collecting samples"))
 
             trade_record = {
                 "trade_id": f"{today_str}_{sym}_{now_ist.strftime('%H%M')}",
@@ -1560,20 +1685,35 @@ class AdaptiveTradeEngine:
                 "entry_iso": now_ist.isoformat(),
                 "entry_session": session_bucket,
                 "market_regime": regime_tag,
+                "vix_ltp": float(row.get("vix_ltp", 14.0) or 14.0),
+                "fii_net_cr": float(row.get("fii_net_cr", 0.0) or 0.0),
+                "macro_regime": macro_tag,
+                "macro_sector_adj": macro_sec_adj,
+                "brent_chg_pct": float(row.get("brent_chg_pct", 0.0) or 0.0),
+                "us10y_bps_chg": float(row.get("us10y_bps_chg", 0.0) or 0.0),
+                "usdinr_chg_pct": float(row.get("usdinr_chg_pct", 0.0) or 0.0),
+                "nasdaq_chg_pct": float(row.get("nasdaq_chg_pct", 0.0) or 0.0),
+                "is_expiry_day": is_exp,
+                "expiry_type": exp_type,
                 "strategy_arm": arm_tag,
                 "archetype": arch_tag,
                 "mansfield_rs": mrs_val,
                 "rvol_normalized": rvol_norm,
+                "vol_accel_5m": vol_accel,
                 "vwap_slope_pct": vwap_slope,
                 "mtf_15m_trend": mtf_trend,
                 "orb_signal": orb_sig,
+                "clv": float(row.get("clv", 0.0) or 0.0),
                 "obi_ratio": obi_val,
+                "bid_ask_spread_pct": spread_val,
                 "sector_index": sec_idx,
+                "sector_chg_pct": sec_chg,
                 "sector_alpha": sec_alpha,
                 "delivery_pct": deliv_pct,
                 "lower_cp": lower_cp,
                 "upper_cp": upper_cp,
                 "debate_note": debate_note,
+                "ml_status": ml_status,
                 "kelly_pct": kelly_pct,
                 "sector": sec,
                 "symbol": sym,
@@ -1591,10 +1731,14 @@ class AdaptiveTradeEngine:
                 "peak_pnl_inr": 0.0,
                 "unrealized_pnl_inr": 0.0,
                 "entry_rsi": float(row.get("rsi", 50.0)),
+                "rsi": float(row.get("rsi", 50.0)),
                 "entry_sentiment": row.get("sentiment", "NEUTRAL"),
                 "chart_trend": row.get("chart_trend", "RANGE_CONSOLIDATION"),
                 "status": "OPEN",
-                "trade_management_note": f"15m:{mtf_trend} | {orb_sig} | RVOL:{rvol_norm:.1f}x | OBI:{obi_val:+.2f} | SecAlpha:{sec_alpha:+.1f}%",
+                "trade_management_note": (
+                    f"15m:{mtf_trend} | {orb_sig} | RVOL:{rvol_norm:.1f}x | "
+                    f"Macro:{macro_tag} ({macro_sec_adj:+.1f}) | ML:{ml_status}"
+                ),
                 "exit_price": None,
                 "exit_time": None,
                 "hold_minutes": 0.0,
@@ -1614,19 +1758,22 @@ class AdaptiveTradeEngine:
                 "headline": row["headline"]
             }
             self.ledger.append(trade_record)
+            self.ml_model.log_setup_observation(trade_record["trade_id"], "REAL_TRADE", trade_record)
             open_symbols.add(sym)
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
             added += 1
 
             if notify_telegram:
                 side_header = "🟢 <b>AI AUTONOMOUS BUY ENTRY</b>" if row["action"] == "BUY" else "🔴 <b>AI AUTONOMOUS SHORT ENTRY</b>"
+                exp_line = f" | ⏳ <b>Expiry:</b> <code>{exp_type}</code>" if is_exp else ""
                 entry_ticket = (
                     f"{side_header}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']}) | <b>Sector:</b> {sec} ({sec_idx})\n"
+                    f"🌍 <b>Macro:</b> <code>{macro_tag}</code> (Sec Adj {macro_sec_adj:+.1f}){exp_line}\n"
                     f"📈 <b>Chart Flow:</b> 15m <code>{mtf_trend}</code> | <code>{orb_sig}</code> | VWAP Slope {vwap_slope:+.2f}%\n"
                     f"📊 <b>RVOL:</b> {rvol_norm:.1f}x | <b>OBI:</b> {obi_val:+.2f} | <b>Deliv:</b> {deliv_pct:.1f}% | <b>Sec Alpha:</b> {sec_alpha:+.2f}%\n"
-                    f"🎰 <b>Arm:</b> <code>{arm_tag}</code> | <b>TRA:</b> <code>{arch_tag}</code>\n"
+                    f"🎰 <b>Arm:</b> <code>{arm_tag}</code> | <b>TRA:</b> <code>{arch_tag}</code> | <b>ML:</b> <code>{ml_status}</code>\n"
                     f"📦 <b>Quantity:</b> <b>{qty} Shares</b> @ <b>₹{entry_p}</b> (Half-Kelly: {kelly_pct:.1f}%)\n"
                     f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Cash Left: ₹{avail_cash:,.2f})</i>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1643,7 +1790,7 @@ class AdaptiveTradeEngine:
         return added
 
     # ------------------------------------------------------------------
-    # 3. LIVE MANAGER + CIRCUIT LOCKOUT + SLIPPAGE + AFTER-TAX SETTLEMENT
+    # 3. LIVE MANAGER + EXPIRY SHIELD + CIRCUIT LOCKOUT + AFTER-TAX SETTLEMENT
     # ------------------------------------------------------------------
     def manage_live_positions(self, notify_telegram=True):
         self._evaluate_shadow_trades()
@@ -1655,6 +1802,10 @@ class AdaptiveTradeEngine:
 
         regime_info = self._detect_market_regime()
         nifty_chg_pct = float(regime_info.get("nifty_chg_pct", 0.0))
+        expiry_status = regime_info.get("expiry_status", {})
+        is_expiry_day = bool(expiry_status.get("is_expiry_day", False))
+        expiry_phase = str(expiry_status.get("expiry_phase", "NORMAL"))
+
         symbols = [t["symbol"] for t in open_trades]
         snapshots = MarketDataScanner.fetch_live_intraday_snapshot(symbols)
         actions_taken = []
@@ -1662,7 +1813,10 @@ class AdaptiveTradeEngine:
         today_str = now_ist.strftime("%Y-%m-%d")
         now_time = now_ist.strftime("%I:%M:%S %p")
 
-        giveback_limit_pct = float(self.weights.get("max_profit_giveback_pct", 45.0))
+        base_giveback = float(self.weights.get("max_profit_giveback_pct", 45.0))
+        exp_giveback_cap = float(expiry_status.get("giveback_cap_pct", 45.0))
+        giveback_limit_pct = min(base_giveback, exp_giveback_cap) if is_expiry_day else base_giveback
+        be_trail_trigger_r = 0.60 if (is_expiry_day and expiry_phase in ("EXPIRY_PIN_WINDOW", "EXPIRY_FINAL_HOUR_LOCK")) else 0.80
         max_hold_mins = float(self.weights.get("learned_max_hold_mins", 180.0))
 
         for trade in open_trades:
@@ -1736,6 +1890,16 @@ class AdaptiveTradeEngine:
                 exit_note = f"News emotion flipped to {live_news['emotion']}: {live_news['top_headline']}"
 
             elif (
+                expiry_phase == "EXPIRY_FINAL_HOUR_LOCK"
+                and r_multiple >= 0.50
+                and ((side == "BUY" and ltp < vwap) or (side.startswith("SELL") and ltp > vwap))
+            ):
+                exit_triggered = True
+                exit_status = "EXPIRY SHIELD PROFIT LOCK"
+                raw_exit_price = ltp
+                exit_note = f"Locked profit before NSE expiry 15:00-15:30 VWAP unwind after losing VWAP (₹{vwap})."
+
+            elif (
                 side == "BUY"
                 and trade.get("entry_sentiment") == "POSITIVE"
                 and hold_mins >= 20.0
@@ -1755,8 +1919,10 @@ class AdaptiveTradeEngine:
                 exit_note = overnight_reason
 
             elif (side == "BUY" and (ltp >= t1 or d_high >= t1)) or (side.startswith("SELL") and (ltp <= t1 or d_low <= t1)):
-                strong_momentum = (ltp >= t1 and ltp > vwap and t1 < t2) if side == "BUY" else (ltp <= t1 and ltp < vwap and t1 > t2)
-                if strong_momentum:
+                strong_momentum = (
+                    (ltp >= t1 and ltp > vwap and t1 < t2) if side == "BUY" else (ltp <= t1 and ltp < vwap and t1 > t2)
+                )
+                if strong_momentum and expiry_phase not in ("EXPIRY_PIN_WINDOW", "EXPIRY_FINAL_HOUR_LOCK"):
                     new_sl = round(entry + (0.85 * risk_unit), 2) if side == "BUY" else round(entry - (0.85 * risk_unit), 2)
                     trade["stop_loss"] = max(sl, new_sl) if side == "BUY" else min(sl, new_sl)
                     trade["target_1"] = t2
@@ -1781,7 +1947,7 @@ class AdaptiveTradeEngine:
                     exit_triggered = True
                     exit_status = "WIN (PROFIT LOCKED)"
                     raw_exit_price = ltp
-                    exit_note = f"AI locked profit after {giveback_pct:.0f}% pullback from peak ₹{peak_pnl:,.0f}."
+                    exit_note = f"AI locked profit after {giveback_pct:.0f}% pullback from peak ₹{peak_pnl:,.0f} (limit {giveback_limit_pct:.0f}%)."
 
             elif r_multiple <= -0.65 and ((side == "BUY" and ltp < vwap) or (side.startswith("SELL") and ltp > vwap)):
                 exit_triggered = True
@@ -1795,9 +1961,9 @@ class AdaptiveTradeEngine:
                 raw_exit_price = ltp
                 exit_note = f"Exited after {hold_mins:.0f}m without momentum follow-through."
 
-            elif r_multiple >= 0.8 and ((side == "BUY" and sl < entry) or (side.startswith("SELL") and sl > entry)):
+            elif r_multiple >= be_trail_trigger_r and ((side == "BUY" and sl < entry) or (side.startswith("SELL") and sl > entry)):
                 trade["stop_loss"] = entry
-                trade["trade_management_note"] = f"SL trailed to breakeven ₹{entry}."
+                trade["trade_management_note"] = f"SL trailed to breakeven ₹{entry} (trigger {be_trail_trigger_r}R)."
 
             if exit_triggered:
                 slip_pct = self._get_archetype_slippage_pct(arch_used) / 100.0
@@ -1917,6 +2083,19 @@ class AdaptiveTradeEngine:
     def evaluate_open_trades_and_learn(self, notify_telegram=True):
         self.manage_live_positions(notify_telegram=notify_telegram)
         learning_summary = self._optimize_weights_from_history(force_recalibrate=True)
+
+        # UPGRADE 3: Sync outcome labels and retrain walk-forward contextual ML model
+        ml_info = self.ml_model.train_walk_forward(self.ledger, self.shadow_ledger)
+        if ml_info.get("trained"):
+            self.weights["ml_model_summary"] = (
+                f"{ml_info['backend']} | n={ml_info['samples_count']} | "
+                f"WF AUC={ml_info['wf_auc']:.2f} | WF WR={ml_info['wf_win_rate']}%"
+            )
+        else:
+            self.weights["ml_model_summary"] = (
+                f"Collecting samples ({ml_info.get('samples_count', 0)}/{ml_info.get('min_required', 60)})"
+            )
+        self._save_weights()
 
         today_str = self._now_ist().strftime("%Y-%m-%d")
         today_pnl = sum(

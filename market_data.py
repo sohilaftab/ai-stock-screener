@@ -1,7 +1,8 @@
+import calendar
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -20,7 +21,28 @@ DEFAULT_NIFTY_UNIVERSE = [
     "BANKBARODA", "PNB", "CANBK", "PFC", "RECLTD", "IRCTC"
 ]
 
-# Direct mapping of NSE stocks to their primary NSE Sectoral Index on Yahoo Finance
+# Official 2026 NSE Equity & F&O Weekday Trading Holidays (YYYY-MM-DD)
+NSE_HOLIDAYS_2026 = {
+    "2026-01-15",  # Municipal Corporation Elections - Maharashtra
+    "2026-01-26",  # Republic Day
+    "2026-03-03",  # Holi
+    "2026-03-26",  # Shri Ram Navami
+    "2026-03-31",  # Shri Mahavir Jayanti
+    "2026-04-03",  # Good Friday
+    "2026-04-14",  # Dr. Baba Saheb Ambedkar Jayanti
+    "2026-05-01",  # Maharashtra Day
+    "2026-05-28",  # Bakri Id
+    "2026-06-26",  # Muharram
+    "2026-09-14",  # Ganesh Chaturthi
+    "2026-10-02",  # Mahatma Gandhi Jayanti
+    "2026-10-20",  # Dussehra
+    "2026-11-10",  # Diwali-Balipratipada
+    "2026-11-24",  # Prakash Gurpurb Sri Guru Nanak Dev
+    "2026-12-25",  # Christmas
+}
+
+GLOBAL_MACRO_TICKERS = ["BZ=F", "^TNX", "INR=X", "^IXIC", "^GSPC"]
+
 SYMBOL_TO_SECTOR_INDEX = {
     "HDFCBANK": "^NSEBANK", "ICICIBANK": "^NSEBANK", "AXISBANK": "^NSEBANK",
     "KOTAKBANK": "^NSEBANK", "BAJFINANCE": "^NSEBANK", "JIOFIN": "^NSEBANK",
@@ -126,15 +148,18 @@ _NSE_CLIENT = NSESessionClient()
 
 class MarketDataScanner:
     """
-    Hybrid NSE Direct + Multi-Timeframe Intraday Scanner providing:
+    Hybrid NSE Direct + Multi-Timeframe Intraday + Global Macro Scanner providing:
     1. Live NSE quotes, circuit bands (lowerCP/upperCP), Delivery %, & Order-Book Imbalance (OBI)
     2. 5m/15m Multi-Timeframe VWAP, VWAP Slope, EMA9/EMA21 Alignment, ORB & Time-Normalized RVOL
     3. Live NSE Sectoral Index alignment & Stock Option Chain Max Call/Put OI walls
-    4. FII / DII daily institutional net flows
+    4. Overnight Global Macro cues (Brent Crude, US 10Y Yield, USD/INR, Nasdaq, S&P 500)
+    5. NSE Tuesday Expiry-Day Shield (including holiday-shifted Monday weekly/monthly expiries)
     """
 
     _sector_cache_ts = 0.0
     _sector_cache_data = {}
+    _macro_cache_ts = 0.0
+    _macro_cache_data = {}
 
     def __init__(self, universe=None):
         self.universe = universe or DEFAULT_NIFTY_UNIVERSE
@@ -162,14 +187,306 @@ class MarketDataScanner:
         return "^NSEI"
 
     # ------------------------------------------------------------------
+    # UPGRADE 2A: NSE TUESDAY EXPIRY-DAY SHIELD (WITH HOLIDAY SHIFTING)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def is_nse_trading_day(d: date) -> bool:
+        if d.weekday() >= 5:
+            return False
+        return d.strftime("%Y-%m-%d") not in NSE_HOLIDAYS_2026
+
+    @classmethod
+    def _effective_expiry_for_tuesday(cls, tuesday_date: date) -> date:
+        eff = tuesday_date
+        while not cls.is_nse_trading_day(eff):
+            eff -= timedelta(days=1)
+        return eff
+
+    @staticmethod
+    def _is_last_tuesday_of_month(tuesday_date: date) -> bool:
+        return (tuesday_date + timedelta(days=7)).month != tuesday_date.month
+
+    @classmethod
+    def is_next_weekday_holiday(cls, dt: datetime = None) -> bool:
+        """Returns True if the next weekday (Mon-Fri) is an NSE holiday (mid-week gap risk)."""
+        now_dt = dt or datetime.now(IST)
+        nxt = now_dt.date() + timedelta(days=1)
+        while nxt.weekday() >= 5:
+            nxt += timedelta(days=1)
+        return nxt.strftime("%Y-%m-%d") in NSE_HOLIDAYS_2026
+
+    @classmethod
+    def get_nse_expiry_status(cls, dt: datetime = None) -> dict:
+        """
+        Detects NSE Weekly & Monthly Tuesday F&O expiry sessions, automatically shifting
+        to the preceding trading day (e.g., Monday) whenever Tuesday is an NSE holiday.
+        """
+        now_dt = dt or datetime.now(IST)
+        today = now_dt.date()
+        mins = now_dt.hour * 60 + now_dt.minute
+
+        mon_this_week = today - timedelta(days=today.weekday())
+        candidate_tuesdays = [
+            mon_this_week + timedelta(days=1),
+            mon_this_week + timedelta(days=8),  # Covers rare Mon+Tue dual holiday shifting to Fri
+        ]
+
+        is_expiry = False
+        expiry_type = "NONE"
+        shifted_from_holiday = False
+        scheduled_tue_str = ""
+
+        for tue in candidate_tuesdays:
+            eff = cls._effective_expiry_for_tuesday(tue)
+            if today == eff:
+                is_expiry = True
+                shifted_from_holiday = (eff != tue)
+                scheduled_tue_str = tue.strftime("%Y-%m-%d")
+                expiry_type = "MONTHLY_EXPIRY" if cls._is_last_tuesday_of_month(tue) else "WEEKLY_EXPIRY"
+                break
+
+        if not is_expiry:
+            return {
+                "is_expiry_day": False,
+                "expiry_type": "NONE",
+                "expiry_phase": "NORMAL",
+                "shifted_from_holiday": False,
+                "scheduled_tuesday": "",
+                "block_new_entries": False,
+                "conviction_hurdle_add": 0.0,
+                "size_multiplier": 1.0,
+                "giveback_cap_pct": 45.0,
+                "next_day_holiday": cls.is_next_weekday_holiday(now_dt),
+                "note": "Normal NSE session",
+            }
+
+        is_monthly = (expiry_type == "MONTHLY_EXPIRY")
+        shift_tag = f" (Holiday-shifted from Tue {scheduled_tue_str})" if shifted_from_holiday else ""
+
+        if mins >= (14 * 60 + 45):
+            phase = "EXPIRY_FINAL_HOUR_LOCK"
+            block_new = True
+            hurdle_add = 99.0
+            size_mult = 0.0
+            giveback_cap = 22.0 if is_monthly else 25.0
+            note = f"{expiry_type}{shift_tag}: Final-hour gamma/VWAP lock active (no new entries after 14:45 IST)."
+        elif mins >= (13 * 60 + 30):
+            phase = "EXPIRY_PIN_WINDOW"
+            block_new = False
+            hurdle_add = 4.0 if is_monthly else 2.5
+            size_mult = 0.70 if is_monthly else 0.80
+            giveback_cap = 28.0 if is_monthly else 32.0
+            note = f"{expiry_type}{shift_tag}: Afternoon gamma-pin shield (+{hurdle_add} conv hurdle, {int(size_mult*100)}% size)."
+        else:
+            phase = "EXPIRY_MORNING"
+            block_new = False
+            hurdle_add = 1.5 if is_monthly else 0.0
+            size_mult = 0.90 if is_monthly else 0.95
+            giveback_cap = 35.0 if is_monthly else 40.0
+            note = f"{expiry_type}{shift_tag}: Active morning expiry awareness ({int(size_mult*100)}% size)."
+
+        return {
+            "is_expiry_day": True,
+            "expiry_type": expiry_type,
+            "expiry_phase": phase,
+            "shifted_from_holiday": shifted_from_holiday,
+            "scheduled_tuesday": scheduled_tue_str,
+            "block_new_entries": block_new,
+            "conviction_hurdle_add": hurdle_add,
+            "size_multiplier": size_mult,
+            "giveback_cap_pct": giveback_cap,
+            "next_day_holiday": cls.is_next_weekday_holiday(now_dt),
+            "note": note,
+        }
+
+    # ------------------------------------------------------------------
+    # UPGRADE 2B: OVERNIGHT GLOBAL MACRO CUES (BRENT, US10Y, USD/INR, NASDAQ)
+    # ------------------------------------------------------------------
+    @classmethod
+    def fetch_global_macro_cues(cls, force_refresh: bool = False) -> dict:
+        """
+        Fetches latest closes & 1-day shifts for Brent Crude (BZ=F), US 10Y Yield (^TNX),
+        USD/INR (INR=X), Nasdaq (^IXIC), and S&P 500 (^GSPC), translating them into
+        India-specific broad & sectoral conviction adjustments (cached 5 mins).
+        """
+        now = time.time()
+        if not force_refresh and cls._macro_cache_data and (now - cls._macro_cache_ts) < 300.0:
+            return cls._macro_cache_data
+
+        default_macro = {
+            "macro_regime": "NEUTRAL",
+            "brent_ltp": 0.0,
+            "brent_chg_pct": 0.0,
+            "us10y_yield": 0.0,
+            "us10y_bps_chg": 0.0,
+            "usdinr_ltp": 0.0,
+            "usdinr_chg_pct": 0.0,
+            "nasdaq_chg_pct": 0.0,
+            "sp500_chg_pct": 0.0,
+            "macro_buy_adj": 0.0,
+            "macro_short_adj": 0.0,
+            "macro_size_multiplier": 1.0,
+            "sector_macro_adjustments": {},
+            "summary": "Macro cues neutral / unavailable",
+            "updated_at": datetime.now(IST).strftime("%I:%M %p IST"),
+        }
+
+        try:
+            raw = yf.download(
+                tickers=GLOBAL_MACRO_TICKERS,
+                period="5d",
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+            if raw.empty or not isinstance(raw.columns, pd.MultiIndex):
+                cls._macro_cache_data = default_macro
+                cls._macro_cache_ts = now
+                return default_macro
+
+            level0 = set(raw.columns.get_level_values(0))
+
+            def _extract(tkr):
+                if tkr not in level0:
+                    return 0.0, 0.0, 0.0
+                closes = raw[tkr]["Close"].dropna()
+                if len(closes) < 2:
+                    return (float(closes.iloc[-1]) if len(closes) == 1 else 0.0), 0.0, 0.0
+                cur = float(closes.iloc[-1])
+                prev = float(closes.iloc[-2])
+                chg_pct = ((cur - prev) / prev) * 100.0 if prev > 0 else 0.0
+                return cur, prev, chg_pct
+
+            brent_ltp, _, brent_chg = _extract("BZ=F")
+            us10y_cur, us10y_prev, _ = _extract("^TNX")
+            usdinr_ltp, _, usdinr_chg = _extract("INR=X")
+            _, _, nasdaq_chg = _extract("^IXIC")
+            _, _, sp500_chg = _extract("^GSPC")
+
+            # Normalize Yahoo ^TNX (quoted either as 4.35 or 43.5 for 4.35%)
+            if us10y_cur > 15.0:
+                us10y_cur /= 10.0
+                us10y_prev /= 10.0
+            us10y_bps_chg = round((us10y_cur - us10y_prev) * 100.0, 1) if us10y_prev > 0 else 0.0
+
+            # Classify Global Macro Regime for Indian Equities
+            inflation_shock = (brent_chg >= 2.2) or (us10y_bps_chg >= 8.0) or (brent_chg >= 1.5 and us10y_bps_chg >= 5.0)
+            risk_off = (sp500_chg <= -1.2) or (nasdaq_chg <= -1.6) or (usdinr_chg >= 0.55)
+            risk_on = (sp500_chg >= 0.7) and (brent_chg <= 1.5) and (us10y_bps_chg <= 4.0) and (usdinr_chg <= 0.30)
+
+            if inflation_shock and risk_off:
+                macro_regime = "INFLATION_RATE_SHOCK"
+                macro_buy_adj = -5.0
+                macro_short_adj = 4.0
+                macro_size_mult = 0.80
+            elif inflation_shock:
+                macro_regime = "INFLATION_RATE_SHOCK"
+                macro_buy_adj = -3.0
+                macro_short_adj = 2.0
+                macro_size_mult = 0.90
+            elif risk_off:
+                macro_regime = "RISK_OFF"
+                macro_buy_adj = -4.0
+                macro_short_adj = 3.5
+                macro_size_mult = 0.85
+            elif risk_on:
+                macro_regime = "RISK_ON"
+                macro_buy_adj = 3.0
+                macro_short_adj = -2.5
+                macro_size_mult = 1.0
+            else:
+                macro_regime = "NEUTRAL"
+                macro_buy_adj = 0.0
+                macro_short_adj = 0.0
+                macro_size_mult = 1.0
+
+            # Sector-Specific Macro Sensitivity Map (applied + for BUY, - for SHORT)
+            sec_adj = {}
+
+            # IT: Tailwind from Nasdaq rally & weaker INR (rising USD/INR); headwind from Nasdaq selloff
+            it_adj = 0.0
+            if nasdaq_chg >= 0.9:
+                it_adj += 3.0
+            elif nasdaq_chg <= -1.1:
+                it_adj -= 3.5
+            if usdinr_chg >= 0.25:
+                it_adj += 2.0
+            elif usdinr_chg <= -0.35:
+                it_adj -= 1.5
+            sec_adj["^CNXIT"] = round(max(-5.5, min(5.5, it_adj)), 1)
+
+            # Banks / Financials & Realty: Rate-sensitive (hurt by US10Y yield spikes & Brent inflation)
+            rate_adj = 0.0
+            if us10y_bps_chg >= 6.0:
+                rate_adj -= 3.0
+            elif us10y_bps_chg <= -6.0:
+                rate_adj += 2.5
+            if brent_chg >= 2.0:
+                rate_adj -= 2.0
+            elif brent_chg <= -2.0:
+                rate_adj += 1.5
+            if usdinr_chg >= 0.45:
+                rate_adj -= 1.5  # FII outflow pressure on large-cap banks
+            sec_adj["^NSEBANK"] = round(max(-5.5, min(5.5, rate_adj)), 1)
+            sec_adj["^CNXPSUBANK"] = round(max(-5.5, min(5.5, rate_adj)), 1)
+            sec_adj["^CNXREALTY"] = round(max(-6.0, min(6.0, rate_adj * 1.15)), 1)
+
+            # Auto & Energy/OMCs: Sensitive to Brent crude input costs
+            crude_adj = 0.0
+            if brent_chg >= 2.0:
+                crude_adj -= 3.5
+            elif brent_chg <= -2.0:
+                crude_adj += 3.0
+            sec_adj["^CNXAUTO"] = round(crude_adj, 1)
+            sec_adj["^CNXENERGY"] = round(crude_adj * 0.6, 1)
+
+            # Pharma: Defensive + USD export earner
+            pharma_adj = 1.5 if (usdinr_chg >= 0.25 or risk_off) else 0.0
+            sec_adj["^CNXPHARMA"] = round(pharma_adj, 1)
+
+            # Metals: Global growth proxy
+            metal_adj = 2.0 if sp500_chg >= 0.9 else (-2.5 if sp500_chg <= -1.1 else 0.0)
+            sec_adj["^CNXMETAL"] = round(metal_adj, 1)
+
+            summary = (
+                f"{macro_regime} | Brent ${brent_ltp:.1f} ({brent_chg:+.1f}%) | "
+                f"US10Y {us10y_cur:.2f}% ({us10y_bps_chg:+.1f}bps) | "
+                f"USD/INR {usdinr_ltp:.2f} ({usdinr_chg:+.2f}%) | "
+                f"Nasdaq {nasdaq_chg:+.2f}%"
+            )
+
+            macro_res = {
+                "macro_regime": macro_regime,
+                "brent_ltp": round(brent_ltp, 2),
+                "brent_chg_pct": round(brent_chg, 2),
+                "us10y_yield": round(us10y_cur, 2),
+                "us10y_bps_chg": us10y_bps_chg,
+                "usdinr_ltp": round(usdinr_ltp, 2),
+                "usdinr_chg_pct": round(usdinr_chg, 2),
+                "nasdaq_chg_pct": round(nasdaq_chg, 2),
+                "sp500_chg_pct": round(sp500_chg, 2),
+                "macro_buy_adj": macro_buy_adj,
+                "macro_short_adj": macro_short_adj,
+                "macro_size_multiplier": macro_size_mult,
+                "sector_macro_adjustments": sec_adj,
+                "summary": summary,
+                "updated_at": datetime.now(IST).strftime("%I:%M %p IST"),
+            }
+            cls._macro_cache_data = macro_res
+            cls._macro_cache_ts = now
+            return macro_res
+        except Exception as e:
+            print(f"[WARN] Global macro cues fetch fallback: {e}")
+            cls._macro_cache_data = default_macro
+            cls._macro_cache_ts = now
+            return default_macro
+
+    # ------------------------------------------------------------------
     # LIVE NSE SECTORAL INDICES SNAPSHOT (60s TTL CACHE)
     # ------------------------------------------------------------------
     @classmethod
     def fetch_sectoral_indices_snapshot(cls, force_refresh: bool = False) -> dict:
-        """
-        Batch-downloads live intraday % change for Nifty 50 and all major NSE Sectoral
-        Indices so every stock can be checked against its sector's live tape.
-        """
         now = time.time()
         if not force_refresh and cls._sector_cache_data and (now - cls._sector_cache_ts) < 60.0:
             return cls._sector_cache_data
@@ -209,10 +526,6 @@ class MarketDataScanner:
     # ------------------------------------------------------------------
     @classmethod
     def _parse_order_book(cls, ob: dict, ltp: float) -> tuple:
-        """
-        Computes normalized Order-Book Imbalance (OBI in [-1.0, +1.0]) and
-        top-of-book bid-ask spread percentage from NSE marketDeptOrderBook / orderBook.
-        """
         if not isinstance(ob, dict):
             return 0.0, 0.0
 
@@ -234,15 +547,9 @@ class MarketDataScanner:
 
     @classmethod
     def fetch_nse_equity_quote(cls, symbol: str) -> dict:
-        """
-        Fetches live quote, VWAP, circuit bands (lowerCP/upperCP), delivery %, and
-        order-book imbalance (OBI + spread). Supports NSE's 2026 GetQuoteApi endpoint
-        and falls back cleanly to legacy /api/quote-equity.
-        """
         clean = cls._clean_sym(symbol)
         encoded = urllib.parse.quote(clean)
 
-        # 1) Try updated 2026 NSE NextApi GetQuoteApi endpoint first
         next_payload = _NSE_CLIENT.get_json(
             f"/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolData&marketType=N&series=EQ&symbol={encoded}"
         )
@@ -286,7 +593,6 @@ class MarketDataScanner:
                         "source": "NSE_GETQUOTE_API",
                     }
 
-        # 2) Fallback to standard /api/quote-equity route
         quote_data = _NSE_CLIENT.get_json(f"/api/quote-equity?symbol={encoded}")
         if not isinstance(quote_data, dict) or "priceInfo" not in quote_data:
             return {}
@@ -376,7 +682,6 @@ class MarketDataScanner:
 
     @classmethod
     def fetch_nse_microstructure(cls, symbol: str, spot_price: float = 0.0) -> dict:
-        """Combines NSE direct quote, circuit bands, delivery %, OBI/spread, and F&O OI walls."""
         q = cls.fetch_nse_equity_quote(symbol)
         ltp = q.get("current_price", spot_price)
         walls = cls.fetch_option_chain_walls(symbol, ltp) if ltp > 0 else {}
@@ -413,14 +718,6 @@ class MarketDataScanner:
     # ------------------------------------------------------------------
     @classmethod
     def compute_intraday_chart_flow(cls, symbols: list) -> dict:
-        """
-        Batch-downloads 10 days of 5-minute intraday candles to compute:
-        1. True cumulative intraday VWAP & 15m VWAP slope (% change over last 3 x 15m bars)
-        2. 15m EMA-9 vs EMA-21 trend alignment (mtf_15m_trend)
-        3. Opening Range Breakout (09:15-09:30 IST High/Low -> ORB_BREAKOUT_UP/DOWN)
-        4. Time-Normalized RVOL (today's cumulative volume up to current HH:MM vs
-           historical average cumulative volume up to the exact same HH:MM)
-        """
         flow_map = {}
         if not symbols:
             return flow_map
@@ -480,7 +777,6 @@ class MarketDataScanner:
                 last_ts = today_5m.index[-1]
                 cutoff_mins = last_ts.hour * 60 + last_ts.minute
 
-                # 1) True cumulative intraday VWAP on 5m bars
                 tp_5m = (today_5m["High"] + today_5m["Low"] + today_5m["Close"]) / 3.0
                 cum_vol = today_5m["Volume"].cumsum()
                 cum_pv = (tp_5m * today_5m["Volume"]).cumsum()
@@ -488,7 +784,6 @@ class MarketDataScanner:
                 vwap_series = vwap_series.ffill().fillna(ltp)
                 vwap_intraday = float(vwap_series.iloc[-1])
 
-                # 2) 15-minute Resampling -> VWAP Slope + 15m EMA9 / EMA21 Alignment
                 df_15m = df.resample("15min").agg({
                     "Open": "first",
                     "High": "max",
@@ -519,7 +814,6 @@ class MarketDataScanner:
                 else:
                     mtf_15m_trend = "NEUTRAL"
 
-                # 3) Opening Range Breakout (09:15 - 09:30 AM IST)
                 orb_mask = (today_5m.index.hour * 60 + today_5m.index.minute) < (9 * 60 + 30)
                 orb_bars = today_5m[orb_mask]
                 if orb_bars.empty:
@@ -539,7 +833,6 @@ class MarketDataScanner:
                     orb_signal = "INSIDE_ORB"
                     orb_dist_pct = 0.0
 
-                # 4) Time-Normalized Relative Volume (RVOL up to exact current minute)
                 today_cum_vol = float(today_5m["Volume"].sum())
                 hist_same_time_vols = []
                 if not hist_5m.empty:
@@ -555,7 +848,6 @@ class MarketDataScanner:
                 else:
                     rvol_normalized = 1.0
 
-                # Recent 5m bar volume acceleration (last 2 bars vs session average 5m bar)
                 avg_5m_vol = float(today_5m["Volume"].mean())
                 recent_5m_vol = float(today_5m["Volume"].tail(2).mean())
                 vol_accel_5m = round(recent_5m_vol / max(avg_5m_vol, 1.0), 2) if avg_5m_vol > 0 else 1.0
@@ -656,13 +948,6 @@ class MarketDataScanner:
         return pd.DataFrame(rows)
 
     def scan_volume_breakouts(self, top_n: int = 15) -> pd.DataFrame:
-        """
-        Two-stage institutional scanner:
-        Stage 1: Fast daily pre-filter (ATR, RSI, trend) across the Nifty universe.
-        Stage 2: Enrich top candidates with 5m/15m Multi-Timeframe Flow (VWAP slope,
-                 ORB, Time-Normalized RVOL), Live Sector Index % change, and Direct
-                 NSE Microstructure (Delivery %, Circuit Bands, OBI, Options OI Walls).
-        """
         ns_tickers = [f"{s}.NS" for s in self.universe]
         raw = yf.download(
             tickers=ns_tickers,
@@ -732,18 +1017,15 @@ class MarketDataScanner:
             return pd.DataFrame()
 
         cand_df = pd.DataFrame(candidates)
-        # Pre-select slightly wider pool (top_n + 5) so morning stocks with low daily vol_ratio aren't missed
         cand_df["pre_rank"] = cand_df["change_pct"].abs() * 1.5 + cand_df["vol_ratio"]
         pool_df = cand_df.sort_values("pre_rank", ascending=False).head(max(top_n + 5, 18)).copy()
         pool_syms = pool_df["symbol"].tolist()
 
-        # Stage 2A: Batch-compute 5m/15m Multi-Timeframe Flow, ORB & Time-Normalized RVOL
         intraday_flow_map = self.compute_intraday_chart_flow(pool_syms)
-
-        # Stage 2B: Live NSE Sectoral Indices Snapshot
         sector_snap = self.fetch_sectoral_indices_snapshot()
+        macro_cues = self.fetch_global_macro_cues()
+        sec_macro_map = macro_cues.get("sector_macro_adjustments", {})
 
-        # Stage 2C: Enrich with Direct NSE Microstructure (Delivery %, OBI, Circuit Bands, OI Walls)
         def _enrich_row(row_dict):
             sym = row_dict["symbol"]
             flow = intraday_flow_map.get(sym, {})
@@ -760,7 +1042,6 @@ class MarketDataScanner:
                 row_dict["orb_dist_pct"] = flow.get("orb_dist_pct", 0.0)
                 row_dict["rvol_normalized"] = flow.get("rvol_normalized", row_dict["vol_ratio"])
                 row_dict["vol_accel_5m"] = flow.get("vol_accel_5m", 1.0)
-                # Upgrade vol_ratio to Time-Normalized RVOL so downstream scoring uses true intraday RVOL
                 row_dict["vol_ratio"] = row_dict["rvol_normalized"]
             else:
                 row_dict["vwap_slope_pct"] = 0.0
@@ -777,6 +1058,7 @@ class MarketDataScanner:
             row_dict["sector_index"] = sec_idx
             row_dict["sector_chg_pct"] = sec_chg
             row_dict["sector_alpha"] = round(float(row_dict["change_pct"]) - sec_chg, 2)
+            row_dict["macro_sector_adj"] = float(sec_macro_map.get(sec_idx, 0.0))
 
             micro = self.fetch_nse_microstructure(sym, row_dict["ltp"])
             row_dict.update(micro)

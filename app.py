@@ -152,6 +152,11 @@ vix_ltp = float(regime_info.get("vix_ltp", 14.0))
 vix_chg = float(regime_info.get("vix_chg_pct", 0.0))
 fii_net = float(regime_info.get("fii_net_cr", 0.0))
 size_mult = float(regime_info.get("size_multiplier", 1.0))
+macro_info = regime_info.get("global_macro", {})
+macro_summary = macro_info.get("summary", "Macro Neutral")
+exp_info = regime_info.get("expiry_status", {})
+exp_note = exp_info.get("note", "Normal NSE session")
+ml_summary = engine.weights.get("ml_model_summary", "Collecting walk-forward samples")
 r_icon, r_bg, r_fg, r_border = get_regime_style(regime_name)
 
 nifty_str = f"Nifty {nifty_ltp:,.2f} ({nifty_chg:+.2f}%)" if nifty_ltp > 0 else f"Nifty {nifty_chg:+.2f}%"
@@ -186,14 +191,17 @@ with st.sidebar:
     )
 
     st.divider()
-    st.markdown("### 🌐 Live Market & FII Regime")
+    st.markdown("### 🌐 Live Market, Macro & Expiry")
     st.markdown(
         f"""
         <div style="background:{r_bg}; border:1px solid {r_border}; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
             <div style="color:{r_fg}; font-weight:700; font-size:0.92rem;">{r_icon} {regime_name}</div>
             <div style="color:#e2e8f0; font-size:0.82rem; margin-top:4px;">{nifty_str}</div>
             <div style="color:#cbd5e1; font-size:0.82rem;">India VIX: {vix_ltp:.2f} ({vix_chg:+.1f}%) • Size: {int(size_mult * 100)}%</div>
-            <div style="color:#cbd5e1; font-size:0.82rem;">FII Cash Net: ₹{fii_net:+,.0f} Cr</div>
+            <div style="color:#cbd5e1; font-size:0.80rem; margin-top:4px;">FII Cash Net: ₹{fii_net:+,.0f} Cr</div>
+            <div style="color:#cbd5e1; font-size:0.78rem; margin-top:3px;">Macro: {macro_summary}</div>
+            <div style="color:#fbbf24; font-size:0.78rem; margin-top:3px;">Expiry: {exp_note}</div>
+            <div style="color:#94a3b8; font-size:0.76rem; margin-top:3px;">ML: {ml_summary}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -239,10 +247,10 @@ st.markdown(
     <div class="hero-card">
         <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Institutional NSE & Quantitative Bandit Portfolio Manager</h2>
         <p style="margin:6px 0 0 0; color:#94a3b8; font-size:0.95rem;">
-            Direct NSE Quotes & Circuit Bands • Delivery % & F&O OI Walls • Gemini Bull/Bear Debate • Page-Hinkley Drift Detection • Thompson Sampling & Half-Kelly Sizing.
+            5m/15m MTF VWAP & ORB Flow • Time-Norm RVOL & NSE OBI • Global Macro & Expiry Shield • Walk-Forward ML • Thompson Sampling & Half-Kelly Sizing.
         </p>
         <div class="pill-row">
-            <span class="status-pill">● Brain Gen #{engine.weights.get('generation', 1)} ({shadow_learned} Shadow Setups Learned) • {now_ist}</span>
+            <span class="status-pill">● Brain Gen #{engine.weights.get('generation', 1)} ({shadow_learned} Shadow Setups • {ml_summary}) • {now_ist}</span>
             <span class="regime-pill" style="background:{r_bg}; color:{r_fg}; border:1px solid {r_border};">{regime_badge_text}</span>
         </div>
     </div>
@@ -277,7 +285,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
 with tab1:
     st.subheader("Currently Open Positions")
     if not open_trades:
-        st.info("No active trades right now. The AI enters automatically when a setup passes its NSE Delivery %, Circuit Band, Gemini Bull/Bear Debate, Bandit, and Sector filters.")
+        st.info("No active trades right now. The AI enters automatically when a setup passes its 5m/15m chart flow, Sector/Macro, NSE OBI & Delivery %, Gemini Debate, Bandit, and ML filters.")
     else:
         rows = []
         sector_summary = {}
@@ -291,7 +299,9 @@ with tab1:
             peak = float(t.get("peak_pnl_inr", 0))
             conv = float(t.get("conviction", 0))
             sec = str(t.get("sector", "General"))
-            mrs = float(t.get("mansfield_rs", 0.0))
+            rvol = float(t.get("rvol_normalized", t.get("vol_ratio", 1.0)))
+            orb_s = str(t.get("orb_signal", "INSIDE_ORB"))
+            mtf_s = str(t.get("mtf_15m_trend", "NEUTRAL"))
             deliv = float(t.get("delivery_pct", 0.0))
             kelly = float(t.get("kelly_pct", 15.0))
 
@@ -308,9 +318,9 @@ with tab1:
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
                     "Sector": sec,
                     "Side": t.get("action", "BUY"),
-                    "Delivery %": f"{deliv:.1f}%" if deliv > 0 else "—",
+                    "15m / ORB": f"{mtf_s} / {orb_s}",
+                    "RVOL / Deliv": f"{rvol:.1f}x / {deliv:.0f}%",
                     "Bandit Arm": t.get("strategy_arm", "MOMENTUM_BREAKOUT"),
-                    "Mansfield RS": f"{mrs:+.2f}%",
                     "Buy/Entry (₹)": f"₹{entry:,.2f}",
                     "Target (₹)": f"₹{target:,.2f}",
                     "Stop-Loss (₹)": f"₹{sl:,.2f}",
@@ -360,7 +370,7 @@ with tab2:
     st.subheader("🧠 Live Post-Trade Research & Mistake Autopsy Log")
     st.caption(
         "Immediately after every trade closes, the AI scans breaking news emotion for that stock, "
-        "identifies why it won or lost, and updates its Bayesian Bandit arms."
+        "identifies why it won or lost, and updates its Bayesian Bandit arms & walk-forward ML model."
     )
     lessons = engine.weights.get("trade_lessons_log", [])
     if not lessons:

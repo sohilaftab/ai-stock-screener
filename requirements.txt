@@ -9,5 +9,6 @@ numpy
 feedparser
 python-dotenv
 streamlit
-requests
 google-genai
+scikit-learn
+lightgbm
