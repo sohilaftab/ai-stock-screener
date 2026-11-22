@@ -53,17 +53,51 @@ def scan_and_score_market(
     sentiment_ai: FinBERTSentimentEngine,
 ):
     """Scans NSE movers, enriches technicals + FinBERT news sentiment, and scores via PulseAI."""
-    raw_df = scanner.scan_market_movers() if hasattr(scanner, "scan_market_movers") else scanner.get_top_movers()
+    raw_df = (
+        scanner.scan_market_movers()
+        if hasattr(scanner, "scan_market_movers")
+        else scanner.get_top_movers()
+    )
     if raw_df is None or raw_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    enriched_df = (
-        sentiment_ai.analyze_candidates(raw_df)
-        if hasattr(sentiment_ai, "analyze_candidates")
-        else sentiment_ai.enrich_with_sentiment(raw_df)
-    )
-    premarket_df = scanner.fetch_premarket_data() if hasattr(scanner, "fetch_premarket_data") else pd.DataFrame()
+    if hasattr(sentiment_ai, "analyze_candidates"):
+        enriched_df = sentiment_ai.analyze_candidates(raw_df)
+    elif hasattr(sentiment_ai, "score_dataframe"):
+        enriched_df = sentiment_ai.score_dataframe(raw_df)
+    else:
+        enriched_rows = []
+        for _, row in raw_df.iterrows():
+            rec = row.to_dict()
+            sym = rec["symbol"]
+            raw_sent = "NEUTRAL"
+            ai_conf = 50.0
+            top_headline = f"{sym} intraday momentum & volume activity"
+            try:
+                headlines = (
+                    sentiment_ai.fetch_google_news(sym)
+                    if hasattr(sentiment_ai, "fetch_google_news")
+                    else []
+                )
+                if headlines:
+                    top_headline = headlines[0] if isinstance(headlines[0], str) else str(headlines[0])
+                if hasattr(sentiment_ai, "analyze_stock_sentiment"):
+                    s_res = sentiment_ai.analyze_stock_sentiment(sym, headlines)
+                    if isinstance(s_res, dict):
+                        raw_sent = str(s_res.get("sentiment", s_res.get("label", "NEUTRAL"))).upper()
+                        ai_conf = float(s_res.get("confidence", s_res.get("score", 50.0)))
+                        if ai_conf <= 1.0:
+                            ai_conf *= 100.0
+                        top_headline = str(s_res.get("headline", s_res.get("top_headline", top_headline)))
+            except Exception:
+                pass
+            rec["raw_sentiment"] = raw_sent
+            rec["AI Confidence"] = round(max(10.0, min(99.0, ai_conf)), 1)
+            rec["Why Is It Moving? (Latest News)"] = top_headline
+            enriched_rows.append(rec)
+        enriched_df = pd.DataFrame(enriched_rows)
 
+    premarket_df = scanner.fetch_premarket_data() if hasattr(scanner, "fetch_premarket_data") else pd.DataFrame()
     rec_df = engine.generate_intraday_recommendations(enriched_df, premarket_df=premarket_df, top_k=5)
     return enriched_df, rec_df
 

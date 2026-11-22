@@ -1,4 +1,3 @@
-import calendar
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -13,9 +12,9 @@ IST = ZoneInfo("Asia/Kolkata")
 
 DEFAULT_NIFTY_UNIVERSE = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "BHARTIARTL",
-    "ITC", "LT", "AXISBANK", "KOTAKBANK", "TATAMOTORS", "SUNPHARMA", "MARUTI",
+    "ITC", "LT", "AXISBANK", "KOTAKBANK", "TMPV", "SUNPHARMA", "MARUTI",
     "NTPC", "ONGC", "POWERGRID", "BAJFINANCE", "TITAN", "ADANIENT", "ADANIPORTS",
-    "HAL", "BEL", "MAZDOCK", "TRENT", "ZOMATO", "JIOFIN", "VBL", "CHOLAFIN",
+    "HAL", "BEL", "MAZDOCK", "TRENT", "ETERNAL", "JIOFIN", "VBL", "CHOLAFIN",
     "INDHOTEL", "DIXON", "POLYCAB", "PERSISTENT", "COFORGE", "MPHASIS", "TATASTEEL",
     "JSWSTEEL", "HINDALCO", "COALINDIA", "BPCL", "IOC", "GAIL", "DLF", "LODHA",
     "BANKBARODA", "PNB", "CANBK", "PFC", "RECLTD", "IRCTC"
@@ -49,7 +48,7 @@ SYMBOL_TO_SECTOR_INDEX = {
     "CHOLAFIN": "^NSEBANK", "PFC": "^NSEBANK", "RECLTD": "^NSEBANK",
     "SBIN": "^CNXPSUBANK", "BANKBARODA": "^CNXPSUBANK", "PNB": "^CNXPSUBANK", "CANBK": "^CNXPSUBANK",
     "TCS": "^CNXIT", "INFY": "^CNXIT", "PERSISTENT": "^CNXIT", "COFORGE": "^CNXIT", "MPHASIS": "^CNXIT",
-    "TATAMOTORS": "^CNXAUTO", "MARUTI": "^CNXAUTO",
+    "TMPV": "^CNXAUTO", "MARUTI": "^CNXAUTO",
     "SUNPHARMA": "^CNXPHARMA",
     "TATASTEEL": "^CNXMETAL", "JSWSTEEL": "^CNXMETAL", "HINDALCO": "^CNXMETAL", "COALINDIA": "^CNXMETAL",
     "RELIANCE": "^CNXENERGY", "NTPC": "^CNXENERGY", "ONGC": "^CNXENERGY",
@@ -59,7 +58,7 @@ SYMBOL_TO_SECTOR_INDEX = {
     "LT": "^CNXINFRA", "ADANIPORTS": "^CNXINFRA", "ADANIENT": "^CNXINFRA",
     "HAL": "^CNXINFRA", "BEL": "^CNXINFRA", "MAZDOCK": "^CNXINFRA",
     "BHARTIARTL": "^CNXINFRA", "POLYCAB": "^CNXINFRA", "DIXON": "^CNXINFRA",
-    "IRCTC": "^CNXINFRA", "INDHOTEL": "^CNXINFRA", "ZOMATO": "^CNXINFRA",
+    "IRCTC": "^CNXINFRA", "INDHOTEL": "^CNXINFRA", "ETERNAL": "^CNXINFRA",
 }
 
 YAHOO_SECTOR_TO_INDEX = {
@@ -186,9 +185,6 @@ class MarketDataScanner:
             return YAHOO_SECTOR_TO_INDEX[yahoo_sector]
         return "^NSEI"
 
-    # ------------------------------------------------------------------
-    # UPGRADE 2A: NSE TUESDAY EXPIRY-DAY SHIELD (WITH HOLIDAY SHIFTING)
-    # ------------------------------------------------------------------
     @staticmethod
     def is_nse_trading_day(d: date) -> bool:
         if d.weekday() >= 5:
@@ -208,7 +204,6 @@ class MarketDataScanner:
 
     @classmethod
     def is_next_weekday_holiday(cls, dt: datetime = None) -> bool:
-        """Returns True if the next weekday (Mon-Fri) is an NSE holiday (mid-week gap risk)."""
         now_dt = dt or datetime.now(IST)
         nxt = now_dt.date() + timedelta(days=1)
         while nxt.weekday() >= 5:
@@ -217,10 +212,6 @@ class MarketDataScanner:
 
     @classmethod
     def get_nse_expiry_status(cls, dt: datetime = None) -> dict:
-        """
-        Detects NSE Weekly & Monthly Tuesday F&O expiry sessions, automatically shifting
-        to the preceding trading day (e.g., Monday) whenever Tuesday is an NSE holiday.
-        """
         now_dt = dt or datetime.now(IST)
         today = now_dt.date()
         mins = now_dt.hour * 60 + now_dt.minute
@@ -228,7 +219,7 @@ class MarketDataScanner:
         mon_this_week = today - timedelta(days=today.weekday())
         candidate_tuesdays = [
             mon_this_week + timedelta(days=1),
-            mon_this_week + timedelta(days=8),  # Covers rare Mon+Tue dual holiday shifting to Fri
+            mon_this_week + timedelta(days=8),
         ]
 
         is_expiry = False
@@ -299,16 +290,8 @@ class MarketDataScanner:
             "note": note,
         }
 
-    # ------------------------------------------------------------------
-    # UPGRADE 2B: OVERNIGHT GLOBAL MACRO CUES (BRENT, US10Y, USD/INR, NASDAQ)
-    # ------------------------------------------------------------------
     @classmethod
     def fetch_global_macro_cues(cls, force_refresh: bool = False) -> dict:
-        """
-        Fetches latest closes & 1-day shifts for Brent Crude (BZ=F), US 10Y Yield (^TNX),
-        USD/INR (INR=X), Nasdaq (^IXIC), and S&P 500 (^GSPC), translating them into
-        India-specific broad & sectoral conviction adjustments (cached 5 mins).
-        """
         now = time.time()
         if not force_refresh and cls._macro_cache_data and (now - cls._macro_cache_ts) < 300.0:
             return cls._macro_cache_data
@@ -364,13 +347,11 @@ class MarketDataScanner:
             _, _, nasdaq_chg = _extract("^IXIC")
             _, _, sp500_chg = _extract("^GSPC")
 
-            # Normalize Yahoo ^TNX (quoted either as 4.35 or 43.5 for 4.35%)
             if us10y_cur > 15.0:
                 us10y_cur /= 10.0
                 us10y_prev /= 10.0
             us10y_bps_chg = round((us10y_cur - us10y_prev) * 100.0, 1) if us10y_prev > 0 else 0.0
 
-            # Classify Global Macro Regime for Indian Equities
             inflation_shock = (brent_chg >= 2.2) or (us10y_bps_chg >= 8.0) or (brent_chg >= 1.5 and us10y_bps_chg >= 5.0)
             risk_off = (sp500_chg <= -1.2) or (nasdaq_chg <= -1.6) or (usdinr_chg >= 0.55)
             risk_on = (sp500_chg >= 0.7) and (brent_chg <= 1.5) and (us10y_bps_chg <= 4.0) and (usdinr_chg <= 0.30)
@@ -401,10 +382,8 @@ class MarketDataScanner:
                 macro_short_adj = 0.0
                 macro_size_mult = 1.0
 
-            # Sector-Specific Macro Sensitivity Map (applied + for BUY, - for SHORT)
             sec_adj = {}
 
-            # IT: Tailwind from Nasdaq rally & weaker INR (rising USD/INR); headwind from Nasdaq selloff
             it_adj = 0.0
             if nasdaq_chg >= 0.9:
                 it_adj += 3.0
@@ -416,7 +395,6 @@ class MarketDataScanner:
                 it_adj -= 1.5
             sec_adj["^CNXIT"] = round(max(-5.5, min(5.5, it_adj)), 1)
 
-            # Banks / Financials & Realty: Rate-sensitive (hurt by US10Y yield spikes & Brent inflation)
             rate_adj = 0.0
             if us10y_bps_chg >= 6.0:
                 rate_adj -= 3.0
@@ -427,12 +405,11 @@ class MarketDataScanner:
             elif brent_chg <= -2.0:
                 rate_adj += 1.5
             if usdinr_chg >= 0.45:
-                rate_adj -= 1.5  # FII outflow pressure on large-cap banks
+                rate_adj -= 1.5
             sec_adj["^NSEBANK"] = round(max(-5.5, min(5.5, rate_adj)), 1)
             sec_adj["^CNXPSUBANK"] = round(max(-5.5, min(5.5, rate_adj)), 1)
             sec_adj["^CNXREALTY"] = round(max(-6.0, min(6.0, rate_adj * 1.15)), 1)
 
-            # Auto & Energy/OMCs: Sensitive to Brent crude input costs
             crude_adj = 0.0
             if brent_chg >= 2.0:
                 crude_adj -= 3.5
@@ -441,11 +418,9 @@ class MarketDataScanner:
             sec_adj["^CNXAUTO"] = round(crude_adj, 1)
             sec_adj["^CNXENERGY"] = round(crude_adj * 0.6, 1)
 
-            # Pharma: Defensive + USD export earner
             pharma_adj = 1.5 if (usdinr_chg >= 0.25 or risk_off) else 0.0
             sec_adj["^CNXPHARMA"] = round(pharma_adj, 1)
 
-            # Metals: Global growth proxy
             metal_adj = 2.0 if sp500_chg >= 0.9 else (-2.5 if sp500_chg <= -1.1 else 0.0)
             sec_adj["^CNXMETAL"] = round(metal_adj, 1)
 
@@ -482,9 +457,6 @@ class MarketDataScanner:
             cls._macro_cache_ts = now
             return default_macro
 
-    # ------------------------------------------------------------------
-    # LIVE NSE SECTORAL INDICES SNAPSHOT (60s TTL CACHE)
-    # ------------------------------------------------------------------
     @classmethod
     def fetch_sectoral_indices_snapshot(cls, force_refresh: bool = False) -> dict:
         now = time.time()
@@ -521,9 +493,6 @@ class MarketDataScanner:
         cls._sector_cache_ts = now
         return snapshot
 
-    # ------------------------------------------------------------------
-    # DIRECT NSE QUOTE + CIRCUIT BANDS + DELIVERY % + ORDER-BOOK IMBALANCE
-    # ------------------------------------------------------------------
     @classmethod
     def _parse_order_book(cls, ob: dict, ltp: float) -> tuple:
         if not isinstance(ob, dict):
@@ -713,9 +682,6 @@ class MarketDataScanner:
                 result["dii_net_cr"] = round(net_val, 2)
         return result
 
-    # ------------------------------------------------------------------
-    # UPGRADE 1: 5m/15m MULTI-TIMEFRAME CHART FLOW, ORB & TIME-NORM RVOL
-    # ------------------------------------------------------------------
     @classmethod
     def compute_intraday_chart_flow(cls, symbols: list) -> dict:
         flow_map = {}
