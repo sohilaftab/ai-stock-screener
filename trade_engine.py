@@ -94,12 +94,11 @@ class AdaptiveTradeEngine:
     # ------------------------------------------------------------------
     @staticmethod
     def _get_archetype_slippage_pct(archetype: str) -> float:
-        """Realistic NSE bid-ask impact slippage by stock liquidity archetype."""
         if archetype == "LARGE_CAP_STEADY":
             return 0.03
         if archetype == "HIGH_VOL_MIDCAP":
             return 0.14
-        return 0.07  # MOMENTUM_MOVER
+        return 0.07
 
     @staticmethod
     def _calculate_nse_charges(side, qty, entry_price, exit_price, is_overnight=False):
@@ -145,10 +144,14 @@ class AdaptiveTradeEngine:
         return round(max(-1.0, min(1.0, clv)), 3)
 
     # ------------------------------------------------------------------
-    # ADVERSARIAL CRITIC + FREE-TIER GEMINI FLASH BULL-VS-BEAR DEBATE
+    # ADVERSARIAL BEAR CRITIC (UPGRADE 1: OBI, SPREAD, 15m MTF & SECTOR)
     # ------------------------------------------------------------------
     @staticmethod
-    def _adversarial_bear_critic(side, ltp, atr, chg_pct, rsi, clv, intraday_alpha, archetype, regime_name):
+    def _adversarial_bear_critic(
+        side, ltp, atr, chg_pct, rsi, clv, intraday_alpha, archetype, regime_name,
+        mtf_15m_trend="NEUTRAL", vwap_slope_pct=0.0, obi_ratio=0.0,
+        bid_ask_spread_pct=0.0, sector_chg_pct=0.0
+    ):
         red_flags = []
         atr_pct = (atr / ltp) * 100.0 if ltp > 0 else 1.5
 
@@ -161,6 +164,12 @@ class AdaptiveTradeEngine:
                 red_flags.append(f"Overbought RSI ({rsi:.1f})")
             if intraday_alpha < -0.6:
                 red_flags.append(f"Lagging Nifty 50 ({intraday_alpha:+.2f}% alpha)")
+            if mtf_15m_trend == "BEARISH" and vwap_slope_pct < -0.08:
+                red_flags.append(f"15m MTF Bearish & falling VWAP ({vwap_slope_pct:+.2f}%)")
+            if obi_ratio < -0.40:
+                red_flags.append(f"Heavy NSE ask wall (OBI {obi_ratio:+.2f})")
+            if sector_chg_pct < -1.0:
+                red_flags.append(f"Fighting falling sector ({sector_chg_pct:+.2f}%)")
         else:
             if atr_pct > 0 and chg_pct < -(2.1 * atr_pct):
                 red_flags.append("Chasing exhausted >2.1x ATR drop")
@@ -170,6 +179,15 @@ class AdaptiveTradeEngine:
                 red_flags.append(f"Oversold RSI ({rsi:.1f})")
             if intraday_alpha > 0.6:
                 red_flags.append(f"Outperforming Nifty 50 ({intraday_alpha:+.2f}% alpha)")
+            if mtf_15m_trend == "BULLISH" and vwap_slope_pct > 0.08:
+                red_flags.append(f"15m MTF Bullish & rising VWAP ({vwap_slope_pct:+.2f}%)")
+            if obi_ratio > 0.40:
+                red_flags.append(f"Heavy NSE bid wall (OBI {obi_ratio:+.2f})")
+            if sector_chg_pct > 1.0:
+                red_flags.append(f"Shorting strong sector ({sector_chg_pct:+.2f}%)")
+
+        if bid_ask_spread_pct > 0.35:
+            red_flags.append(f"Illiquid NSE spread ({bid_ask_spread_pct:.2f}%)")
 
         if archetype == "HIGH_VOL_MIDCAP" and regime_name in ("SIDEWAYS_CHOP", "HIGH_VOLATILITY_PANIC"):
             red_flags.append(f"High-vol midcap during {regime_name}")
@@ -179,23 +197,22 @@ class AdaptiveTradeEngine:
         return vetoed, penalty, red_flags
 
     def _gemini_bull_bear_debate(self, candidate: dict, regime_info: dict) -> dict:
-        """
-        FactorMAD Multi-Agent Debate using Google GenAI free tier (gemini-2.5-flash /
-        gemini-3.5-flash-lite). Runs ONLY on top 2 finalists (~10-15 calls/day) to critique
-        full news context, delivery %, OI walls, and priced-in rumor risks.
-        """
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key or not HAS_GENAI:
             return {"veto": False, "conviction_adj": 0.0, "debate_note": "Quantitative Bear Critic passed"}
 
         prompt = (
             "You are an institutional NSE risk committee running a Bull vs. Bear adversarial debate "
-            "before executing an Indian equity trade. Analyze this candidate strictly in JSON:\n"
+            "before executing an Indian intraday equity trade. Analyze this candidate strictly in JSON:\n"
             f"- Stock: {candidate['symbol']} | Action: {candidate['action']} | LTP: ₹{candidate['entry_price']}\n"
             f"- Nifty Regime: {regime_info.get('regime')} (Nifty {regime_info.get('nifty_chg_pct')}%, "
             f"VIX {regime_info.get('vix_ltp')}, FII Net ₹{regime_info.get('fii_net_cr', 0)} Cr)\n"
-            f"- Delivery %: {candidate.get('delivery_pct', 0)}% | Mansfield RS: {candidate.get('mansfield_rs', 0)}% | "
-            f"CLV: {candidate.get('clv', 0)} | RSI: {candidate.get('rsi', 50)}\n"
+            f"- 5m/15m Chart Flow: 15m Trend={candidate.get('mtf_15m_trend')}, VWAP Slope={candidate.get('vwap_slope_pct')}%, "
+            f"ORB={candidate.get('orb_signal')}, Time-Norm RVOL={candidate.get('rvol_normalized')}x\n"
+            f"- Sector Alignment: {candidate.get('sector_index')} ({candidate.get('sector_chg_pct'):+.2f}%), "
+            f"Sector Alpha={candidate.get('sector_alpha'):+.2f}%\n"
+            f"- NSE Microstructure: Delivery={candidate.get('delivery_pct', 0)}%, OBI={candidate.get('obi_ratio', 0):+.2f}, "
+            f"Spread={candidate.get('bid_ask_spread_pct', 0):.2f}%, CLV={candidate.get('clv', 0)}, RSI={candidate.get('rsi', 50)}\n"
             f"- Option OI Walls: Call Resistance ₹{candidate.get('max_call_oi_strike', 0)}, "
             f"Put Support ₹{candidate.get('max_put_oi_strike', 0)}\n"
             f"- News Headline: {candidate.get('headline', '')}\n\n"
@@ -228,11 +245,6 @@ class AdaptiveTradeEngine:
     # PAGE-HINKLEY ONLINE CONCEPT-DRIFT DETECTOR
     # ------------------------------------------------------------------
     def _check_page_hinkley_drift(self):
-        """
-        Monitors rolling prediction residual errors across recent settled trades.
-        If a sudden macro shock (Budget, RBI policy, tariff shock) causes structural drift,
-        automatically softens Bandit alpha/beta priors toward neutral so the AI adapts immediately.
-        """
         settled = [t for t in self.ledger if t.get("status") != "OPEN" and "pnl_inr" in t]
         if len(settled) < 8:
             return False
@@ -316,7 +328,6 @@ class AdaptiveTradeEngine:
                     prev_vix = float(vix_df["Close"].iloc[-2])
                     vix_chg_pct = ((vix_ltp - prev_vix) / prev_vix) * 100.0 if prev_vix > 0 else 0.0
 
-            # FII institutional flow bias (-3 to +3 pts)
             fii_bias = 3.0 if fii_net > 1500 else (-3.0 if fii_net < -1500 else 0.0)
 
             if vix_ltp >= 18.5 or vix_chg_pct >= 8.0:
@@ -494,7 +505,7 @@ class AdaptiveTradeEngine:
         return clamped_fraction, round(payoff_b, 2)
 
     # ------------------------------------------------------------------
-    # COUNTERFACTUAL SHADOW-TRADE LEDGER
+    # COUNTERFACTUAL SHADOW-TRADE LEDGER (LOGS FULL UPGRADE 1 FEATURES)
     # ------------------------------------------------------------------
     def _load_shadow_ledger(self):
         if os.path.exists(SHADOW_LEDGER_FILE):
@@ -540,6 +551,13 @@ class AdaptiveTradeEngine:
                 "action": item["action"],
                 "strategy_arm": item.get("strategy_arm", "MOMENTUM_BREAKOUT"),
                 "archetype": item.get("archetype", "MOMENTUM_MOVER"),
+                "rvol_normalized": float(item.get("rvol_normalized", 1.0)),
+                "vwap_slope_pct": float(item.get("vwap_slope_pct", 0.0)),
+                "mtf_15m_trend": item.get("mtf_15m_trend", "NEUTRAL"),
+                "orb_signal": item.get("orb_signal", "INSIDE_ORB"),
+                "obi_ratio": float(item.get("obi_ratio", 0.0)),
+                "sector_index": item.get("sector_index", "^NSEI"),
+                "sector_alpha": float(item.get("sector_alpha", 0.0)),
                 "entry_price": float(item["entry_price"]),
                 "target_1": float(item["target_1"]),
                 "stop_loss": float(item["stop_loss"]),
@@ -832,7 +850,7 @@ class AdaptiveTradeEngine:
             "generation": 1,
             "last_evaluated_count": 0,
             "last_updated": self._now_ist().strftime("%Y-%m-%d %H:%M"),
-            "learning_notes": "Initialized NSE Direct + Microstructure + Gemini Debate + Drift Brain."
+            "learning_notes": "Initialized Upgrade 1 (5m/15m MTF VWAP, ORB, Time-Norm RVOL, OBI, Sector Alignment)."
         }
         if os.path.exists(WEIGHTS_FILE):
             try:
@@ -993,7 +1011,7 @@ class AdaptiveTradeEngine:
         return changes
 
     # ------------------------------------------------------------------
-    # 1. FULL QUANTITATIVE + NSE MICROSTRUCTURE + GEMINI DEBATE SCORER
+    # 1. FULL QUANTITATIVE + UPGRADE 1 CHART-FLOW + MICROSTRUCTURE SCORER
     # ------------------------------------------------------------------
     def generate_intraday_recommendations(self, enriched_df, premarket_df=None, top_k=5):
         if enriched_df.empty:
@@ -1018,6 +1036,14 @@ class AdaptiveTradeEngine:
 
         candidate_syms = enriched_df["symbol"].tolist()
         mansfield_rs_map = self._batch_compute_mansfield_rs(candidate_syms)
+
+        # Ensure live sectoral snapshot is available even if caller didn't pre-populate sector columns
+        sector_snap = MarketDataScanner.fetch_sectoral_indices_snapshot()
+
+        # Backfill 5m/15m intraday chart flow if caller passed a dataframe without Upgrade 1 columns
+        intraday_flow_fallback = {}
+        if "rvol_normalized" not in enriched_df.columns or "orb_signal" not in enriched_df.columns:
+            intraday_flow_fallback = MarketDataScanner.compute_intraday_chart_flow(candidate_syms)
 
         pre_map = {}
         if premarket_df is not None and not premarket_df.empty:
@@ -1053,18 +1079,34 @@ class AdaptiveTradeEngine:
             if sym in blacklist and len(enriched_df) > 3:
                 continue
 
-            ltp = float(row["ltp"])
+            flow = intraday_flow_fallback.get(sym, {})
+            ltp = float(flow.get("ltp_intraday", row["ltp"]))
             chg = float(row["change_pct"])
-            vol_ratio = float(row["vol_ratio"])
+            rvol_norm = float(row.get("rvol_normalized", flow.get("rvol_normalized", row["vol_ratio"])))
+            vol_accel_5m = float(row.get("vol_accel_5m", flow.get("vol_accel_5m", 1.0)))
             atr = float(row.get("atr", ltp * 0.015))
             rsi = float(row.get("rsi", 50.0))
-            vwap = float(row.get("vwap_proxy", ltp))
-            d_high = float(row.get("day_high", row.get("high", ltp)))
-            d_low = float(row.get("day_low", row.get("low", ltp)))
+            vwap = float(row.get("vwap_proxy", flow.get("vwap_intraday", ltp)))
+            vwap_slope_pct = float(row.get("vwap_slope_pct", flow.get("vwap_slope_pct", 0.0)))
+            mtf_15m_trend = str(row.get("mtf_15m_trend", flow.get("mtf_15m_trend", "NEUTRAL")))
+            orb_signal = str(row.get("orb_signal", flow.get("orb_signal", "INSIDE_ORB")))
+            orb_high = float(row.get("orb_high", flow.get("orb_high", ltp)))
+            orb_low = float(row.get("orb_low", flow.get("orb_low", ltp)))
+            d_high = float(row.get("day_high", flow.get("day_high_intraday", ltp)))
+            d_low = float(row.get("day_low", flow.get("day_low_intraday", ltp)))
             chart_trend = row.get("chart_trend", "RANGE_CONSOLIDATION")
 
-            # Direct NSE Microstructure fields
+            # Live Sector Index alignment
+            sec_idx = str(row.get("sector_index", "") or MarketDataScanner.get_sector_index_for_stock(sym))
+            sec_chg_pct = float(
+                row.get("sector_chg_pct", sector_snap.get(sec_idx, {}).get("change_pct", nifty_chg_pct))
+            )
+            sector_alpha = round(chg - sec_chg_pct, 2)
+
+            # Direct NSE Microstructure & Order-Book Imbalance fields
             delivery_pct = float(row.get("delivery_pct", 0.0) or 0.0)
+            obi_ratio = float(row.get("obi_ratio", 0.0) or 0.0)
+            bid_ask_spread_pct = float(row.get("bid_ask_spread_pct", 0.0) or 0.0)
             lower_cp = float(row.get("lower_cp", 0.0) or 0.0)
             upper_cp = float(row.get("upper_cp", 0.0) or 0.0)
             max_call_oi = float(row.get("max_call_oi_strike", 0.0) or 0.0)
@@ -1077,19 +1119,17 @@ class AdaptiveTradeEngine:
             ai_conf = float(row.get("AI Confidence", 50)) / 100.0
             headline = row.get("Why Is It Moving? (Latest News)", "Technical chart & volume setup")
 
-            if (chg >= 0 and raw_sent != "NEGATIVE") or (chart_trend == "BULLISH_UPTREND" and raw_sent == "POSITIVE"):
+            if (chg >= 0 and raw_sent != "NEGATIVE") or (mtf_15m_trend == "BULLISH" and orb_signal == "ORB_BREAKOUT_UP"):
                 side = "BUY"
-            elif (chg < 0 and raw_sent != "POSITIVE") or (chart_trend == "BEARISH_DOWNTREND" and raw_sent == "NEGATIVE"):
+            elif (chg < 0 and raw_sent != "POSITIVE") or (mtf_15m_trend == "BEARISH" and orb_signal == "ORB_BREAKDOWN_DOWN"):
                 side = "SELL (SHORT)"
             else:
                 side = "BUY" if chg >= 0 else "SELL (SHORT)"
 
-            # CIRCUIT-BREAKER PROXIMITY VETO (Blocks buying at upper circuit or shorting at lower circuit)
+            # Circuit-Breaker Proximity Veto
             if side == "BUY" and upper_cp > 0 and ltp >= (upper_cp * 0.985):
-                print(f"[CIRCUIT GUARD] Vetoed BUY {sym}: LTP ₹{ltp} is within 1.5% of Upper Circuit ₹{upper_cp}.")
                 continue
             if side.startswith("SELL") and lower_cp > 0 and ltp <= (lower_cp * 1.015):
-                print(f"[CIRCUIT GUARD] Vetoed SHORT {sym}: LTP ₹{ltp} is within 1.5% of Lower Circuit ₹{lower_cp}.")
                 continue
 
             archetype = self._classify_stock_archetype(ltp, atr)
@@ -1101,16 +1141,24 @@ class AdaptiveTradeEngine:
             mansfield_rs = float(mansfield_rs_map.get(sym, 0.0))
             intraday_alpha = round(chg - nifty_chg_pct, 2)
 
+            # Priced-In News / Institutional Distribution Trap Filter
             if side == "BUY" and raw_sent == "POSITIVE" and ltp < vwap and intraday_alpha < -0.5:
                 continue
 
+            # Upgrade 1 Adversarial Bear Critic (with 15m MTF, OBI, Spread & Sector checks)
             vetoed, critic_penalty, red_flags = self._adversarial_bear_critic(
-                side, ltp, atr, chg, rsi, clv, intraday_alpha, archetype, regime_name
+                side, ltp, atr, chg, rsi, clv, intraday_alpha, archetype, regime_name,
+                mtf_15m_trend=mtf_15m_trend,
+                vwap_slope_pct=vwap_slope_pct,
+                obi_ratio=obi_ratio,
+                bid_ask_spread_pct=bid_ask_spread_pct,
+                sector_chg_pct=sec_chg_pct,
             )
 
-            # NSE Delivery Percentage Multiplier (rewards institutional accumulation >50%, penalizes <22% churn)
+            # Time-Normalized RVOL + 5m Volume Acceleration + Delivery % Multiplier
             deliv_mult = 1.20 if delivery_pct >= 50.0 else (0.75 if (0 < delivery_pct < 22.0) else 1.0)
-            vol_score = min(100.0, (vol_ratio / 2.8) * 100.0 * deliv_mult)
+            accel_bonus = 8.0 if vol_accel_5m >= 1.5 else 0.0
+            vol_score = min(100.0, ((rvol_norm / 2.4) * 100.0 * deliv_mult) + accel_bonus)
 
             if (side == "BUY" and raw_sent == "POSITIVE") or (side.startswith("SELL") and raw_sent == "NEGATIVE"):
                 sent_score = 65.0 + (ai_conf * 35.0)
@@ -1130,30 +1178,39 @@ class AdaptiveTradeEngine:
             else:
                 pre_score = 55.0
 
+            # Multi-Timeframe 5m/15m Chart Flow + ORB + VWAP Slope Scoring
             if side == "BUY":
-                trend_bonus = 25.0 if chart_trend == "BULLISH_UPTREND" else 0.0
-                vwap_bonus = 15.0 if ltp >= vwap else -10.0
+                trend_bonus = 18.0 if chart_trend == "BULLISH_UPTREND" else 0.0
+                mtf_bonus = 14.0 if mtf_15m_trend == "BULLISH" else (-12.0 if mtf_15m_trend == "BEARISH" else 0.0)
+                orb_bonus = 12.0 if orb_signal == "ORB_BREAKOUT_UP" else (-8.0 if orb_signal == "ORB_BREAKDOWN_DOWN" else 0.0)
+                vwap_bonus = 10.0 if (ltp >= vwap and vwap_slope_pct >= 0.0) else (-10.0 if ltp < vwap else 2.0)
                 clv_bonus = 6.0 * clv
                 if 50.0 <= rsi <= buy_rsi_max:
-                    rsi_bonus = 15.0
+                    rsi_bonus = 10.0
                 elif rsi > buy_rsi_max:
-                    rsi_bonus = -15.0
+                    rsi_bonus = -14.0
                 else:
                     rsi_bonus = 0.0
-                mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus + clv_bonus))
-                rs_adj = max(-6.0, min(8.0, (mansfield_rs * 1.5) + (intraday_alpha * 1.2)))
+                mom_score = max(10.0, min(100.0, 40.0 + trend_bonus + mtf_bonus + orb_bonus + vwap_bonus + rsi_bonus + clv_bonus))
+                rs_adj = max(-6.0, min(8.0, (mansfield_rs * 1.4) + (intraday_alpha * 1.0)))
+                sector_adj = max(-7.0, min(7.0, (sec_chg_pct * 2.5) + (sector_alpha * 1.2)))
+                obi_adj = max(-5.0, min(5.0, obi_ratio * 8.0))
             else:
-                trend_bonus = 25.0 if chart_trend == "BEARISH_DOWNTREND" else 0.0
-                vwap_bonus = 15.0 if ltp <= vwap else -10.0
+                trend_bonus = 18.0 if chart_trend == "BEARISH_DOWNTREND" else 0.0
+                mtf_bonus = 14.0 if mtf_15m_trend == "BEARISH" else (-12.0 if mtf_15m_trend == "BULLISH" else 0.0)
+                orb_bonus = 12.0 if orb_signal == "ORB_BREAKDOWN_DOWN" else (-8.0 if orb_signal == "ORB_BREAKOUT_UP" else 0.0)
+                vwap_bonus = 10.0 if (ltp <= vwap and vwap_slope_pct <= 0.0) else (-10.0 if ltp > vwap else 2.0)
                 clv_bonus = -6.0 * clv
                 if short_rsi_min <= rsi <= 50.0:
-                    rsi_bonus = 15.0
+                    rsi_bonus = 10.0
                 elif rsi < short_rsi_min:
-                    rsi_bonus = -15.0
+                    rsi_bonus = -14.0
                 else:
                     rsi_bonus = 0.0
-                mom_score = max(10.0, min(100.0, 45.0 + trend_bonus + vwap_bonus + rsi_bonus + clv_bonus))
-                rs_adj = max(-6.0, min(8.0, (-mansfield_rs * 1.5) + (-intraday_alpha * 1.2)))
+                mom_score = max(10.0, min(100.0, 40.0 + trend_bonus + mtf_bonus + orb_bonus + vwap_bonus + rsi_bonus + clv_bonus))
+                rs_adj = max(-6.0, min(8.0, (-mansfield_rs * 1.4) + (-intraday_alpha * 1.0)))
+                sector_adj = max(-7.0, min(7.0, (-sec_chg_pct * 2.5) + (-sector_alpha * 1.2)))
+                obi_adj = max(-5.0, min(5.0, -obi_ratio * 8.0))
 
             base_conviction = (
                 (w_vol * vol_score) +
@@ -1188,7 +1245,7 @@ class AdaptiveTradeEngine:
                     min(
                         99.0,
                         base_conviction + ticker_adj + dir_adj + session_adj + chop_adj +
-                        rs_adj + bandit_adj + arch_score_adj - critic_penalty
+                        rs_adj + sector_adj + obi_adj + bandit_adj + arch_score_adj - critic_penalty
                     )
                 ),
                 1
@@ -1205,7 +1262,6 @@ class AdaptiveTradeEngine:
                 stop_loss = round(entry_price - intraday_risk_per_share, 2)
                 target_1 = round(entry_price + reward_1_per_share, 2)
                 target_2 = round(entry_price + reward_2_per_share, 2)
-                # Cap Target 1 just below institutional Max Call OI resistance strike
                 if max_call_oi > entry_price and target_1 > (max_call_oi * 0.997):
                     capped_t1 = round(max_call_oi * 0.997, 2)
                     if capped_t1 > entry_price * 1.004:
@@ -1217,7 +1273,6 @@ class AdaptiveTradeEngine:
                 stop_loss = round(entry_price + intraday_risk_per_share, 2)
                 target_1 = round(entry_price - reward_1_per_share, 2)
                 target_2 = round(entry_price - reward_2_per_share, 2)
-                # Floor Target 1 just above institutional Max Put OI support strike
                 if 0 < max_put_oi < entry_price and target_1 < (max_put_oi * 1.003):
                     capped_t1 = round(max_put_oi * 1.003, 2)
                     if capped_t1 < entry_price * 0.996:
@@ -1237,6 +1292,17 @@ class AdaptiveTradeEngine:
                 "strategy_arm": strategy_arm,
                 "archetype": archetype,
                 "clv": clv,
+                "rvol_normalized": round(rvol_norm, 2),
+                "vwap_slope_pct": round(vwap_slope_pct, 3),
+                "mtf_15m_trend": mtf_15m_trend,
+                "orb_signal": orb_signal,
+                "orb_high": orb_high,
+                "orb_low": orb_low,
+                "obi_ratio": obi_ratio,
+                "bid_ask_spread_pct": bid_ask_spread_pct,
+                "sector_index": sec_idx,
+                "sector_chg_pct": sec_chg_pct,
+                "sector_alpha": sector_alpha,
                 "delivery_pct": delivery_pct,
                 "lower_cp": lower_cp,
                 "upper_cp": upper_cp,
@@ -1253,7 +1319,7 @@ class AdaptiveTradeEngine:
                 "rr_val": rr_val,
                 "rr_ratio": f"1 : {rr_val}",
                 "chart_trend": chart_trend,
-                "vol_ratio": vol_ratio,
+                "vol_ratio": round(rvol_norm, 2),
                 "rsi": rsi,
                 "sentiment": raw_sent,
                 "headline": headline,
@@ -1285,7 +1351,7 @@ class AdaptiveTradeEngine:
 
         scored_candidates.sort(key=lambda x: x["conviction"], reverse=True)
 
-        # Run Gemini Flash Bull-vs-Bear Multi-Agent Debate on top 2 finalists only
+        # Gemini Flash Bull-vs-Bear Debate on top 2 finalists
         debate_approved = []
         for idx, item in enumerate(scored_candidates):
             if idx < 2:
@@ -1363,10 +1429,19 @@ class AdaptiveTradeEngine:
             final_suggestions.append({
                 "symbol": item["symbol"],
                 "sector": sec,
+                "sector_index": item["sector_index"],
+                "sector_chg_pct": item["sector_chg_pct"],
+                "sector_alpha": item["sector_alpha"],
                 "market_regime": regime_name,
                 "strategy_arm": item["strategy_arm"],
                 "archetype": item["archetype"],
                 "clv": item["clv"],
+                "rvol_normalized": item["rvol_normalized"],
+                "vwap_slope_pct": item["vwap_slope_pct"],
+                "mtf_15m_trend": item["mtf_15m_trend"],
+                "orb_signal": item["orb_signal"],
+                "obi_ratio": item["obi_ratio"],
+                "bid_ask_spread_pct": item["bid_ask_spread_pct"],
                 "delivery_pct": item["delivery_pct"],
                 "lower_cp": item["lower_cp"],
                 "upper_cp": item["upper_cp"],
@@ -1467,6 +1542,13 @@ class AdaptiveTradeEngine:
             mrs_val = float(row.get("mansfield_rs", 0.0))
             kelly_pct = float(row.get("kelly_pct", 15.0))
             deliv_pct = float(row.get("delivery_pct", snap.get("delivery_pct", 0.0)) or 0.0)
+            rvol_norm = float(row.get("rvol_normalized", row.get("vol_ratio", 1.0)) or 1.0)
+            vwap_slope = float(row.get("vwap_slope_pct", 0.0) or 0.0)
+            mtf_trend = str(row.get("mtf_15m_trend", "NEUTRAL"))
+            orb_sig = str(row.get("orb_signal", "INSIDE_ORB"))
+            obi_val = float(row.get("obi_ratio", snap.get("obi_ratio", 0.0)) or 0.0)
+            sec_idx = str(row.get("sector_index", "^NSEI"))
+            sec_alpha = float(row.get("sector_alpha", 0.0) or 0.0)
             lower_cp = float(row.get("lower_cp", snap.get("lower_cp", 0.0)) or 0.0)
             upper_cp = float(row.get("upper_cp", snap.get("upper_cp", 0.0)) or 0.0)
             debate_note = str(row.get("debate_note", "Passed risk debate"))
@@ -1481,6 +1563,13 @@ class AdaptiveTradeEngine:
                 "strategy_arm": arm_tag,
                 "archetype": arch_tag,
                 "mansfield_rs": mrs_val,
+                "rvol_normalized": rvol_norm,
+                "vwap_slope_pct": vwap_slope,
+                "mtf_15m_trend": mtf_trend,
+                "orb_signal": orb_sig,
+                "obi_ratio": obi_val,
+                "sector_index": sec_idx,
+                "sector_alpha": sec_alpha,
                 "delivery_pct": deliv_pct,
                 "lower_cp": lower_cp,
                 "upper_cp": upper_cp,
@@ -1505,7 +1594,7 @@ class AdaptiveTradeEngine:
                 "entry_sentiment": row.get("sentiment", "NEUTRAL"),
                 "chart_trend": row.get("chart_trend", "RANGE_CONSOLIDATION"),
                 "status": "OPEN",
-                "trade_management_note": f"Deliv: {deliv_pct:.1f}% | Critic: {debate_note}",
+                "trade_management_note": f"15m:{mtf_trend} | {orb_sig} | RVOL:{rvol_norm:.1f}x | OBI:{obi_val:+.2f} | SecAlpha:{sec_alpha:+.1f}%",
                 "exit_price": None,
                 "exit_time": None,
                 "hold_minutes": 0.0,
@@ -1534,8 +1623,9 @@ class AdaptiveTradeEngine:
                 entry_ticket = (
                     f"{side_header}\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']}) | <b>Sector:</b> {sec}\n"
-                    f"📊 <b>Delivery %:</b> {deliv_pct:.1f}% | <b>Mansfield RS:</b> {mrs_val:+.2f}%\n"
+                    f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']}) | <b>Sector:</b> {sec} ({sec_idx})\n"
+                    f"📈 <b>Chart Flow:</b> 15m <code>{mtf_trend}</code> | <code>{orb_sig}</code> | VWAP Slope {vwap_slope:+.2f}%\n"
+                    f"📊 <b>RVOL:</b> {rvol_norm:.1f}x | <b>OBI:</b> {obi_val:+.2f} | <b>Deliv:</b> {deliv_pct:.1f}% | <b>Sec Alpha:</b> {sec_alpha:+.2f}%\n"
                     f"🎰 <b>Arm:</b> <code>{arm_tag}</code> | <b>TRA:</b> <code>{arch_tag}</code>\n"
                     f"📦 <b>Quantity:</b> <b>{qty} Shares</b> @ <b>₹{entry_p}</b> (Half-Kelly: {kelly_pct:.1f}%)\n"
                     f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Cash Left: ₹{avail_cash:,.2f})</i>\n"
@@ -1613,7 +1703,6 @@ class AdaptiveTradeEngine:
             peak_pnl = max(prev_peak, unrealized_inr)
             trade["peak_pnl_inr"] = round(peak_pnl, 2)
 
-            # NSE LOWER/UPPER CIRCUIT LOCKOUT SIMULATION (Realistic illiquidity handling)
             if side == "BUY" and lower_cp > 0 and ltp <= lower_cp:
                 trade["trade_management_note"] = f"LOWER CIRCUIT LOCKED @ ₹{lower_cp} — Zero buyers; SL fill queued for unlock."
                 continue
@@ -1711,7 +1800,6 @@ class AdaptiveTradeEngine:
                 trade["trade_management_note"] = f"SL trailed to breakeven ₹{entry}."
 
             if exit_triggered:
-                # Apply realistic TRA Archetype liquidity slippage on exit
                 slip_pct = self._get_archetype_slippage_pct(arch_used) / 100.0
                 if side == "BUY":
                     exit_price = round(raw_exit_price * (1.0 - slip_pct), 2)
