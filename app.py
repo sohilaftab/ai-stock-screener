@@ -44,7 +44,7 @@ st.markdown(
         }
 
         .block-container {
-            padding-top: 1.25rem !important;
+            padding-top: 3.6rem !important;
             padding-bottom: 3rem !important;
             padding-left: clamp(0.75rem, 2.5vw, 2rem) !important;
             padding-right: clamp(0.75rem, 2.5vw, 2rem) !important;
@@ -57,11 +57,11 @@ st.markdown(
             flex-wrap: wrap;
             justify-content: space-between;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
             background: #121826;
-            border: 1px solid rgba(148, 163, 184, 0.14);
+            border: 1px solid rgba(148, 163, 184, 0.16);
             border-radius: 16px;
-            padding: 12px 16px;
+            padding: 14px 18px;
             margin-bottom: 14px;
         }
 
@@ -69,11 +69,14 @@ st.markdown(
             display: flex;
             align-items: center;
             gap: 10px;
+            min-width: 0;
+            flex: 1 1 210px;
         }
 
         .app-logo {
-            width: 34px;
-            height: 34px;
+            width: 36px;
+            height: 36px;
+            flex-shrink: 0;
             border-radius: 10px;
             background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%);
             display: inline-flex;
@@ -87,18 +90,20 @@ st.markdown(
         .app-title-wrap {
             display: flex;
             flex-direction: column;
+            min-width: 0;
         }
 
         .app-title {
-            font-size: 1.02rem;
+            font-size: 1.08rem;
             font-weight: 800;
             color: #f8fafc;
-            line-height: 1.2;
+            line-height: 1.25;
         }
 
         .app-sub {
-            font-size: 0.74rem;
+            font-size: 0.76rem;
             color: #94a3b8;
+            line-height: 1.3;
         }
 
         .nav-badges {
@@ -111,7 +116,7 @@ st.markdown(
         .chip {
             font-size: 0.74rem;
             font-weight: 600;
-            padding: 4px 10px;
+            padding: 5px 10px;
             border-radius: 999px;
             background: #1a2234;
             color: #cbd5e1;
@@ -119,7 +124,7 @@ st.markdown(
             white-space: nowrap;
         }
 
-        /* Hero Portfolio Card (Groww / Robinhood style) */
+        /* Hero Portfolio Card */
         .wallet-hero {
             background: linear-gradient(145deg, #141c2e 0%, #0f1624 100%);
             border: 1px solid rgba(56, 189, 248, 0.22);
@@ -141,7 +146,7 @@ st.markdown(
             flex-wrap: wrap;
             align-items: baseline;
             gap: 12px;
-            margin-top: 4px;
+            margin-top: 6px;
         }
 
         .wallet-amount {
@@ -160,10 +165,10 @@ st.markdown(
             border-radius: 999px;
         }
 
-        /* Responsive 2x2 / 4-col Stat Grid */
+        /* Responsive Stat Grid */
         .stat-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
             gap: 10px;
             margin-top: 16px;
         }
@@ -696,7 +701,7 @@ def render_live_app():
     f_closed = [t for t in closed_trades if _keep_trade(t, False)]
 
     # ---------------------------------------------------------
-    # PRIMARY APP TABS (SWIPEABLE / COMPACT LABELS FOR MOBILE)
+    # PRIMARY APP TABS
     # ---------------------------------------------------------
     t_positions, t_insights, t_ai, t_watchlist = st.tabs(
         [
