@@ -1,11 +1,12 @@
-import os
 import json
+import os
 import random
-import urllib.request
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import pandas as pd
 import yfinance as yf
 from market_data import MarketDataScanner
@@ -756,10 +757,8 @@ class AdaptiveTradeEngine:
         self._save_portfolio()
         if notify_telegram:
             self.notifier.send_message(
-                f"💵 <b>MANUAL FUNDS ADDED BY USER</b>\n━━━━━━━━━━━━━━━━━━━━\n"
-                f"➕ <b>Amount Added:</b> +₹{amt:,.2f}\n📝 <b>Note:</b> {note}\n"
-                f"🏦 <b>New Total Equity:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
-                f"💰 <b>Available Cash to Trade:</b> <b>₹{self.portfolio['available_cash']:,.2f}</b>"
+                f"💵 <b>Funds Added: +₹{amt:,.2f}</b>\n"
+                f"<b>Equity:</b> ₹{self.portfolio['current_equity']:,.0f} | <b>Cash:</b> ₹{self.portfolio['available_cash']:,.0f}"
             )
         return self.portfolio
 
@@ -783,16 +782,16 @@ class AdaptiveTradeEngine:
         for _, row in new_rec_df.iterrows():
             sym = row["symbol"]
             if sym not in old_map:
-                changes.append(f"🆕 <b>NEW SETUP DETECTED: {sym}</b> ({row['action']} @ ₹{row['entry_price']}, Conv {row['conviction']}/100).")
+                changes.append(f"🆕 <b>{sym}</b> ({row['action']} @ ₹{row['entry_price']})")
             else:
                 old_item = old_map[sym]
                 if old_item["action"] != row["action"]:
-                    changes.append(f"🔄 <b>DIRECTION FLIP: {sym}</b> from {old_item['action']} to <b>{row['action']}</b>!")
+                    changes.append(f"🔄 <b>{sym}</b> flipped to <b>{row['action']}</b>")
                 elif abs(float(row["entry_price"]) - float(old_item["entry_price"])) / float(old_item["entry_price"]) > 0.01:
-                    changes.append(f"⚡ <b>LEVEL UPDATE: {sym}</b> Entry ₹{row['entry_price']} | Target ₹{row['target_1']} | SL ₹{row['stop_loss']}.")
+                    changes.append(f"⚡ <b>{sym}</b> Entry ₹{row['entry_price']} | T1 ₹{row['target_1']} | SL ₹{row['stop_loss']}")
         for old_sym in old_map:
             if old_sym not in new_symbols:
-                changes.append(f"❌ <b>DROPPED: {old_sym}</b> removed.")
+                changes.append(f"❌ <b>{old_sym}</b> removed from watchlist")
         return changes
 
     def generate_intraday_recommendations(self, enriched_df, premarket_df=None, top_k=5):
@@ -1217,8 +1216,6 @@ class AdaptiveTradeEngine:
             t1 = round(float(row["target_1"]) + price_shift, 2)
             t2 = round(float(row["target_2"]) + price_shift, 2)
             sl = round(float(row["stop_loss"]) + price_shift, 2)
-            max_loss = round(abs(entry_p - sl) * qty, 2)
-            exp_profit = round(abs(t1 - entry_p) * qty, 2)
 
             regime_tag = row.get("market_regime", self.weights.get("last_market_regime", {}).get("regime", "NEUTRAL"))
             macro_tag = str(row.get("macro_regime", "NEUTRAL"))
@@ -1286,21 +1283,15 @@ class AdaptiveTradeEngine:
             added += 1
 
             if notify_telegram:
-                side_header = "🟢 <b>INTRADAY BUY ENTRY</b>" if row["action"] == "BUY" else "🔴 <b>INTRADAY SHORT ENTRY</b>"
-                self.notifier.send_message(
-                    f"{side_header}\n━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']}) | <b>Sector:</b> {sec} ({sec_idx})\n"
-                    f"🌍 <b>Macro:</b> <code>{macro_tag}</code> (Sec Adj {macro_sec_adj:+.1f})\n"
-                    f"📈 <b>Chart Flow:</b> 15m <code>{mtf_trend}</code> | <code>{orb_sig}</code> | VWAP Slope {vwap_slope:+.2f}%\n"
-                    f"📊 <b>RVOL:</b> {rvol_norm:.1f}x | <b>OBI:</b> {obi_val:+.2f} | <b>Deliv:</b> {deliv_pct:.1f}% | <b>Sec Alpha:</b> {sec_alpha:+.2f}%\n"
-                    f"🎰 <b>Arm:</b> <code>{arm_tag}</code> | <b>TRA:</b> <code>{arch_tag}</code> | <b>ML:</b> <code>{ml_status}</code>\n"
-                    f"📦 <b>Quantity:</b> <b>{qty} Shares</b> @ <b>₹{entry_p}</b> (Half-Kelly: {kelly_pct:.1f}%)\n"
-                    f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Cash Left: ₹{avail_cash:,.2f})</i>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🎯 <b>Target 1:</b> ₹{t1} <i>(+₹{exp_profit:,.0f})</i> | 🚀 <b>Target 2:</b> ₹{t2}\n"
-                    f"🛑 <b>Initial Stop-Loss:</b> ₹{sl} <i>(-₹{max_loss:,.0f} risk)</i>\n"
-                    f"⚖️ <b>Risk Debate:</b> <i>{debate_note}</i>\n"
-                    f"📰 <b>Catalyst ({row['sentiment']}):</b> {row['headline']}"
+                self.notifier.send_entry_alert(
+                    symbol=sym,
+                    action=row["action"],
+                    qty=qty,
+                    entry_price=entry_p,
+                    stop_loss=sl,
+                    target_1=t1,
+                    cash_left=avail_cash,
+                    reason=str(row.get("headline", "")),
                 )
 
         if added > 0:
@@ -1434,16 +1425,15 @@ class AdaptiveTradeEngine:
 
                 actions_taken.append(f"{'✅' if net_pnl_inr >= 0 else '🛑'} <b>AI CLOSED {sym} ({exit_status}):</b> ₹{exit_price} | Net P&L: <b>₹{net_pnl_inr:+,.0f}</b>")
                 if notify_telegram:
-                    header = "✅ <b>INTRADAY TRADE CLOSED — NET PROFIT</b>" if net_pnl_inr >= 0 else "🔴 <b>INTRADAY TRADE CLOSED — CUT & RESEARCHED</b>"
-                    self.notifier.send_message(
-                        f"{header}\n━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 <b>Stock:</b> <code>{sym}</code> ({side}) | <b>Arm:</b> <code>{arm_used}</code>\n"
-                        f"🏷️ <b>AI Decision:</b> {exit_status} ({hold_mins:.0f} mins)\n"
-                        f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{exit_price}</b>\n"
-                        f"🧾 <b>Gross P&L:</b> ₹{gross_pnl_inr:+,.2f} | <b>Intraday Taxes/Fees:</b> -₹{charges_inr:.2f}\n"
-                        f"💰 <b>Net Realized P&L:</b> <b>₹{net_pnl_inr:+,.2f} ({net_pnl_pct:+.2f}%)</b>\n"
-                        f"🏦 <b>Updated Wallet Equity:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
-                        f"🧠 <b>Post-Trade AI Research & Lesson:</b>\n<i>{lesson}</i>"
+                    self.notifier.send_exit_alert(
+                        symbol=sym,
+                        action=side,
+                        status=exit_status,
+                        entry_price=entry,
+                        exit_price=exit_price,
+                        net_pnl_inr=net_pnl_inr,
+                        net_pnl_pct=net_pnl_pct,
+                        equity=float(self.portfolio.get("current_equity", 0.0)),
                     )
 
         self._save_ledger()
