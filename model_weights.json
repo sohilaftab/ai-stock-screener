@@ -62,7 +62,7 @@
     }
   },
   "shadow_samples_learned": 4,
-  "ml_model_summary": "Collecting walk-forward samples",
+  "ml_model_summary": "Collecting samples (9/60)",
   "session_memory": {
     "MORNING_TREND (09:45-11:30)": {
       "trades": 10,
@@ -250,6 +250,6 @@
   },
   "generation": 11,
   "last_evaluated_count": 10,
-  "last_updated": "2026-11-23 04:08 PM IST",
+  "last_updated": "2026-11-23 04:36 PM IST",
   "learning_notes": "Gen #11 (10 real + 4 shadow): Top Arm=MOMENTUM_BREAKOUT (61%), Min Conv=68.0"
 }
