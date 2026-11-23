@@ -93,36 +93,54 @@ def _get_repo_slug() -> str:
     return os.getenv("GITHUB_REPO", DEFAULT_REPO).strip() or DEFAULT_REPO
 
 
-def _read_github_raw_json(filename: str, default):
+def _read_local_json(filename: str):
+    path = BASE_DIR / filename
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _read_github_raw_json(filename: str):
     repo = _get_repo_slug()
-    raw_url = f"https://raw.githubusercontent.com/{repo}/main/{filename}?t={int(datetime.now().timestamp())}"
+    raw_url = f"https://raw.githubusercontent.com/{repo}/main/{filename}?t={int(time.time())}"
     try:
         req = urllib.request.Request(raw_url, headers={"User-Agent": "PulseAI-Dashboard"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
-        return default
+        return None
 
 
-def _read_json_file(filename: str, default, fetch_remote: bool = True):
-    path = BASE_DIR / filename
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    if fetch_remote:
-        return _read_github_raw_json(filename, default)
+def _load_state_json(filename: str, default, prefer_remote: bool = True):
+    # On cloud or when remote sync is enabled, check GitHub main first so pushed worker/action updates
+    # show up immediately even before a container restart, falling back cleanly to local disk.
+    if prefer_remote:
+        remote_data = _read_github_raw_json(filename)
+        if remote_data is not None:
+            return remote_data
+
+    local_data = _read_local_json(filename)
+    if local_data is not None:
+        return local_data
+
+    if not prefer_remote:
+        remote_data = _read_github_raw_json(filename)
+        if remote_data is not None:
+            return remote_data
+
     return default
 
 
-def refresh_engine_from_disk(eng: AdaptiveTradeEngine, fetch_remote: bool = True) -> AdaptiveTradeEngine:
-    eng.ledger = _read_json_file("trade_history.json", [], fetch_remote=fetch_remote)
-    eng.portfolio = _read_json_file("portfolio_state.json", eng.portfolio, fetch_remote=fetch_remote)
-    eng.weights = _read_json_file("model_weights.json", eng.weights, fetch_remote=fetch_remote)
-    eng.shadow_ledger = _read_json_file("shadow_ledger.json", getattr(eng, "shadow_ledger", []), fetch_remote=fetch_remote)
-    eng.sector_cache = _read_json_file("sector_cache.json", getattr(eng, "sector_cache", {}), fetch_remote=fetch_remote)
+def refresh_engine_from_disk(eng: AdaptiveTradeEngine, prefer_remote: bool = True) -> AdaptiveTradeEngine:
+    eng.ledger = _load_state_json("trade_history.json", [], prefer_remote=prefer_remote)
+    eng.portfolio = _load_state_json("portfolio_state.json", eng.portfolio, prefer_remote=prefer_remote)
+    eng.weights = _load_state_json("model_weights.json", eng.weights, prefer_remote=prefer_remote)
+    eng.shadow_ledger = _load_state_json("shadow_ledger.json", getattr(eng, "shadow_ledger", []), prefer_remote=prefer_remote)
+    eng.sector_cache = _load_state_json("sector_cache.json", getattr(eng, "sector_cache", {}), prefer_remote=prefer_remote)
     if hasattr(eng, "_recalculate_cash") and isinstance(eng.portfolio, dict):
         eng._recalculate_cash(eng.portfolio)
     return eng
@@ -181,7 +199,8 @@ def get_regime_style(regime_name: str):
 if "pulse_engine" not in st.session_state:
     st.session_state.pulse_engine = AdaptiveTradeEngine()
 
-engine = refresh_engine_from_disk(st.session_state.pulse_engine, fetch_remote=True)
+prefer_remote_default = os.getenv("STREAMLIT_SERVER_HEADLESS", "").lower() == "true" or True
+engine = refresh_engine_from_disk(st.session_state.pulse_engine, prefer_remote=prefer_remote_default)
 perf = engine.get_performance_metrics()
 trades = engine.ledger
 open_trades = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
@@ -220,7 +239,7 @@ fii_str = f" • FII Net ₹{fii_net:+,.0f} Cr" if fii_net != 0 else ""
 regime_badge_text = f"{r_icon} Regime: {regime_name} • {nifty_str} • VIX {vix_ltp:.2f}{fii_str}"
 
 watchlist_data = []
-raw_wl = _read_json_file("morning_watchlist.json", [], fetch_remote=True)
+raw_wl = _load_state_json("morning_watchlist.json", [], prefer_remote=prefer_remote_default)
 watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else (raw_wl if isinstance(raw_wl, list) else [])
 
 # ---------------------------------------------------------
