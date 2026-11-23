@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from trade_engine import AdaptiveTradeEngine
@@ -16,8 +17,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_REPO = "sohilaftab/ai-stock-screener"
 
 st.set_page_config(
-    page_title="PulseAI — Autonomous NSE Portfolio",
-    page_icon="📈",
+    page_title="PulseAI — Smart NSE Trading & Portfolio Studio",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -25,58 +26,182 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+        html, body, [class*="css"] {
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        code, pre, [data-testid="stMetricValue"], [data-testid="stMetricDelta"], .mono-num {
+            font-family: 'JetBrains Mono', monospace !important;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .stApp {
+            background: radial-gradient(circle at top right, #13203b 0%, #090e1a 48%, #070b14 100%);
+            color: #e2e8f0;
+        }
+
         .block-container {
-            padding-top: 3.5rem !important;
-            padding-bottom: 2rem !important;
-            max-width: 1380px;
+            padding-top: 2.2rem !important;
+            padding-bottom: 2.5rem !important;
+            max-width: 1400px;
         }
-        .stTabs [data-baseweb="tab-list"] {
+
+        /* Top Live Bar */
+        .top-ticker-bar {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            border-radius: 12px;
+            padding: 10px 16px;
+            margin-bottom: 14px;
+            backdrop-filter: blur(8px);
+        }
+
+        .brand-mark {
+            display: flex;
+            align-items: center;
             gap: 10px;
-            border-bottom: 1px solid rgba(255,255,255,0.12);
-            padding-bottom: 6px;
+            font-weight: 800;
+            font-size: 1rem;
+            letter-spacing: -0.01em;
+            color: #f8fafc;
         }
-        .stTabs [data-baseweb="tab"] {
-            height: 42px;
-            padding: 8px 18px;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 0.95rem;
+
+        .brand-badge {
+            background: linear-gradient(135deg, #0ea5e9, #6366f1);
+            color: #ffffff;
+            font-size: 0.72rem;
+            font-weight: 700;
+            padding: 2px 8px;
+            border-radius: 999px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
         }
-        .hero-card {
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+
+        .meta-chip {
+            font-size: 0.8rem;
+            color: #cbd5e1;
+            background: rgba(30, 41, 59, 0.75);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            padding: 4px 10px;
+            border-radius: 999px;
+        }
+
+        /* Hero Banner */
+        .hero-banner {
+            background: linear-gradient(125deg, rgba(15, 23, 42, 0.96) 0%, rgba(23, 37, 84, 0.65) 60%, rgba(15, 23, 42, 0.96) 100%);
             border: 1px solid rgba(56, 189, 248, 0.25);
-            border-radius: 14px;
-            padding: 20px 24px;
-            margin-bottom: 1.25rem;
+            border-radius: 16px;
+            padding: 22px 26px;
+            margin-bottom: 18px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
         }
+
+        .hero-title {
+            margin: 0;
+            font-size: 1.55rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            color: #f8fafc;
+        }
+
+        .hero-subtitle {
+            margin: 6px 0 0 0;
+            color: #94a3b8;
+            font-size: 0.94rem;
+            line-height: 1.5;
+            max-width: 920px;
+        }
+
         .pill-row {
             display: flex;
             flex-wrap: wrap;
-            gap: 10px;
-            margin-top: 12px;
+            gap: 8px;
+            margin-top: 14px;
         }
-        .status-pill {
-            display: inline-block;
-            padding: 4px 12px;
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
             border-radius: 999px;
-            font-size: 0.8rem;
+            font-size: 0.78rem;
             font-weight: 600;
-            background: rgba(16, 185, 129, 0.15);
+        }
+
+        .pill-ai {
+            background: rgba(16, 185, 129, 0.14);
             color: #34d399;
             border: 1px solid rgba(16, 185, 129, 0.35);
         }
-        .regime-pill {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 999px;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
+
+        /* Metric Cards */
         div[data-testid="stMetric"] {
-            background-color: rgba(30, 41, 59, 0.55);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            padding: 14px 16px;
-            border-radius: 12px;
+            background: rgba(15, 23, 42, 0.78);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            padding: 15px 18px;
+            border-radius: 14px;
+            transition: border-color 0.2s ease, transform 0.2s ease;
+        }
+
+        div[data-testid="stMetric"]:hover {
+            border-color: rgba(56, 189, 248, 0.42);
+        }
+
+        div[data-testid="stMetricLabel"] {
+            color: #94a3b8 !important;
+            font-size: 0.82rem !important;
+            font-weight: 600 !important;
+        }
+
+        /* Section / Filter Panel */
+        .panel-card {
+            background: rgba(15, 23, 42, 0.72);
+            border: 1px solid rgba(148, 163, 184, 0.15);
+            border-radius: 14px;
+            padding: 16px 18px;
+            margin-bottom: 16px;
+        }
+
+        /* Tabs */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 8px;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+            padding-bottom: 8px;
+            margin-bottom: 12px;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            height: 40px;
+            padding: 6px 16px;
+            border-radius: 10px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            background: rgba(30, 41, 59, 0.45);
+        }
+
+        .stTabs [aria-selected="true"] {
+            background: rgba(56, 189, 248, 0.18) !important;
+            color: #38bdf8 !important;
+        }
+
+        /* Footer */
+        .app-footer {
+            margin-top: 2.5rem;
+            padding: 18px 22px;
+            border-radius: 14px;
+            background: rgba(15, 23, 42, 0.75);
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            color: #94a3b8;
+            font-size: 0.8rem;
+            line-height: 1.55;
         }
     </style>
     """,
@@ -116,8 +241,6 @@ def _read_github_raw_json(filename: str):
 
 
 def _load_state_json(filename: str, default, prefer_remote: bool = True):
-    # On cloud or when remote sync is enabled, check GitHub main first so pushed worker/action updates
-    # show up immediately even before a container restart, falling back cleanly to local disk.
     if prefer_remote:
         remote_data = _read_github_raw_json(filename)
         if remote_data is not None:
@@ -188,21 +311,58 @@ def persist_portfolio_to_github(portfolio_dict: dict) -> bool:
 def get_regime_style(regime_name: str):
     r = str(regime_name).upper()
     if r == "BULL_TREND":
-        return "🟢", "rgba(16, 185, 129, 0.16)", "#34d399", "rgba(16, 185, 129, 0.40)"
+        return "🟢", "Bullish Market", "rgba(16, 185, 129, 0.16)", "#34d399", "rgba(16, 185, 129, 0.40)"
     if r in ("BEAR_TREND", "HIGH_VOLATILITY_PANIC"):
-        return "🔴", "rgba(239, 68, 68, 0.16)", "#f87171", "rgba(239, 68, 68, 0.40)"
+        return "🔴", "Caution / Bearish", "rgba(244, 63, 94, 0.16)", "#fb7185", "rgba(244, 63, 94, 0.40)"
     if r == "SIDEWAYS_CHOP":
-        return "🟡", "rgba(245, 158, 11, 0.16)", "#fbbf24", "rgba(245, 158, 11, 0.40)"
-    return "⚪", "rgba(148, 163, 184, 0.16)", "#cbd5e1", "rgba(148, 163, 184, 0.35)"
+        return "🟡", "Choppy / Range-Bound", "rgba(245, 158, 11, 0.16)", "#fbbf24", "rgba(245, 158, 11, 0.40)"
+    return "⚪", "Balanced Market", "rgba(148, 163, 184, 0.16)", "#cbd5e1", "rgba(148, 163, 184, 0.35)"
+
+
+def humanize_signal(orb_sig: str, mtf_trend: str) -> str:
+    orb = str(orb_sig).upper()
+    mtf = str(mtf_trend).upper()
+    if "BREAKOUT_UP" in orb:
+        orb_txt = "Broke above morning range"
+    elif "BREAKDOWN_DOWN" in orb:
+        orb_txt = "Broke below morning range"
+    else:
+        orb_txt = "Inside morning range"
+
+    if mtf == "BULLISH":
+        mtf_txt = "15m uptrend"
+    elif mtf == "BEARISH":
+        mtf_txt = "15m downtrend"
+    else:
+        mtf_txt = "15m neutral"
+    return f"{orb_txt} • {mtf_txt}"
+
+
+def humanize_arm(arm_name: str) -> str:
+    mapping = {
+        "MOMENTUM_BREAKOUT": "Volume & Price Breakout",
+        "NEWS_CATALYST": "News Reaction Setup",
+        "PREMARKET_GAP": "Opening Gap Move",
+        "RELATIVE_STRENGTH_LEADER": "Market Outperformer",
+    }
+    return mapping.get(str(arm_name).upper(), str(arm_name).replace("_", " ").title())
+
+
+def humanize_archetype(arch_name: str) -> str:
+    mapping = {
+        "LARGE_CAP_STEADY": "Steady Large-Cap",
+        "MOMENTUM_MOVER": "Active Momentum Stock",
+        "HIGH_VOL_MIDCAP": "Fast-Moving Midcap",
+    }
+    return mapping.get(str(arch_name).upper(), str(arch_name).replace("_", " ").title())
 
 
 if "pulse_engine" not in st.session_state:
     st.session_state.pulse_engine = AdaptiveTradeEngine()
 
-prefer_remote_default = os.getenv("STREAMLIT_SERVER_HEADLESS", "").lower() == "true" or True
-engine = refresh_engine_from_disk(st.session_state.pulse_engine, prefer_remote=prefer_remote_default)
+engine = refresh_engine_from_disk(st.session_state.pulse_engine, prefer_remote=True)
 perf = engine.get_performance_metrics()
-trades = engine.ledger
+trades = engine.ledger if isinstance(engine.ledger, list) else []
 open_trades = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
 closed_trades = [t for t in trades if str(t.get("status", "")).upper() != "OPEN"]
 
@@ -232,23 +392,23 @@ macro_summary = macro_info.get("summary", "Macro Neutral")
 exp_info = regime_info.get("expiry_status", {})
 exp_note = exp_info.get("note", "Normal NSE session")
 ml_summary = engine.weights.get("ml_model_summary", "Collecting walk-forward samples")
-r_icon, r_bg, r_fg, r_border = get_regime_style(regime_name)
 
+r_icon, r_friendly, r_bg, r_fg, r_border = get_regime_style(regime_name)
 nifty_str = f"Nifty {nifty_ltp:,.2f} ({nifty_chg:+.2f}%)" if nifty_ltp > 0 else f"Nifty {nifty_chg:+.2f}%"
 fii_str = f" • FII Net ₹{fii_net:+,.0f} Cr" if fii_net != 0 else ""
-regime_badge_text = f"{r_icon} Regime: {regime_name} • {nifty_str} • VIX {vix_ltp:.2f}{fii_str}"
+regime_badge_text = f"{r_icon} {r_friendly} • {nifty_str} • Volatility Index {vix_ltp:.2f}{fii_str}"
 
-watchlist_data = []
-raw_wl = _load_state_json("morning_watchlist.json", [], prefer_remote=prefer_remote_default)
+raw_wl = _load_state_json("morning_watchlist.json", [], prefer_remote=True)
 watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else (raw_wl if isinstance(raw_wl, list) else [])
 
 # ---------------------------------------------------------
-# SIDEBAR: WALLET, LIVE REGIME & USER-ONLY MANUAL DEPOSITS
+# SIDEBAR: WALLET, MARKET MOOD, DISPLAY PREFS & MANUAL FUNDS
 # ---------------------------------------------------------
 with st.sidebar:
-    st.markdown("### 💼 Wallet Summary")
+    st.markdown("### 💼 Wallet & Controls")
     auto_live_sync = st.toggle("⚡ Auto-Refresh Every 30s", value=True, key="auto_live_sync")
-    if st.button("🔄 Reload Disk State Now", use_container_width=True):
+    show_quant_jargon = st.toggle("🔬 Show Raw Quant Codes", value=False, key="show_quant_jargon", help="Toggle between plain-English descriptions and raw technical/quant labels.")
+    if st.button("🔄 Refresh Now", use_container_width=True):
         st.rerun()
 
     st.metric(
@@ -257,33 +417,33 @@ with st.sidebar:
         delta=f"{total_pnl_pct:+.2f}% net return",
     )
     st.metric(label="Free Cash Ready to Trade", value=f"₹{avail_cash:,.0f}")
-    st.metric(label="Money Currently in Stocks", value=f"₹{alloc_cap:,.0f}")
+    st.metric(label="Money Currently in Trades", value=f"₹{alloc_cap:,.0f}")
     st.caption(
-        f"Base Seed: ₹{initial_cap:,.0f} • "
-        f"Deposits: ₹{manual_dep:,.0f} • "
+        f"Starting Capital: ₹{initial_cap:,.0f} • "
+        f"Added Funds: ₹{manual_dep:,.0f} • "
         f"NSE Taxes/Fees: ₹{total_taxes:,.0f}"
     )
 
     st.divider()
-    st.markdown("### 🌐 Live Market, Macro & Expiry")
+    st.markdown("### 🌐 Market & Risk Context")
     st.markdown(
         f"""
-        <div style="background:{r_bg}; border:1px solid {r_border}; border-radius:10px; padding:10px 12px; margin-bottom:8px;">
-            <div style="color:{r_fg}; font-weight:700; font-size:0.92rem;">{r_icon} {regime_name}</div>
-            <div style="color:#e2e8f0; font-size:0.82rem; margin-top:4px;">{nifty_str}</div>
-            <div style="color:#cbd5e1; font-size:0.82rem;">India VIX: {vix_ltp:.2f} ({vix_chg:+.1f}%) • Size: {int(size_mult * 100)}%</div>
-            <div style="color:#cbd5e1; font-size:0.80rem; margin-top:4px;">FII Cash Net: ₹{fii_net:+,.0f} Cr</div>
-            <div style="color:#cbd5e1; font-size:0.78rem; margin-top:3px;">Macro: {macro_summary}</div>
-            <div style="color:#fbbf24; font-size:0.78rem; margin-top:3px;">Expiry: {exp_note}</div>
-            <div style="color:#94a3b8; font-size:0.76rem; margin-top:3px;">ML: {ml_summary}</div>
+        <div style="background:{r_bg}; border:1px solid {r_border}; border-radius:12px; padding:12px 14px; margin-bottom:8px;">
+            <div style="color:{r_fg}; font-weight:700; font-size:0.94rem;">{r_icon} {r_friendly} ({regime_name})</div>
+            <div style="color:#e2e8f0; font-size:0.83rem; margin-top:5px;">{nifty_str}</div>
+            <div style="color:#cbd5e1; font-size:0.82rem;">VIX: {vix_ltp:.2f} ({vix_chg:+.1f}%) • Position Sizing: {int(size_mult * 100)}%</div>
+            <div style="color:#cbd5e1; font-size:0.80rem; margin-top:4px;">FII Cash Flow: ₹{fii_net:+,.0f} Cr</div>
+            <div style="color:#cbd5e1; font-size:0.79rem; margin-top:4px;">Global Cues: {macro_summary}</div>
+            <div style="color:#fbbf24; font-size:0.79rem; margin-top:4px;">Session Note: {exp_note}</div>
+            <div style="color:#94a3b8; font-size:0.76rem; margin-top:4px;">AI Model: {ml_summary}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.divider()
-    st.markdown("### ➕ Add Money Manually")
-    st.caption("Only you can add capital here. The AI never adds funds on its own.")
+    st.markdown("### ➕ Add Capital Manually")
+    st.caption("Only you can add money to the wallet. The AI never adds funds automatically.")
     with st.form("manual_deposit_form", clear_on_submit=True):
         deposit_amt = st.number_input(
             "Deposit Amount (₹)",
@@ -292,7 +452,7 @@ with st.sidebar:
             value=25000,
             step=5000,
         )
-        deposit_note = st.text_input("Deposit Note (Optional)", placeholder="e.g., Added extra trading funds")
+        deposit_note = st.text_input("Note (Optional)", placeholder="e.g., Added extra trading funds")
         if st.form_submit_button("Deposit Into Wallet", use_container_width=True):
             updated_port = engine.add_manual_funds(
                 deposit_amt,
@@ -301,31 +461,53 @@ with st.sidebar:
             )
             synced = persist_portfolio_to_github(updated_port)
             if synced:
-                st.success(f"Added ₹{deposit_amt:,.0f} and synced permanently to GitHub!")
+                st.success(f"Added ₹{deposit_amt:,.0f} and synced to GitHub.")
             else:
-                st.success(f"Added ₹{deposit_amt:,.0f} to wallet! (Add GITHUB_TOKEN in Streamlit Secrets to auto-sync to GitHub.)")
+                st.success(f"Added ₹{deposit_amt:,.0f} to your wallet.")
             st.rerun()
 
     st.divider()
-    with st.expander("⚙️ Developer Controls (Keep OFF)", expanded=False):
-        st.caption("Cloud Autopilot runs via GitHub Actions / Warm Worker. Keep browser overrides OFF.")
+    with st.expander("⚙️ Advanced Flags (Keep OFF)", expanded=False):
+        st.caption("Automation runs via GitHub Actions / Worker. Keep manual browser overrides off.")
         st.toggle("Enable Browser Autopilot", value=False, key="ui_autopilot")
         st.checkbox("Simulate After-Hours Entry", value=False, key="ui_sim")
 
 # ---------------------------------------------------------
-# MAIN HEADER & KPI CARDS
+# TOP BAR, HERO HEADER & KPI SUMMARY
 # ---------------------------------------------------------
-now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+now_ist_dt = datetime.now(IST)
+now_ist_str = now_ist_dt.strftime("%d %b %Y, %I:%M %p IST")
+mins_now = now_ist_dt.hour * 60 + now_ist_dt.minute
+market_open_now = (now_ist_dt.weekday() < 5) and ((9 * 60 + 15) <= mins_now <= (15 * 60 + 30))
+session_badge = "🟢 NSE Session Live" if market_open_now else "🌙 NSE Market Closed"
+
 st.markdown(
     f"""
-    <div class="hero-card">
-        <h2 style="margin:0; color:#f8fafc;">📈 PulseAI — Institutional NSE & Quantitative Bandit Portfolio Manager</h2>
-        <p style="margin:6px 0 0 0; color:#94a3b8; font-size:0.95rem;">
-            5m/15m MTF VWAP & ORB Flow • Time-Norm RVOL & NSE OBI • Global Macro & Expiry Shield • Walk-Forward ML • Thompson Sampling & Half-Kelly Sizing.
+    <div class="top-ticker-bar">
+        <div class="brand-mark">
+            <span>⚡ PULSEAI</span>
+            <span class="brand-badge">NSE Intraday AI</span>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+            <span class="meta-chip">{session_badge}</span>
+            <span class="meta-chip">🕒 {now_ist_str}</span>
+            <span class="meta-chip">🔄 Sync: {"30s Auto" if auto_live_sync else "Manual"}</span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f"""
+    <div class="hero-banner">
+        <h1 class="hero-title">Smart NSE Portfolio & AI Trade Monitor</h1>
+        <p class="hero-subtitle">
+            Tracks intraday equity calls, automatic 15:15 IST square-offs, net after-tax profit & loss, and how the AI adapts from real and simulated setups—in plain, clear numbers.
         </p>
         <div class="pill-row">
-            <span class="status-pill">● Brain Gen #{engine.weights.get('generation', 1)} ({shadow_learned} Shadow Setups • {ml_summary}) • {now_ist}</span>
-            <span class="regime-pill" style="background:{r_bg}; color:{r_fg}; border:1px solid {r_border};">{regime_badge_text}</span>
+            <span class="pill pill-ai">● AI Brain Gen #{engine.weights.get('generation', 1)} • {shadow_learned} Shadow Setups Learned • {now_ist_str}</span>
+            <span class="pill" style="background:{r_bg}; color:{r_fg}; border:1px solid {r_border};">{regime_badge_text}</span>
         </div>
     </div>
     """,
@@ -334,36 +516,168 @@ st.markdown(
 
 drift_msg = engine.weights.get("drift_alert", "")
 if drift_msg:
-    st.warning(f"⚡ **Concept-Drift Auto-Reset Active:** {drift_msg}")
+    st.warning(f"⚡ **Market Shift Detected:** {drift_msg}")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Net Portfolio Value", f"₹{current_eq:,.0f}", f"Contributed: ₹{total_contrib:,.0f}")
-c2.metric("Available Cash", f"₹{avail_cash:,.0f}", f"In Trades: ₹{alloc_cap:,.0f}")
-c3.metric("Open Trade P&L", f"₹{unrl_total:+,.0f}", f"{len(open_trades)} Active Positions")
-c4.metric("Net Win Rate (After Tax)", f"{win_rate_val:.1f}%", f"Net Realized: ₹{total_pnl_inr:+,.0f}")
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Portfolio Value", f"₹{current_eq:,.0f}", f"Capital Added: ₹{total_contrib:,.0f}")
+k2.metric("Cash Available", f"₹{avail_cash:,.0f}", f"Locked in Trades: ₹{alloc_cap:,.0f}")
+k3.metric("Open Trade P&L", f"₹{unrl_total:+,.0f}", f"{len(open_trades)} Active Trades")
+k4.metric("Win Rate (After Tax)", f"{win_rate_val:.1f}%", f"Net Realized: ₹{total_pnl_inr:+,.0f}")
 
 st.write("")
 
 # ---------------------------------------------------------
-# TABS: TRADES, POST-TRADE RESEARCH, QUANT BRAIN & WATCHLIST
+# SEARCH & FILTER BAR FOR TRADES
+# ---------------------------------------------------------
+st.markdown('<div class="panel-card">', unsafe_allow_html=True)
+f_col1, f_col2, f_col3, f_col4 = st.columns([2.2, 1.3, 1.3, 1.6])
+with f_col1:
+    search_query = st.text_input(
+        "🔍 Search Stock or Sector",
+        placeholder="Type e.g. TATASTEEL, HDFCBANK, Energy, Technology...",
+        key="trade_search",
+    ).strip().upper()
+with f_col2:
+    side_filter = st.selectbox(
+        "Direction",
+        options=["All", "BUY", "SELL (SHORT)"],
+        key="trade_side_filter",
+    )
+with f_col3:
+    status_filter = st.selectbox(
+        "Trade State",
+        options=["All", "Open Only", "Settled Only"],
+        key="trade_status_filter",
+    )
+with f_col4:
+    min_conv = st.slider(
+        "Min AI Confidence",
+        min_value=0,
+        max_value=95,
+        value=0,
+        step=5,
+        key="trade_min_conv",
+    )
+st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _matches_trade_filters(t: dict, is_open: bool) -> bool:
+    if status_filter == "Open Only" and not is_open:
+        return False
+    if status_filter == "Settled Only" and is_open:
+        return False
+    if side_filter != "All" and str(t.get("action", "")).upper() != side_filter:
+        return False
+    if float(t.get("conviction", 0.0)) < float(min_conv):
+        return False
+    if search_query:
+        sym = str(t.get("symbol", "")).replace(".NS", "").upper()
+        sec = str(t.get("sector", "")).upper()
+        reason = str(t.get("headline", "")).upper()
+        if search_query not in sym and search_query not in sec and search_query not in reason:
+            return False
+    return True
+
+
+filtered_open = [t for t in open_trades if _matches_trade_filters(t, True)]
+filtered_closed = [t for t in closed_trades if _matches_trade_filters(t, False)]
+
+# ---------------------------------------------------------
+# VISUAL CHARTS (EQUITY & DAILY P&L + TRADE OUTCOMES)
+# ---------------------------------------------------------
+chart_col1, chart_col2 = st.columns(2)
+
+with chart_col1:
+    st.markdown("#### 📈 Portfolio Equity Trend")
+    eq_log = engine.portfolio.get("daily_equity_log", [])
+    if eq_log and len(eq_log) >= 1:
+        eq_df = pd.DataFrame(eq_log)
+        eq_df["equity"] = pd.to_numeric(eq_df.get("equity", current_eq), errors="coerce").fillna(current_eq)
+        eq_df["date"] = eq_df.get("date", now_ist_dt.strftime("%Y-%m-%d")).astype(str)
+        eq_chart = (
+            alt.Chart(eq_df)
+            .mark_area(
+                line={"color": "#38bdf8", "strokeWidth": 2.5},
+                color=alt.Gradient(
+                    gradient="linear",
+                    stops=[
+                        alt.GradientStop(color="rgba(56, 189, 248, 0.35)", offset=0),
+                        alt.GradientStop(color="rgba(56, 189, 248, 0.02)", offset=1),
+                    ],
+                    x1=1, x2=1, y1=1, y2=0,
+                ),
+            )
+            .encode(
+                x=alt.X("date:N", title="Date"),
+                y=alt.Y("equity:Q", title="Equity (₹)", scale=alt.Scale(zero=False)),
+                tooltip=[
+                    alt.Tooltip("date:N", title="Date"),
+                    alt.Tooltip("equity:Q", title="Equity (₹)", format=",.0f"),
+                ],
+            )
+            .properties(height=220)
+        )
+        st.altair_chart(eq_chart, use_container_width=True)
+    else:
+        st.info("Equity history will appear here as trading days complete.")
+
+with chart_col2:
+    st.markdown("#### 📊 Recent Settled Trade P&L (After Taxes)")
+    if closed_trades:
+        recent_c = closed_trades[-12:]
+        pnl_df = pd.DataFrame([
+            {
+                "Stock": f"{str(t.get('symbol', '')).replace('.NS', '')} ({t.get('date', '')[-5:]})",
+                "Net P&L (₹)": round(float(t.get("pnl_inr", 0.0)), 2),
+                "Outcome": "Profit" if float(t.get("pnl_inr", 0.0)) >= 0 else "Loss",
+            }
+            for t in recent_c
+        ])
+        pnl_chart = (
+            alt.Chart(pnl_df)
+            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+            .encode(
+                x=alt.X("Stock:N", sort=None, title="Trade"),
+                y=alt.Y("Net P&L (₹):Q", title="Net P&L (₹)"),
+                color=alt.Color(
+                    "Outcome:N",
+                    scale=alt.Scale(domain=["Profit", "Loss"], range=["#10b981", "#f43f5e"]),
+                    legend=None,
+                ),
+                tooltip=[
+                    alt.Tooltip("Stock:N", title="Trade"),
+                    alt.Tooltip("Net P&L (₹):Q", title="Net P&L (₹)", format="+,.2f"),
+                    alt.Tooltip("Outcome:N", title="Result"),
+                ],
+            )
+            .properties(height=220)
+        )
+        st.altair_chart(pnl_chart, use_container_width=True)
+    else:
+        st.info("Settled trade profit/loss bars will appear once intraday positions close.")
+
+st.write("")
+
+# ---------------------------------------------------------
+# MAIN TABS: TRADES, AI NOTES, STRATEGY PERFORMANCE & WATCHLIST
 # ---------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(
     [
-        f"📊 Active & Past Trades ({len(open_trades)} Open)",
-        "🧠 AI Research & Shadow Learning",
-        "🎰 Bandit Arms, TRA & Timing",
-        f"🌅 Watchlist ({len(watchlist_data)})",
+        f"📊 Trades ({len(filtered_open)} Open • {len(filtered_closed)} Settled)",
+        "🧠 AI Research & Learning Log",
+        "🎯 Strategy & Timing Breakdown",
+        f"🌅 Morning Watchlist ({len(watchlist_data)})",
     ]
 )
 
 with tab1:
-    st.subheader("Currently Open Positions")
-    if not open_trades:
-        st.info("No active trades right now. The AI enters automatically when a setup passes its 5m/15m chart flow, Sector/Macro, NSE OBI & Delivery %, Gemini Debate, Bandit, and ML filters.")
+    st.subheader("Active Open Trades")
+    if not filtered_open:
+        st.info("No open trades match your current filter. Positions close automatically at 15:15 IST or when target/stop rules trigger.")
     else:
         rows = []
         sector_summary = {}
-        for t in open_trades:
+        for t in filtered_open:
             entry = float(t.get("entry_price", 0))
             target = float(t.get("target_1", t.get("initial_target", 0)))
             sl = float(t.get("stop_loss", 0))
@@ -377,12 +691,14 @@ with tab1:
             orb_s = str(t.get("orb_signal", "INSIDE_ORB"))
             mtf_s = str(t.get("mtf_15m_trend", "NEUTRAL"))
             deliv = float(t.get("delivery_pct", 0.0))
-            kelly = float(t.get("kelly_pct", 15.0))
+            arm_raw = str(t.get("strategy_arm", "MOMENTUM_BREAKOUT"))
 
             sector_summary.setdefault(sec, {"count": 0, "capital": 0.0})
             sector_summary[sec]["count"] += 1
             sector_summary[sec]["capital"] += invested
 
+            setup_label = f"{mtf_s} / {orb_s}" if show_quant_jargon else humanize_signal(orb_s, mtf_s)
+            arm_label = arm_raw if show_quant_jargon else humanize_arm(arm_raw)
             headline = str(t.get("headline", "")).strip()
             note = str(t.get("trade_management_note", "")).strip()
             why_text = f"{headline} — {note}" if (headline and note) else (headline or note)
@@ -391,64 +707,62 @@ with tab1:
                 {
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
                     "Sector": sec,
-                    "Side": t.get("action", "BUY"),
-                    "15m / ORB": f"{mtf_s} / {orb_s}",
-                    "RVOL / Deliv": f"{rvol:.1f}x / {deliv:.0f}%",
-                    "Bandit Arm": t.get("strategy_arm", "MOMENTUM_BREAKOUT"),
-                    "Buy/Entry (₹)": f"₹{entry:,.2f}",
-                    "Target (₹)": f"₹{target:,.2f}",
-                    "Stop-Loss (₹)": f"₹{sl:,.2f}",
-                    "Shares": qty,
-                    "Invested (₹)": f"₹{invested:,.0f} ({kelly:.0f}% Kelly)",
-                    "Live P&L (₹)": f"₹{unrl:+,.0f} (Peak ₹{peak:+,.0f})",
-                    "Conviction": f"{conv:.1f}/100",
-                    "Catalyst, Debate & Live AI Note": why_text,
+                    "Direction": t.get("action", "BUY"),
+                    "Chart Signal": setup_label,
+                    "Vol / Delivery": f"{rvol:.1f}x avg • {deliv:.0f}% deliv",
+                    "Setup Type": arm_label,
+                    "Entry": f"₹{entry:,.2f}",
+                    "Target": f"₹{target:,.2f}",
+                    "Stop-Loss": f"₹{sl:,.2f}",
+                    "Qty": qty,
+                    "Capital": f"₹{invested:,.0f}",
+                    "Live P&L": f"₹{unrl:+,.0f} (Best ₹{peak:+,.0f})",
+                    "AI Score": f"{conv:.0f}/100",
+                    "Reason & Status": why_text,
                 }
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         eq = max(current_eq, 1.0)
         sec_tags = [
-            f"**{sec}**: {vals['count']}/2 trades (₹{vals['capital']:,.0f} • {vals['capital'] / eq * 100:.0f}% of equity)"
+            f"**{sec}**: {vals['count']}/2 trades (₹{vals['capital']:,.0f} • {vals['capital'] / eq * 100:.0f}%)"
             for sec, vals in sector_summary.items()
         ]
-        st.caption("🛡️ **Sector Correlation Guard (Max 2 trades / 40% equity per sector):** " + " | ".join(sec_tags))
+        st.caption("🛡️ **Sector Limit (Max 2 trades & 40% capital per sector):** " + " | ".join(sec_tags))
 
-    st.subheader("Completed Trade History (Net After 2026 NSE Taxes & Slippage)")
-    if not closed_trades:
-        st.caption("No settled trades yet. Whenever the AI closes a trade, its net after-tax P&L and research lesson appear here.")
+    st.subheader("Settled Trade History (Net After Taxes & Charges)")
+    if not filtered_closed:
+        st.caption("No settled trades match your filter yet.")
     else:
         closed_rows = []
-        for t in reversed(closed_trades[-30:]):
+        for t in reversed(filtered_closed[-40:]):
             pnl = float(t.get("pnl_inr", 0))
             charges = float(t.get("charges_inr", 0))
+            arm_raw = str(t.get("strategy_arm", "—"))
             closed_rows.append(
                 {
                     "Date": t.get("date", "—"),
                     "Stock": t.get("symbol", "N/A").replace(".NS", ""),
                     "Sector": t.get("sector", "General"),
-                    "Arm": t.get("strategy_arm", "—"),
-                    "Side": t.get("action", "BUY"),
-                    "Entry (₹)": f"₹{float(t.get('entry_price', 0)):,.2f}",
-                    "Exit (₹)": f"₹{float(t.get('exit_price', 0)):,.2f}",
-                    "Hold": f"{float(t.get('hold_minutes', 0)):.0f}m",
+                    "Setup Type": arm_raw if show_quant_jargon else humanize_arm(arm_raw),
+                    "Direction": t.get("action", "BUY"),
+                    "Entry": f"₹{float(t.get('entry_price', 0)):,.2f}",
+                    "Exit": f"₹{float(t.get('exit_price', 0)):,.2f}",
+                    "Duration": f"{float(t.get('hold_minutes', 0)):.0f}m",
                     "Taxes/Fees": f"₹{charges:.2f}",
                     "Net P&L": f"₹{pnl:+,.0f} ({float(t.get('pnl_pct', 0)):+.2f}%)",
-                    "AI Exit Reason": t.get("status", "CLOSED"),
-                    "Post-Trade Research Lesson": t.get("mistake_diagnosis", "—"),
+                    "Exit Reason": t.get("status", "CLOSED"),
+                    "What AI Learned": t.get("mistake_diagnosis", "—"),
                 }
             )
         st.dataframe(pd.DataFrame(closed_rows), use_container_width=True, hide_index=True)
 
 with tab2:
-    st.subheader("🧠 Live Post-Trade Research & Mistake Autopsy Log")
-    st.caption(
-        "Immediately after every trade closes, the AI scans breaking news emotion for that stock, "
-        "identifies why it won or lost, and updates its Bayesian Bandit arms & walk-forward ML model."
-    )
+    st.subheader("🧠 Post-Trade AI Notes")
+    st.caption("Every time a trade closes, the AI checks news and price action to record what worked or went wrong.")
     lessons = engine.weights.get("trade_lessons_log", [])
     if not lessons:
-        st.info("No post-trade research lessons recorded yet. They populate automatically as trades settle.")
+        st.info("No post-trade notes recorded yet.")
     else:
         for item in lessons[:15]:
             icon = "✅" if float(item.get("pnl_inr", 0)) >= 0 else "🔍"
@@ -456,40 +770,40 @@ with tab2:
             st.markdown(f"{icon} **{item.get('timestamp', '')}**{regime_tag} — {item.get('lesson', '')}")
 
     st.divider()
-    st.subheader("👻 Counterfactual Shadow-Trade Learning (Skipped & Vetoed Setups)")
-    st.caption("Near-miss and Bear-Critic / Gemini Debate vetoed setups are tracked silently and evaluated so the AI learns 5× faster without risking money.")
+    st.subheader("👻 Skipped & Filtered Setups (Shadow Practice)")
+    st.caption("Setups that didn't pass risk or confidence rules are tracked silently so the AI learns without risking real cash.")
     shadows = getattr(engine, "shadow_ledger", [])
     if not shadows:
-        st.caption("No shadow setups logged yet.")
+        st.caption("No shadow setups recorded yet.")
     else:
         s_rows = [
             {
                 "Date": s.get("date", "—"),
                 "Stock": s.get("symbol", "").replace(".NS", ""),
-                "Side": s.get("action", "BUY"),
-                "Archetype": s.get("archetype", "—"),
-                "Conviction": s.get("conviction", 0),
-                "Why Skipped / Vetoed": s.get("skip_reason", "—"),
-                "Outcome": s.get("status", "SHADOW_OPEN"),
-                "Shadow P&L": f"{float(s.get('shadow_pnl_pct', 0)):+.2f}%",
+                "Direction": s.get("action", "BUY"),
+                "Stock Style": s.get("archetype", "—") if show_quant_jargon else humanize_archetype(s.get("archetype", "")),
+                "AI Score": s.get("conviction", 0),
+                "Why Skipped": s.get("skip_reason", "—"),
+                "Status": s.get("status", "SHADOW_OPEN"),
+                "Simulated P&L": f"{float(s.get('shadow_pnl_pct', 0)):+.2f}%",
             }
             for s in reversed(shadows[-15:])
         ]
         st.dataframe(pd.DataFrame(s_rows), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader("💰 Manual Deposit History")
+    st.subheader("💰 Manual Deposits")
     deposits = engine.portfolio.get("deposit_history", [])
     if not deposits:
-        st.caption("No manual deposits added yet. Use the 'Add Money Manually' form in the left sidebar whenever you want to add funds.")
+        st.caption("No manual deposits added yet.")
     else:
         st.dataframe(pd.DataFrame(deposits), use_container_width=True, hide_index=True)
 
 with tab3:
-    st.subheader("🎰 Thompson Sampling Multi-Armed Bandit (Beta α / β Posteriors)")
+    st.subheader("🎯 Strategy Performance")
     arms = engine.weights.get("bandit_arms", {})
     if not arms:
-        st.info("Bandit posteriors will appear once the latest trade_engine.py runs its first scan.")
+        st.info("Strategy stats appear once scans and trades run.")
     else:
         arm_rows = []
         for arm_name, stats in arms.items():
@@ -498,21 +812,20 @@ with tab3:
             post_p = (a / (a + b)) * 100.0
             arm_rows.append(
                 {
-                    "Strategy Arm": arm_name,
-                    "Alpha (Wins)": round(a, 2),
-                    "Beta (Losses)": round(b, 2),
-                    "Posterior Win Prob": f"{post_p:.1f}%",
-                    "Real Trades": int(stats.get("trades", 0)),
-                    "Net P&L (₹)": f"₹{float(stats.get('net_pnl_inr', 0.0)):+,.0f}",
+                    "Strategy": arm_name if show_quant_jargon else humanize_arm(arm_name),
+                    "Est. Win Likelihood": f"{post_p:.1f}%",
+                    "Completed Trades": int(stats.get("trades", 0)),
+                    "Net P&L": f"₹{float(stats.get('net_pnl_inr', 0.0)):+,.0f}",
+                    "Alpha / Beta": f"{a:.1f} / {b:.1f}",
                 }
             )
         st.dataframe(pd.DataFrame(arm_rows), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader("🧬 Qlib TRA Stock Archetype Routing Memory")
+    st.subheader("🧬 Stock Style Performance")
     arch_mem = engine.weights.get("archetype_memory", {})
     if not arch_mem:
-        st.info("Archetype stats (Large-Cap Steady vs. Momentum Mover vs. High-Vol Midcap) populate automatically as real & shadow trades settle.")
+        st.info("Stock style stats populate automatically as real and shadow trades settle.")
     else:
         arch_rows = []
         for arch_name, st_a in arch_mem.items():
@@ -521,39 +834,56 @@ with tab3:
             wp = (w_wins / max(w_wins + w_losses, 1.0)) * 100.0
             arch_rows.append(
                 {
-                    "Stock Archetype": arch_name,
-                    "Learned Win Rate": f"{wp:.1f}%",
-                    "Real Trades": int(st_a.get("trades", 0)),
-                    "SL Multiplier Adj": f"{float(st_a.get('sl_mult_adj', 1.0)):.2f}x",
-                    "Score Adjustment": f"{float(st_a.get('score_adj', 0.0)):+.1f} pts",
+                    "Stock Style": arch_name if show_quant_jargon else humanize_archetype(arch_name),
+                    "Win Rate": f"{wp:.1f}%",
+                    "Trades": int(st_a.get("trades", 0)),
+                    "Stop-Loss Cushion": f"{float(st_a.get('sl_mult_adj', 1.0)):.2f}x",
+                    "Score Boost": f"{float(st_a.get('score_adj', 0.0)):+.1f} pts",
                 }
             )
         st.dataframe(pd.DataFrame(arch_rows), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader("⏱️ Learned Time-of-Day Session Performance")
+    st.subheader("⏱️ Time-of-Day Performance (IST)")
     sess_mem = engine.weights.get("session_memory", {})
     if not sess_mem:
-        st.info("Session timing stats will appear automatically once trades complete across different market windows.")
+        st.info("Time-of-day stats appear once trades complete across intraday sessions.")
     else:
         sess_rows = [
             {
-                "Market Window (IST)": k,
-                "Trades Taken": v.get("trades", 0),
+                "Time Window (IST)": k,
+                "Trades": v.get("trades", 0),
                 "Win Rate": f"{v.get('win_rate', 0)}%",
-                "Net P&L (₹)": f"₹{v.get('net_pnl_inr', 0):+,.0f}",
-                "AI Score Adjustment": f"{v.get('score_adj', 0):+.1f} pts",
+                "Net P&L": f"₹{v.get('net_pnl_inr', 0):+,.0f}",
+                "Score Boost": f"{v.get('score_adj', 0):+.1f} pts",
             }
             for k, v in sess_mem.items()
         ]
         st.dataframe(pd.DataFrame(sess_rows), use_container_width=True, hide_index=True)
 
 with tab4:
-    st.subheader("Latest AI Watchlist Snapshot")
+    st.subheader("🌅 Morning Watchlist")
     if not watchlist_data:
-        st.info("Watchlist updates automatically during market scans.")
+        st.info("Watchlist updates automatically during market prep and intraday scans.")
     else:
-        st.dataframe(pd.DataFrame(watchlist_data), use_container_width=True, hide_index=True)
+        wl_df = pd.DataFrame(watchlist_data)
+        if search_query and "symbol" in wl_df.columns:
+            wl_df = wl_df[wl_df["symbol"].astype(str).str.upper().str.contains(search_query, na=False)]
+        st.dataframe(wl_df, use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------
+# FOOTER
+# ---------------------------------------------------------
+st.markdown(
+    f"""
+    <div class="app-footer">
+        <strong>PulseAI NSE Portfolio Monitor</strong> • Repo: <code>{_get_repo_slug()}</code> •
+        Intraday session runs Mon–Fri (09:15–15:25 IST; mandatory square-off from 15:15 IST; NSE closed on listed holidays such as 24 Nov 2026).<br/>
+        <em>Disclaimer: This dashboard tracks automated model paper/simulation state and analytical signals for research & learning—not SEBI-registered investment advice.</em>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 if auto_live_sync:
     time.sleep(30)
