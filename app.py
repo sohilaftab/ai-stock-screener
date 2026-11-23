@@ -200,6 +200,23 @@ st.markdown(
             margin-top: 2px;
         }
 
+        /* Filtered P&L Strip */
+        .filter-summary-box {
+            background: #121826;
+            border: 1px solid rgba(56, 189, 248, 0.22);
+            border-radius: 16px;
+            padding: 14px 16px;
+            margin-top: 10px;
+            margin-bottom: 14px;
+        }
+
+        .filter-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+            gap: 10px;
+            margin-top: 8px;
+        }
+
         /* Mobile-Friendly Trade Position Card */
         .trade-card {
             background: #121826;
@@ -497,6 +514,14 @@ def humanize_archetype(arch_name: str) -> str:
     return mapping.get(str(arch_name).upper(), str(arch_name).replace("_", " ").title())
 
 
+def _extract_trade_date_str(trade: dict) -> str:
+    raw_d = str(trade.get("date") or trade.get("entry_date") or "").strip()
+    if raw_d:
+        return raw_d[:10]
+    raw_ts = str(trade.get("entry_time") or trade.get("timestamp") or "").strip()
+    return raw_ts[:10] if len(raw_ts) >= 10 else ""
+
+
 if "pulse_engine" not in st.session_state:
     st.session_state.pulse_engine = AdaptiveTradeEngine()
 
@@ -657,7 +682,7 @@ def render_live_app():
         st.warning(f"⚡ **Market Shift Alert:** {drift_msg}")
 
     # ---------------------------------------------------------
-    # MOBILE-FRIENDLY SEARCH & QUICK FILTER BAR
+    # MOBILE-FRIENDLY SEARCH, DATE & QUICK FILTER BAR
     # ---------------------------------------------------------
     st.markdown("#### 🔎 Find Trades")
     q_col1, q_col2 = st.columns([2, 1])
@@ -676,7 +701,22 @@ def render_live_app():
             key="quick_filter",
         )
 
+    available_dates = sorted(
+        {d for d in (_extract_trade_date_str(t) for t in trades) if d},
+        reverse=True,
+    )
+    selected_dates = st.multiselect(
+        "Filter by Single or Multiple Dates (leave empty for all days)",
+        options=available_dates,
+        default=[],
+        placeholder="Select one or more dates (e.g. 2026-11-23)",
+        key="selected_trade_dates",
+    )
+    selected_date_set = set(selected_dates)
+
     def _keep_trade(t: dict, is_open: bool) -> bool:
+        if selected_date_set and _extract_trade_date_str(t) not in selected_date_set:
+            return False
         if quick_filter == "Open Only" and not is_open:
             return False
         if quick_filter == "Settled Only" and is_open:
@@ -700,6 +740,49 @@ def render_live_app():
     f_open = [t for t in open_trades if _keep_trade(t, True)]
     f_closed = [t for t in closed_trades if _keep_trade(t, False)]
 
+    # Dynamic Profit / Loss summary for the currently applied filter(s)
+    f_closed_pnl = sum(float(t.get("pnl_inr", 0.0)) for t in f_closed)
+    f_open_pnl = sum(float(t.get("unrealized_pnl_inr", 0.0)) for t in f_open)
+    f_combined_pnl = f_closed_pnl + f_open_pnl
+    f_wins = sum(1 for t in f_closed if float(t.get("pnl_inr", 0.0)) > 0)
+    f_win_rate = (f_wins / len(f_closed) * 100.0) if f_closed else 0.0
+    comb_color = "#34d399" if f_combined_pnl >= 0 else "#fb7185"
+    closed_color = "#34d399" if f_closed_pnl >= 0 else "#fb7185"
+
+    if selected_dates:
+        date_scope_label = f"Selected Date{'s' if len(selected_dates) > 1 else ''}: {', '.join(selected_dates)}"
+    else:
+        date_scope_label = "All Recorded Dates"
+
+    st.markdown(
+        f"""
+        <div class="filter-summary-box">
+            <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:6px;">
+                <span style="font-size:0.82rem; font-weight:700; color:#e2e8f0;">📋 Filtered P&L Summary • {date_scope_label}</span>
+                <span style="font-size:0.74rem; color:#94a3b8;">{len(f_open) + len(f_closed)} matching trade(s)</span>
+            </div>
+            <div class="filter-summary-grid">
+                <div class="stat-box">
+                    <div class="stat-box-title">Total Filtered P&L</div>
+                    <div class="stat-box-val" style="color:{comb_color};">₹{f_combined_pnl:+,.0f}</div>
+                    <div class="stat-box-sub">Settled + Open in filter</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-box-title">Settled P&L (Filter)</div>
+                    <div class="stat-box-val" style="color:{closed_color};">₹{f_closed_pnl:+,.0f}</div>
+                    <div class="stat-box-sub">{len(f_closed)} settled trade(s)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-box-title">Filter Win Rate</div>
+                    <div class="stat-box-val">{f_win_rate:.1f}%</div>
+                    <div class="stat-box-sub">{f_wins} winning settled</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # ---------------------------------------------------------
     # PRIMARY APP TABS
     # ---------------------------------------------------------
@@ -715,7 +798,7 @@ def render_live_app():
     with t_positions:
         st.markdown(f"**Active Positions ({len(f_open)})**")
         if not f_open:
-            st.info("No active positions right now. All intraday positions close automatically by 15:15 IST.")
+            st.info("No active positions match the selected filter.")
         else:
             if view_mode == "Mobile App Cards":
                 for t in f_open:
@@ -754,7 +837,7 @@ def render_live_app():
                                 <div>
                                     <span class="tc-sym">{sym}</span>
                                     <span class="side-pill" style="background:{side_bg}; color:{side_fg}; margin-left:6px;">{action}</span>
-                                    <div class="tc-sector">{sec} • {qty} shares (₹{invested:,.0f})</div>
+                                    <div class="tc-sector">{_extract_trade_date_str(t) or "—"} • {sec} • {qty} shares (₹{invested:,.0f})</div>
                                 </div>
                                 <div class="tc-pnl-wrap">
                                     <div class="tc-pnl" style="color:{pnl_fg};">₹{unrl:+,.0f}</div>
@@ -791,6 +874,7 @@ def render_live_app():
             else:
                 table_rows = [
                     {
+                        "Date": _extract_trade_date_str(t) or "—",
                         "Stock": str(t.get("symbol", "")).replace(".NS", ""),
                         "Side": t.get("action", "BUY"),
                         "Qty": int(t.get("qty", 0)),
@@ -807,7 +891,7 @@ def render_live_app():
         st.write("")
         st.markdown(f"**Settled History ({len(f_closed)})**")
         if not f_closed:
-            st.caption("No settled trades yet. Closed trades appear here with net after-tax P&L and what the AI learned.")
+            st.caption("No settled trades match the selected filter.")
         else:
             if view_mode == "Mobile App Cards":
                 for t in reversed(f_closed[-25:]):
@@ -833,7 +917,7 @@ def render_live_app():
                                 <div>
                                     <span class="tc-sym">{sym}</span>
                                     <span class="side-pill" style="background:{badge_bg}; color:{pnl_fg}; margin-left:6px;">{status_txt}</span>
-                                    <div class="tc-sector">{t.get("date", "—")} • {sec} • {action}</div>
+                                    <div class="tc-sector">{_extract_trade_date_str(t) or "—"} • {sec} • {action}</div>
                                 </div>
                                 <div class="tc-pnl-wrap">
                                     <div class="tc-pnl" style="color:{pnl_fg};">₹{pnl:+,.0f} ({pnl_pct:+.2f}%)</div>
@@ -862,7 +946,7 @@ def render_live_app():
             else:
                 c_rows = [
                     {
-                        "Date": t.get("date", "—"),
+                        "Date": _extract_trade_date_str(t) or "—",
                         "Stock": str(t.get("symbol", "")).replace(".NS", ""),
                         "Side": t.get("action", "BUY"),
                         "Entry (₹)": round(float(t.get("entry_price", 0)), 2),
@@ -909,14 +993,15 @@ def render_live_app():
             st.info("Daily equity curve updates automatically as trading sessions complete.")
 
         st.markdown("**Trade-by-Trade Profit & Loss**")
-        if closed_trades:
+        chart_source_trades = f_closed if selected_dates else closed_trades
+        if chart_source_trades:
             pnl_df = pd.DataFrame([
                 {
-                    "Trade": f"{str(t.get('symbol', '')).replace('.NS', '')} ({str(t.get('date', ''))[-5:]})",
+                    "Trade": f"{str(t.get('symbol', '')).replace('.NS', '')} ({_extract_trade_date_str(t)[-5:]})",
                     "Net P&L (₹)": round(float(t.get("pnl_inr", 0.0)), 2),
                     "Result": "Win" if float(t.get("pnl_inr", 0.0)) >= 0 else "Loss",
                 }
-                for t in closed_trades[-15:]
+                for t in chart_source_trades[-15:]
             ])
             bar_chart = (
                 alt.Chart(pnl_df)
@@ -938,7 +1023,7 @@ def render_live_app():
             )
             st.altair_chart(bar_chart)
         else:
-            st.caption("Profit/loss bars appear once trades settle.")
+            st.caption("Profit/loss bars appear once settled trades match the selected view.")
 
         st.markdown("**Market & Capital Breakdown**")
         st.caption(
