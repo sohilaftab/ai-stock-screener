@@ -1,25 +1,25 @@
 {
-  "volume_weight": 0.253,
-  "sentiment_weight": 0.31,
-  "premarket_weight": 0.231,
-  "momentum_weight": 0.206,
-  "risk_per_trade_pct": 0.6,
-  "min_conviction_threshold": 52.0,
-  "atr_sl_multiplier": 0.72,
+  "volume_weight": 0.269,
+  "sentiment_weight": 0.294,
+  "premarket_weight": 0.221,
+  "momentum_weight": 0.216,
+  "risk_per_trade_pct": 0.85,
+  "min_conviction_threshold": 68.0,
+  "atr_sl_multiplier": 0.59,
   "atr_tp_multiplier": 1.4,
   "buy_rsi_ceiling": 72.0,
   "short_rsi_floor": 28.0,
   "buy_bias_bonus": 0.0,
   "short_bias_bonus": -6.0,
   "max_profit_giveback_pct": 45.0,
-  "learned_max_hold_mins": 180.0,
+  "learned_max_hold_mins": 240.0,
   "bandit_arms": {
     "MOMENTUM_BREAKOUT": {
-      "alpha": 2.84,
-      "beta": 2.0,
-      "trades": 0,
-      "wins": 0,
-      "net_pnl_inr": 0.0
+      "alpha": 4.565,
+      "beta": 2.884,
+      "trades": 4,
+      "wins": 3,
+      "net_pnl_inr": 309.49
     },
     "NEWS_CATALYST": {
       "alpha": 2.0,
@@ -36,11 +36,11 @@
       "net_pnl_inr": 0.0
     },
     "RELATIVE_STRENGTH_LEADER": {
-      "alpha": 2.0,
+      "alpha": 3.23,
       "beta": 2.408,
-      "trades": 0,
-      "wins": 0,
-      "net_pnl_inr": 0.0
+      "trades": 1,
+      "wins": 1,
+      "net_pnl_inr": 780.99
     }
   },
   "archetype_memory": {
@@ -53,17 +53,25 @@
       "score_adj": 1.5
     },
     "MOMENTUM_MOVER": {
-      "weighted_wins": 1.7,
-      "weighted_losses": 1.35,
+      "weighted_wins": 5.7,
+      "weighted_losses": 2.35,
       "sl_hits": 1,
-      "trades": 0,
-      "sl_mult_adj": 1.0,
-      "score_adj": 1.1
+      "trades": 5,
+      "sl_mult_adj": 0.95,
+      "score_adj": 4.2
     }
   },
   "shadow_samples_learned": 4,
   "ml_model_summary": "Collecting walk-forward samples",
-  "session_memory": {},
+  "session_memory": {
+    "MORNING_TREND (09:45-11:30)": {
+      "trades": 10,
+      "wins": 4,
+      "net_pnl_inr": -1089.72,
+      "score_adj": -2.5,
+      "win_rate": 40.0
+    }
+  },
   "ticker_memory": {
     "TMPV": {
       "trades": 1,
@@ -99,18 +107,113 @@
       "losses": 1,
       "net_pnl_inr": -484.24,
       "win_rate": 0.0
+    },
+    "TATASTEEL": {
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "net_pnl_inr": 780.99,
+      "win_rate": 100.0
+    },
+    "HDFCBANK": {
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "net_pnl_inr": 367.62,
+      "win_rate": 100.0
+    },
+    "IOC": {
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "net_pnl_inr": 300.83,
+      "win_rate": 100.0
+    },
+    "TECHM": {
+      "trades": 1,
+      "wins": 0,
+      "losses": 1,
+      "net_pnl_inr": -409.38,
+      "win_rate": 0.0
+    },
+    "CANBK": {
+      "trades": 1,
+      "wins": 1,
+      "losses": 0,
+      "net_pnl_inr": 50.42,
+      "win_rate": 100.0
     }
   },
   "blacklisted_tickers": [],
-  "preferred_tickers": [],
-  "trade_lessons_log": [],
+  "preferred_tickers": [
+    "TATASTEEL",
+    "HDFCBANK",
+    "IOC"
+  ],
+  "trade_lessons_log": [
+    {
+      "timestamp": "2026-11-23 04:08 PM IST",
+      "symbol": "CANBK",
+      "pnl_inr": 50.42,
+      "session": "MORNING_TREND (09:45-11:30)",
+      "regime": "BEAR_TREND",
+      "arm": "MOMENTUM_BREAKOUT",
+      "archetype": "MOMENTUM_MOVER",
+      "emotion_at_exit": "NEUTRAL",
+      "lesson": "WINNING EDGE (CANBK SELL (SHORT), +\u20b950 net in 352m): Reinforced MOMENTUM_BREAKOUT on MOMENTUM_MOVER [BEAR_TREND]."
+    },
+    {
+      "timestamp": "2026-11-23 04:08 PM IST",
+      "symbol": "TECHM",
+      "pnl_inr": -409.38,
+      "session": "MORNING_TREND (09:45-11:30)",
+      "regime": "BEAR_TREND",
+      "arm": "MOMENTUM_BREAKOUT",
+      "archetype": "MOMENTUM_MOVER",
+      "emotion_at_exit": "NEUTRAL",
+      "lesson": "MISTAKE AUTOPSY (TECHM BUY, \u20b9-409 net): Failed due to MOMENTUM_BREAKOUT on MOMENTUM_MOVER underperformed in MORNING_TREND (09:45-11:30) [BEAR_TREND]."
+    },
+    {
+      "timestamp": "2026-11-23 04:08 PM IST",
+      "symbol": "IOC",
+      "pnl_inr": 300.83,
+      "session": "MORNING_TREND (09:45-11:30)",
+      "regime": "BEAR_TREND",
+      "arm": "MOMENTUM_BREAKOUT",
+      "archetype": "MOMENTUM_MOVER",
+      "emotion_at_exit": "NEUTRAL",
+      "lesson": "WINNING EDGE (IOC SELL (SHORT), +\u20b9301 net in 352m): Reinforced MOMENTUM_BREAKOUT on MOMENTUM_MOVER [BEAR_TREND]."
+    },
+    {
+      "timestamp": "2026-11-23 04:08 PM IST",
+      "symbol": "HDFCBANK",
+      "pnl_inr": 367.62,
+      "session": "MORNING_TREND (09:45-11:30)",
+      "regime": "BEAR_TREND",
+      "arm": "MOMENTUM_BREAKOUT",
+      "archetype": "MOMENTUM_MOVER",
+      "emotion_at_exit": "NEUTRAL",
+      "lesson": "WINNING EDGE (HDFCBANK SELL (SHORT), +\u20b9368 net in 352m): Reinforced MOMENTUM_BREAKOUT on MOMENTUM_MOVER [BEAR_TREND]."
+    },
+    {
+      "timestamp": "2026-11-23 04:08 PM IST",
+      "symbol": "TATASTEEL",
+      "pnl_inr": 780.99,
+      "session": "MORNING_TREND (09:45-11:30)",
+      "regime": "BEAR_TREND",
+      "arm": "RELATIVE_STRENGTH_LEADER",
+      "archetype": "MOMENTUM_MOVER",
+      "emotion_at_exit": "NEUTRAL",
+      "lesson": "WINNING EDGE (TATASTEEL SELL (SHORT), +\u20b9781 net in 352m): Reinforced RELATIVE_STRENGTH_LEADER on MOMENTUM_MOVER [BEAR_TREND]."
+    }
+  ],
   "drift_alert": "",
   "last_market_regime": {
     "regime": "BEAR_TREND",
-    "nifty_ltp": 25635.5,
-    "nifty_chg_pct": -0.64,
-    "vix_ltp": 17.93,
-    "vix_chg_pct": 3.51,
+    "nifty_ltp": 25366.4,
+    "nifty_chg_pct": -1.68,
+    "vix_ltp": 17.7,
+    "vix_chg_pct": 2.18,
     "fii_net_cr": 10308.42,
     "dii_net_cr": -4859.8,
     "buy_adj": -9.0,
@@ -119,12 +222,12 @@
     "sl_multiplier_adj": 1.05,
     "global_macro": {
       "macro_regime": "RISK_OFF",
-      "brent_ltp": 90.01,
-      "brent_chg_pct": -2.77,
+      "brent_ltp": 89.27,
+      "brent_chg_pct": -3.56,
       "us10y_yield": 4.91,
       "us10y_bps_chg": -14.0,
-      "usdinr_ltp": 92.86,
-      "usdinr_chg_pct": -0.47,
+      "usdinr_ltp": 92.91,
+      "usdinr_chg_pct": -0.41,
       "nasdaq_chg_pct": -5.28,
       "sp500_chg_pct": -3.7,
       "macro_buy_adj": -4.0,
@@ -140,13 +243,13 @@
         "^CNXPHARMA": 1.5,
         "^CNXMETAL": -2.5
       },
-      "summary": "RISK_OFF | Brent $90.0 (-2.8%) | US10Y 4.91% (-14.0bps) | USD/INR 92.86 (-0.47%) | Nasdaq -5.28%",
-      "updated_at": "10:16 AM IST"
+      "summary": "RISK_OFF | Brent $89.3 (-3.6%) | US10Y 4.91% (-14.0bps) | USD/INR 92.91 (-0.41%) | Nasdaq -5.28%",
+      "updated_at": "04:08 PM IST"
     },
-    "updated_at": "10:16 AM IST"
+    "updated_at": "04:07 PM IST"
   },
-  "generation": 6,
-  "last_evaluated_count": 5,
-  "last_updated": "2026-11-16 06:52 PM",
-  "learning_notes": "Gen #6 (5 trades analyzed): Best Pillar=News AI (31%), Min Conviction=52.0, ATR SL=0.72x / TP=1.4x"
+  "generation": 11,
+  "last_evaluated_count": 10,
+  "last_updated": "2026-11-23 04:08 PM IST",
+  "learning_notes": "Gen #11 (10 real + 4 shadow): Top Arm=MOMENTUM_BREAKOUT (61%), Min Conv=68.0"
 }
