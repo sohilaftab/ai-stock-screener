@@ -5,5 +5,9 @@
   "DLF": "Real Estate",
   "POWERGRID": "Utilities",
   "AXISBANK": "Financial Services",
-  "APOLLOHOSP": "Healthcare"
+  "APOLLOHOSP": "Healthcare",
+  "TATASTEEL": "Basic Materials",
+  "IOC": "Energy",
+  "TECHM": "Technology",
+  "CANBK": "Financial Services"
 }

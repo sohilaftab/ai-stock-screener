@@ -15,7 +15,7 @@
   "learned_max_hold_mins": 180.0,
   "bandit_arms": {
     "MOMENTUM_BREAKOUT": {
-      "alpha": 2.0,
+      "alpha": 2.84,
       "beta": 2.0,
       "trades": 0,
       "wins": 0,
@@ -29,7 +29,7 @@
       "net_pnl_inr": 0.0
     },
     "PREMARKET_GAP": {
-      "alpha": 2.0,
+      "alpha": 2.39,
       "beta": 2.0,
       "trades": 0,
       "wins": 0,
@@ -37,14 +37,31 @@
     },
     "RELATIVE_STRENGTH_LEADER": {
       "alpha": 2.0,
-      "beta": 2.0,
+      "beta": 2.408,
       "trades": 0,
       "wins": 0,
       "net_pnl_inr": 0.0
     }
   },
-  "archetype_memory": {},
-  "shadow_samples_learned": 0,
+  "archetype_memory": {
+    "HIGH_VOL_MIDCAP": {
+      "weighted_wins": 1.35,
+      "weighted_losses": 1.0,
+      "sl_hits": 0,
+      "trades": 0,
+      "sl_mult_adj": 1.0,
+      "score_adj": 1.5
+    },
+    "MOMENTUM_MOVER": {
+      "weighted_wins": 1.7,
+      "weighted_losses": 1.35,
+      "sl_hits": 1,
+      "trades": 0,
+      "sl_mult_adj": 1.0,
+      "score_adj": 1.1
+    }
+  },
+  "shadow_samples_learned": 4,
   "ml_model_summary": "Collecting walk-forward samples",
   "session_memory": {},
   "ticker_memory": {
@@ -89,25 +106,25 @@
   "trade_lessons_log": [],
   "drift_alert": "",
   "last_market_regime": {
-    "regime": "BULL_TREND",
-    "nifty_ltp": 25800.6,
-    "nifty_chg_pct": 1.12,
-    "vix_ltp": 17.32,
-    "vix_chg_pct": 7.51,
+    "regime": "BEAR_TREND",
+    "nifty_ltp": 25635.5,
+    "nifty_chg_pct": -0.64,
+    "vix_ltp": 17.93,
+    "vix_chg_pct": 3.51,
     "fii_net_cr": 10308.42,
     "dii_net_cr": -4859.8,
-    "buy_adj": 5.0,
-    "short_adj": -5.5,
-    "size_multiplier": 0.85,
-    "sl_multiplier_adj": 1.0,
+    "buy_adj": -9.0,
+    "short_adj": 6.5,
+    "size_multiplier": 0.72,
+    "sl_multiplier_adj": 1.05,
     "global_macro": {
       "macro_regime": "RISK_OFF",
-      "brent_ltp": 89.95,
-      "brent_chg_pct": -2.21,
+      "brent_ltp": 90.01,
+      "brent_chg_pct": -2.77,
       "us10y_yield": 4.91,
       "us10y_bps_chg": -14.0,
-      "usdinr_ltp": 92.66,
-      "usdinr_chg_pct": -0.68,
+      "usdinr_ltp": 92.86,
+      "usdinr_chg_pct": -0.47,
       "nasdaq_chg_pct": -5.28,
       "sp500_chg_pct": -3.7,
       "macro_buy_adj": -4.0,
@@ -123,10 +140,10 @@
         "^CNXPHARMA": 1.5,
         "^CNXMETAL": -2.5
       },
-      "summary": "RISK_OFF | Brent $89.9 (-2.2%) | US10Y 4.91% (-14.0bps) | USD/INR 92.66 (-0.68%) | Nasdaq -5.28%",
-      "updated_at": "02:29 AM IST"
+      "summary": "RISK_OFF | Brent $90.0 (-2.8%) | US10Y 4.91% (-14.0bps) | USD/INR 92.86 (-0.47%) | Nasdaq -5.28%",
+      "updated_at": "10:16 AM IST"
     },
-    "updated_at": "02:29 AM IST"
+    "updated_at": "10:16 AM IST"
   },
   "generation": 6,
   "last_evaluated_count": 5,

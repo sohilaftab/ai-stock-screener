@@ -1,9 +1,13 @@
 {
   "initial_capital": 150000.0,
+  "manual_deposits": 0,
+  "total_capital_contributed": 150000.0,
+  "deposit_history": [],
   "current_equity": 147819.8,
-  "available_cash": 147819.8,
-  "allocated_capital": 0,
+  "available_cash": 18014.71,
+  "allocated_capital": 129805.09,
   "total_realized_pnl": -2180.2,
+  "total_taxes_paid": 0.0,
   "win_streak": 0,
   "loss_streak": 0,
   "mistakes_identified": [
