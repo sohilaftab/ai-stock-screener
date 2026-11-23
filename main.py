@@ -1,11 +1,12 @@
 import os
 import sys
-from dotenv import load_dotenv
-load_dotenv()
-
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from market_data import MarketDataScanner
 from sentiment_engine import FinBERTSentimentEngine
@@ -110,17 +111,17 @@ def run_autonomous_cycle(
 ):
     """
     Unified AI Decision Loop:
-    1. Evaluates all OPEN positions against live ticks, news emotion shifts, and profit-giveback rules.
-       Any closed position immediately triggers post-trade research and weight updates.
+    1. Evaluates all OPEN positions against live ticks, 15:15 IST square-off, news emotion shifts,
+       and profit-giveback rules; updates learning weights, walk-forward ML summary, and equity log.
     2. During live market hours, scans for fresh setups and enters ONLY if conviction, risk,
        microstructure, and session rules approve.
     """
     now_ist = datetime.now(IST)
     print(f"[PULSEAI] Running autonomous cycle at {now_ist.strftime('%Y-%m-%d %I:%M:%S %p IST')}")
 
-    actions = engine.manage_live_positions(notify_telegram=True)
-    if actions:
-        print(f"[PULSEAI] Executed {len(actions)} live position action(s).")
+    eval_res = engine.evaluate_open_trades_and_learn(notify_telegram=True)
+    if eval_res.get("message"):
+        print(f"[PULSEAI] Learning status: {eval_res['message']}")
 
     if is_live_market_hours(now_ist):
         perf = engine.get_performance_metrics()

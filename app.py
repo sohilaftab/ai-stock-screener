@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from trade_engine import AdaptiveTradeEngine
 
 IST = ZoneInfo("Asia/Kolkata")
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_REPO = "sohilaftab/ai-stock-screener"
 
 st.set_page_config(
     page_title="PulseAI — Autonomous NSE Portfolio",
@@ -82,31 +84,58 @@ st.markdown(
 )
 
 
-def _read_json_file(filename: str, default):
-    path = BASE_DIR / filename
-    if not path.exists():
-        return default
+def _get_repo_slug() -> str:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if "GITHUB_REPO" in st.secrets and st.secrets["GITHUB_REPO"]:
+            return str(st.secrets["GITHUB_REPO"]).strip()
+    except Exception:
+        pass
+    return os.getenv("GITHUB_REPO", DEFAULT_REPO).strip() or DEFAULT_REPO
+
+
+def _read_github_raw_json(filename: str, default):
+    repo = _get_repo_slug()
+    raw_url = f"https://raw.githubusercontent.com/{repo}/main/{filename}?t={int(datetime.now().timestamp())}"
+    try:
+        req = urllib.request.Request(raw_url, headers={"User-Agent": "PulseAI-Dashboard"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return default
 
 
-def refresh_engine_from_disk(eng: AdaptiveTradeEngine) -> AdaptiveTradeEngine:
-    eng.ledger = _read_json_file("trade_history.json", [])
-    eng.portfolio = _read_json_file("portfolio_state.json", eng.portfolio)
-    eng.weights = _read_json_file("model_weights.json", eng.weights)
-    eng.shadow_ledger = _read_json_file("shadow_ledger.json", getattr(eng, "shadow_ledger", []))
-    eng.sector_cache = _read_json_file("sector_cache.json", getattr(eng, "sector_cache", {}))
+def _read_json_file(filename: str, default, fetch_remote: bool = True):
+    path = BASE_DIR / filename
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    if fetch_remote:
+        return _read_github_raw_json(filename, default)
+    return default
+
+
+def refresh_engine_from_disk(eng: AdaptiveTradeEngine, fetch_remote: bool = True) -> AdaptiveTradeEngine:
+    eng.ledger = _read_json_file("trade_history.json", [], fetch_remote=fetch_remote)
+    eng.portfolio = _read_json_file("portfolio_state.json", eng.portfolio, fetch_remote=fetch_remote)
+    eng.weights = _read_json_file("model_weights.json", eng.weights, fetch_remote=fetch_remote)
+    eng.shadow_ledger = _read_json_file("shadow_ledger.json", getattr(eng, "shadow_ledger", []), fetch_remote=fetch_remote)
+    eng.sector_cache = _read_json_file("sector_cache.json", getattr(eng, "sector_cache", {}), fetch_remote=fetch_remote)
     if hasattr(eng, "_recalculate_cash") and isinstance(eng.portfolio, dict):
         eng._recalculate_cash(eng.portfolio)
     return eng
 
 
 def persist_portfolio_to_github(portfolio_dict: dict) -> bool:
-    token = st.secrets.get("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", ""))
-    repo = st.secrets.get("GITHUB_REPO", "sohilaftab/ai-stock-screener")
+    token = ""
+    try:
+        token = st.secrets.get("GITHUB_TOKEN", "")
+    except Exception:
+        token = ""
+    token = token or os.getenv("GITHUB_TOKEN", "")
+    repo = _get_repo_slug()
     if not token:
         return False
 
@@ -152,7 +181,7 @@ def get_regime_style(regime_name: str):
 if "pulse_engine" not in st.session_state:
     st.session_state.pulse_engine = AdaptiveTradeEngine()
 
-engine = refresh_engine_from_disk(st.session_state.pulse_engine)
+engine = refresh_engine_from_disk(st.session_state.pulse_engine, fetch_remote=True)
 perf = engine.get_performance_metrics()
 trades = engine.ledger
 open_trades = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
@@ -191,7 +220,7 @@ fii_str = f" • FII Net ₹{fii_net:+,.0f} Cr" if fii_net != 0 else ""
 regime_badge_text = f"{r_icon} Regime: {regime_name} • {nifty_str} • VIX {vix_ltp:.2f}{fii_str}"
 
 watchlist_data = []
-raw_wl = _read_json_file("morning_watchlist.json", [])
+raw_wl = _read_json_file("morning_watchlist.json", [], fetch_remote=True)
 watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else (raw_wl if isinstance(raw_wl, list) else [])
 
 # ---------------------------------------------------------
@@ -199,6 +228,7 @@ watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else (raw_w
 # ---------------------------------------------------------
 with st.sidebar:
     st.markdown("### 💼 Wallet Summary")
+    auto_live_sync = st.toggle("⚡ Auto-Refresh Every 30s", value=True, key="auto_live_sync")
     if st.button("🔄 Reload Disk State Now", use_container_width=True):
         st.rerun()
 
@@ -505,3 +535,7 @@ with tab4:
         st.info("Watchlist updates automatically during market scans.")
     else:
         st.dataframe(pd.DataFrame(watchlist_data), use_container_width=True, hide_index=True)
+
+if auto_live_sync:
+    time.sleep(30)
+    st.rerun()
