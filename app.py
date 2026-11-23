@@ -3,7 +3,7 @@ import json
 import os
 import time
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -514,12 +514,33 @@ def humanize_archetype(arch_name: str) -> str:
     return mapping.get(str(arch_name).upper(), str(arch_name).replace("_", " ").title())
 
 
-def _extract_trade_date_str(trade: dict) -> str:
+def _extract_trade_date(trade: dict) -> date | None:
     raw_d = str(trade.get("date") or trade.get("entry_date") or "").strip()
-    if raw_d:
-        return raw_d[:10]
     raw_ts = str(trade.get("entry_time") or trade.get("timestamp") or "").strip()
-    return raw_ts[:10] if len(raw_ts) >= 10 else ""
+    candidate = raw_d[:10] if raw_d else (raw_ts[:10] if len(raw_ts) >= 10 else "")
+    if not candidate:
+        return None
+    try:
+        return date.fromisoformat(candidate)
+    except ValueError:
+        return None
+
+
+def _normalize_date_range(picker_value) -> tuple[date | None, date | None]:
+    if isinstance(picker_value, date):
+        return picker_value, picker_value
+    if isinstance(picker_value, (list, tuple)):
+        if len(picker_value) == 0:
+            return None, None
+        if len(picker_value) == 1:
+            d0 = picker_value[0] if isinstance(picker_value[0], date) else None
+            return d0, d0
+        d_start = picker_value[0] if isinstance(picker_value[0], date) else None
+        d_end = picker_value[1] if isinstance(picker_value[1], date) else d_start
+        if d_start and d_end and d_start > d_end:
+            d_start, d_end = d_end, d_start
+        return d_start, d_end
+    return None, None
 
 
 if "pulse_engine" not in st.session_state:
@@ -602,6 +623,7 @@ def render_live_app():
     watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else (raw_wl if isinstance(raw_wl, list) else [])
 
     now_ist_dt = datetime.now(IST)
+    today_ist_date = now_ist_dt.date()
     now_ist_str = now_ist_dt.strftime("%d %b %Y • %I:%M %p IST")
     mins_now = now_ist_dt.hour * 60 + now_ist_dt.minute
     market_open_now = (now_ist_dt.weekday() < 5) and ((9 * 60 + 15) <= mins_now <= (15 * 60 + 30))
@@ -682,7 +704,7 @@ def render_live_app():
         st.warning(f"⚡ **Market Shift Alert:** {drift_msg}")
 
     # ---------------------------------------------------------
-    # MOBILE-FRIENDLY SEARCH, DATE & QUICK FILTER BAR
+    # MOBILE-FRIENDLY SEARCH, CALENDAR RANGE & QUICK FILTER BAR
     # ---------------------------------------------------------
     st.markdown("#### 🔎 Find Trades")
     q_col1, q_col2 = st.columns([2, 1])
@@ -701,22 +723,42 @@ def render_live_app():
             key="quick_filter",
         )
 
-    available_dates = sorted(
-        {d for d in (_extract_trade_date_str(t) for t in trades) if d},
-        reverse=True,
-    )
-    selected_dates = st.multiselect(
-        "Filter by Single or Multiple Dates (leave empty for all days)",
-        options=available_dates,
-        default=[],
-        placeholder="Select one or more dates (e.g. 2026-11-23)",
-        key="selected_trade_dates",
-    )
-    selected_date_set = set(selected_dates)
+    trade_dates = [d for d in (_extract_trade_date(t) for t in trades) if d is not None]
+    min_trade_date = min(trade_dates) if trade_dates else today_ist_date
+    max_trade_date = max(trade_dates + [today_ist_date])
+
+    d_col1, d_col2 = st.columns([2.4, 0.8])
+    with d_col1:
+        date_filter_enabled = st.checkbox(
+            "Filter by date range (open calendar to pick From → To dates)",
+            value=False,
+            key="date_filter_enabled",
+        )
+        picked_range = st.date_input(
+            "Select From and To Dates",
+            value=(min_trade_date, max_trade_date),
+            min_value=min_trade_date,
+            max_value=max_trade_date,
+            format="YYYY-MM-DD",
+            disabled=not date_filter_enabled,
+            key="trade_date_range",
+        )
+    with d_col2:
+        st.write("")
+        st.write("")
+        if st.button("Reset Filters", use_container_width=True, key="reset_trade_filters"):
+            st.session_state.search_query = ""
+            st.session_state.quick_filter = "All Trades"
+            st.session_state.date_filter_enabled = False
+            st.rerun()
+
+    start_date, end_date = _normalize_date_range(picked_range) if date_filter_enabled else (None, None)
 
     def _keep_trade(t: dict, is_open: bool) -> bool:
-        if selected_date_set and _extract_trade_date_str(t) not in selected_date_set:
-            return False
+        if date_filter_enabled and start_date is not None and end_date is not None:
+            t_date = _extract_trade_date(t)
+            if t_date is None or not (start_date <= t_date <= end_date):
+                return False
         if quick_filter == "Open Only" and not is_open:
             return False
         if quick_filter == "Settled Only" and is_open:
@@ -749,10 +791,13 @@ def render_live_app():
     comb_color = "#34d399" if f_combined_pnl >= 0 else "#fb7185"
     closed_color = "#34d399" if f_closed_pnl >= 0 else "#fb7185"
 
-    if selected_dates:
-        date_scope_label = f"Selected Date{'s' if len(selected_dates) > 1 else ''}: {', '.join(selected_dates)}"
+    if date_filter_enabled and start_date and end_date:
+        if start_date == end_date:
+            date_scope_label = f"Date: {start_date.isoformat()}"
+        else:
+            date_scope_label = f"From {start_date.isoformat()} → To {end_date.isoformat()}"
     else:
-        date_scope_label = "All Recorded Dates"
+        date_scope_label = "All Dates"
 
     st.markdown(
         f"""
@@ -822,6 +867,8 @@ def render_live_app():
                     orb_s = str(t.get("orb_signal", "INSIDE_ORB"))
                     mtf_s = str(t.get("mtf_15m_trend", "NEUTRAL"))
                     arm_raw = str(t.get("strategy_arm", "MOMENTUM_BREAKOUT"))
+                    t_d = _extract_trade_date(t)
+                    d_str = t_d.isoformat() if t_d else "—"
 
                     pnl_fg = "#34d399" if unrl >= 0 else "#fb7185"
                     setup_txt = f"{mtf_s} / {orb_s}" if show_quant_jargon else humanize_signal(orb_s, mtf_s)
@@ -837,7 +884,7 @@ def render_live_app():
                                 <div>
                                     <span class="tc-sym">{sym}</span>
                                     <span class="side-pill" style="background:{side_bg}; color:{side_fg}; margin-left:6px;">{action}</span>
-                                    <div class="tc-sector">{_extract_trade_date_str(t) or "—"} • {sec} • {qty} shares (₹{invested:,.0f})</div>
+                                    <div class="tc-sector">{d_str} • {sec} • {qty} shares (₹{invested:,.0f})</div>
                                 </div>
                                 <div class="tc-pnl-wrap">
                                     <div class="tc-pnl" style="color:{pnl_fg};">₹{unrl:+,.0f}</div>
@@ -874,7 +921,7 @@ def render_live_app():
             else:
                 table_rows = [
                     {
-                        "Date": _extract_trade_date_str(t) or "—",
+                        "Date": (_extract_trade_date(t).isoformat() if _extract_trade_date(t) else "—"),
                         "Stock": str(t.get("symbol", "")).replace(".NS", ""),
                         "Side": t.get("action", "BUY"),
                         "Qty": int(t.get("qty", 0)),
@@ -906,6 +953,8 @@ def render_live_app():
                     hold_m = float(t.get("hold_minutes", 0))
                     status_txt = str(t.get("status", "CLOSED"))
                     lesson = str(t.get("mistake_diagnosis", "Trade settled cleanly.")).strip()
+                    t_d = _extract_trade_date(t)
+                    d_str = t_d.isoformat() if t_d else "—"
 
                     pnl_fg = "#34d399" if pnl >= 0 else "#fb7185"
                     badge_bg = "rgba(16, 185, 129, 0.16)" if pnl >= 0 else "rgba(244, 63, 94, 0.16)"
@@ -917,7 +966,7 @@ def render_live_app():
                                 <div>
                                     <span class="tc-sym">{sym}</span>
                                     <span class="side-pill" style="background:{badge_bg}; color:{pnl_fg}; margin-left:6px;">{status_txt}</span>
-                                    <div class="tc-sector">{_extract_trade_date_str(t) or "—"} • {sec} • {action}</div>
+                                    <div class="tc-sector">{d_str} • {sec} • {action}</div>
                                 </div>
                                 <div class="tc-pnl-wrap">
                                     <div class="tc-pnl" style="color:{pnl_fg};">₹{pnl:+,.0f} ({pnl_pct:+.2f}%)</div>
@@ -946,7 +995,7 @@ def render_live_app():
             else:
                 c_rows = [
                     {
-                        "Date": _extract_trade_date_str(t) or "—",
+                        "Date": (_extract_trade_date(t).isoformat() if _extract_trade_date(t) else "—"),
                         "Stock": str(t.get("symbol", "")).replace(".NS", ""),
                         "Side": t.get("action", "BUY"),
                         "Entry (₹)": round(float(t.get("entry_price", 0)), 2),
@@ -993,11 +1042,11 @@ def render_live_app():
             st.info("Daily equity curve updates automatically as trading sessions complete.")
 
         st.markdown("**Trade-by-Trade Profit & Loss**")
-        chart_source_trades = f_closed if selected_dates else closed_trades
+        chart_source_trades = f_closed if date_filter_enabled else closed_trades
         if chart_source_trades:
             pnl_df = pd.DataFrame([
                 {
-                    "Trade": f"{str(t.get('symbol', '')).replace('.NS', '')} ({_extract_trade_date_str(t)[-5:]})",
+                    "Trade": f"{str(t.get('symbol', '')).replace('.NS', '')} ({(_extract_trade_date(t).isoformat()[-5:] if _extract_trade_date(t) else '')})",
                     "Net P&L (₹)": round(float(t.get("pnl_inr", 0.0)), 2),
                     "Result": "Win" if float(t.get("pnl_inr", 0.0)) >= 0 else "Loss",
                 }
