@@ -3,6 +3,7 @@ import json
 import os
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -10,6 +11,7 @@ import streamlit as st
 from trade_engine import AdaptiveTradeEngine
 
 IST = ZoneInfo("Asia/Kolkata")
+BASE_DIR = Path(__file__).resolve().parent
 
 st.set_page_config(
     page_title="PulseAI — Autonomous NSE Portfolio",
@@ -80,6 +82,28 @@ st.markdown(
 )
 
 
+def _read_json_file(filename: str, default):
+    path = BASE_DIR / filename
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def refresh_engine_from_disk(eng: AdaptiveTradeEngine) -> AdaptiveTradeEngine:
+    eng.ledger = _read_json_file("trade_history.json", [])
+    eng.portfolio = _read_json_file("portfolio_state.json", eng.portfolio)
+    eng.weights = _read_json_file("model_weights.json", eng.weights)
+    eng.shadow_ledger = _read_json_file("shadow_ledger.json", getattr(eng, "shadow_ledger", []))
+    eng.sector_cache = _read_json_file("sector_cache.json", getattr(eng, "sector_cache", {}))
+    if hasattr(eng, "_recalculate_cash") and isinstance(eng.portfolio, dict):
+        eng._recalculate_cash(eng.portfolio)
+    return eng
+
+
 def persist_portfolio_to_github(portfolio_dict: dict) -> bool:
     token = st.secrets.get("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", ""))
     repo = st.secrets.get("GITHUB_REPO", "sohilaftab/ai-stock-screener")
@@ -125,7 +149,10 @@ def get_regime_style(regime_name: str):
     return "⚪", "rgba(148, 163, 184, 0.16)", "#cbd5e1", "rgba(148, 163, 184, 0.35)"
 
 
-engine = AdaptiveTradeEngine()
+if "pulse_engine" not in st.session_state:
+    st.session_state.pulse_engine = AdaptiveTradeEngine()
+
+engine = refresh_engine_from_disk(st.session_state.pulse_engine)
 perf = engine.get_performance_metrics()
 trades = engine.ledger
 open_trades = [t for t in trades if str(t.get("status", "")).upper() == "OPEN"]
@@ -164,19 +191,17 @@ fii_str = f" • FII Net ₹{fii_net:+,.0f} Cr" if fii_net != 0 else ""
 regime_badge_text = f"{r_icon} Regime: {regime_name} • {nifty_str} • VIX {vix_ltp:.2f}{fii_str}"
 
 watchlist_data = []
-if os.path.exists("morning_watchlist.json"):
-    try:
-        with open("morning_watchlist.json", "r", encoding="utf-8") as f:
-            raw_wl = json.load(f)
-            watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else raw_wl
-    except Exception:
-        watchlist_data = []
+raw_wl = _read_json_file("morning_watchlist.json", [])
+watchlist_data = raw_wl.get("items", []) if isinstance(raw_wl, dict) else (raw_wl if isinstance(raw_wl, list) else [])
 
 # ---------------------------------------------------------
 # SIDEBAR: WALLET, LIVE REGIME & USER-ONLY MANUAL DEPOSITS
 # ---------------------------------------------------------
 with st.sidebar:
     st.markdown("### 💼 Wallet Summary")
+    if st.button("🔄 Reload Disk State Now", use_container_width=True):
+        st.rerun()
+
     st.metric(
         label="Total Portfolio Value (After Taxes)",
         value=f"₹{current_eq:,.0f}",
