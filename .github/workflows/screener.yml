@@ -29,7 +29,7 @@ concurrency:
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout Repository
@@ -43,6 +43,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+
+      # FinBERT is ~440 MB; cache prevents re-downloading on every cycle
+      - name: Cache Hugging Face models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-finbert-v1
 
       - name: Install Dependencies
         run: |
@@ -85,8 +92,13 @@ jobs:
 
           if ! git diff --cached --quiet; then
             git commit -m "chore(pulseai): update portfolio, ledger, research audit & weights [${{ github.event.inputs.mode || 'autonomous_cycle' }}] [skip ci]"
-            git pull --rebase origin main
-            git push origin main
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push origin main && exit 0
+              git rebase --abort 2>/dev/null || true
+              sleep 3
+            done
+            echo "::error::Could not push state after 3 attempts"
+            exit 1
           else
             echo "No state changes to commit."
           fi
@@ -101,7 +113,12 @@ jobs:
             git add sent_alerts_log.json
             if ! git diff --cached --quiet; then
               git commit -m "chore(pulseai): log verified post-push Telegram alerts [skip ci]"
-              git pull --rebase origin main
-              git push origin main
+              for i in 1 2 3; do
+                git pull --rebase origin main && git push origin main && exit 0
+                git rebase --abort 2>/dev/null || true
+                sleep 3
+              done
+              echo "::error::Could not push sent_alerts_log.json after 3 attempts"
+              exit 1
             fi
           fi

@@ -18,8 +18,9 @@ from audit_tracker import (
 )
 from market_data import MarketDataScanner
 from sentiment_engine import FinBERTSentimentEngine
+from state_store import StateCorruptionError
 from telegram_notifier import TelegramNotifier
-from trade_engine import AdaptiveTradeEngine
+from trade_engine import AdaptiveTradeEngine, EARLIEST_ENTRY_MIN, LATEST_ENTRY_MIN
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -62,18 +63,19 @@ def is_premarket_window(now_ist: datetime) -> bool:
 
 def is_entry_window_open(now_ist: datetime) -> bool:
     mins = now_ist.hour * 60 + now_ist.minute
-    # New entries strictly from 09:15 AM to 03:05 PM IST (10 min buffer before 15:15 square-off)
-    return (9 * 60 + 15) <= mins <= (15 * 60 + 5)
+    # Matches trade_engine.py: 09:30 AM to 02:30 PM IST (ORB formed + buffer before 15:15 square-off)
+    return EARLIEST_ENTRY_MIN <= mins < LATEST_ENTRY_MIN
+
+
+def is_live_market_hours(now_ist: datetime) -> bool:
+    """Backward-compatible alias used by worker.py (09:15-15:25 IST session)."""
+    mins = now_ist.hour * 60 + now_ist.minute
+    return (9 * 60 + 15) <= mins <= (15 * 60 + 25)
 
 
 def is_eod_window(now_ist: datetime) -> bool:
     mins = now_ist.hour * 60 + now_ist.minute
     return mins >= (15 * 60 + 30)
-
-
-def is_live_market_hours(now_ist: datetime) -> bool:
-    """Backward-compatible alias used by worker.py."""
-    return is_entry_window_open(now_ist)
 
 
 def _today_skip_reasons(engine: AdaptiveTradeEngine, today_str: str) -> dict[str, str]:
@@ -128,8 +130,8 @@ def scan_and_score_market(
                         if ai_conf <= 1.0:
                             ai_conf *= 100.0
                         top_headline = str(s_res.get("headline", s_res.get("top_headline", top_headline)))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[SENTIMENT WARN] {sym}: {type(e).__name__}: {e}")
             rec["raw_sentiment"] = raw_sent
             rec["AI Confidence"] = round(max(10.0, min(99.0, ai_conf)), 1)
             rec["Why Is It Moving? (Latest News)"] = top_headline
@@ -187,7 +189,7 @@ def _record_and_notify_entries(
 def run_eod_routine(
     engine: AdaptiveTradeEngine,
     notifier: TelegramNotifier,
-    today_str: str,
+    today_str: str | None = None,
     force_summary: bool = False,
 ):
     """
@@ -196,25 +198,18 @@ def run_eod_routine(
     2. Retrains Walk-Forward ML model on updated live + shadow ledgers.
     3. Saves weights & EOD audit marker and queues the post-push daily summary.
     """
+    today_str = today_str or datetime.now(IST).strftime("%Y-%m-%d")
     result = _evaluate_positions_and_notify_exits(engine, notifier)
-    ml_info = engine.ml_model.train_walk_forward(engine.ledger, engine.shadow_ledger)
-    if hasattr(engine, "_save_weights"):
-        try:
-            engine._save_weights()
-        except Exception:
-            pass
-
     perf = engine.get_performance_metrics()
-    samples_ct = ml_info.get("samples_count", 0)
-    min_req = ml_info.get("min_required", 60)
-    wf_auc = ml_info.get("wf_auc", 0.5)
+    pf = perf.get("profit_factor")
+    ml_summary = engine.weights.get("ml_model_summary", "Collecting samples")
 
     log_research_cycle(
         candidates=[],
         cycle_mode="eod",
         market_note=(
             f"EOD settlement & ML training complete. Equity Rs.{perf['current_equity']:,.2f}, "
-            f"Open={perf['open_trades']}, ML samples={samples_ct}/{min_req} (AUC {wf_auc:.2f})."
+            f"Open={perf['open_trades']}, PF={pf if pf is not None else 'n/a'}, ML={ml_summary}."
         ),
     )
 
@@ -224,11 +219,20 @@ def run_eod_routine(
         f"💼 <b>Total Wallet Equity:</b> <b>₹{perf['current_equity']:,.2f}</b> ({perf['total_pnl_pct']:+.2f}%)\n"
         f"💵 <b>Available Cash:</b> ₹{perf['available_cash']:,.2f} | <b>Open Positions:</b> {perf['open_trades']}\n"
         f"🎯 <b>Win Rate:</b> {perf['win_rate']}% ({perf['settled_trades']} settled)\n"
-        f"🤖 <b>Walk-Forward ML:</b> {samples_ct}/{min_req} samples (AUC {wf_auc:.2f})\n"
+        f"📐 <b>Profit Factor:</b> {pf if pf is not None else 'n/a'} | "
+        f"<b>Expectancy:</b> ₹{perf.get('expectancy_inr', 0.0):+,.0f}/trade | "
+        f"<b>Max DD:</b> {perf.get('max_drawdown_pct', 0.0)}%\n"
+        f"🧪 <b>Evidence:</b> <i>{perf.get('edge_confidence', '')}</i>\n"
+        f"🤖 <b>Walk-Forward ML:</b> {ml_summary}\n"
         f"🧠 <b>AI Evolution:</b> <i>{result['message']}</i>"
     )
     send_verified_eod_summary(notifier, eod_msg, today_str, force_resend=force_summary)
-    print(f"[PULSEAI] EOD complete for {today_str} | Equity Rs.{perf['current_equity']:,.2f} | ML {samples_ct}/{min_req}")
+    print(f"[PULSEAI] EOD complete for {today_str} | Equity Rs.{perf['current_equity']:,.2f} | ML: {ml_summary}")
+
+
+def run_eod(engine: AdaptiveTradeEngine, notifier: TelegramNotifier):
+    """Compatibility wrapper for worker.py."""
+    run_eod_routine(engine, notifier, today_str=datetime.now(IST).strftime("%Y-%m-%d"), force_summary=False)
 
 
 def run_autonomous_cycle(
@@ -266,6 +270,16 @@ def run_autonomous_cycle(
         print(f"[PULSEAI] Learning status: {eval_res['message']}")
 
     if is_entry_window_open(now_ist):
+        allowed, why = engine.entries_allowed(now_ist)
+        if not allowed:
+            log_research_cycle(
+                candidates=[],
+                cycle_mode="risk_gate",
+                market_note=f"New entries paused by risk circuit breaker: {why}",
+            )
+            print(f"[PULSEAI] New entries blocked: {why}")
+            return
+
         perf = engine.get_performance_metrics()
         if perf["available_cash"] >= 1000 and perf["open_trades"] < 5:
             enriched_df, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
@@ -279,7 +293,7 @@ def run_autonomous_cycle(
                 executed_symbols=executed_syms,
                 skip_reasons=skip_reasons,
                 cycle_mode="autonomous_cycle",
-                market_note="Live scan completed inside 09:15-15:05 IST entry window.",
+                market_note="Live scan completed inside 09:30-14:30 IST entry window.",
             )
             print(f"[PULSEAI] AI autonomously entered {len(new_trades)} verified trade(s).")
         else:
@@ -304,7 +318,7 @@ def run_autonomous_cycle(
         print("[PULSEAI] Pre-market research updated in webapp (no unexecuted Telegram alerts sent).")
 
     else:
-        note = "15:06-15:29 IST square-off window; managed/squared off open positions only."
+        note = "Outside 09:30-14:30 IST entry window; managed/squared off open positions only."
         log_research_cycle(candidates=[], cycle_mode="manage_only", market_note=note)
         print(f"[PULSEAI] {note}")
 
@@ -318,10 +332,17 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1].strip():
         mode = sys.argv[1].strip().lower()
 
-    engine = AdaptiveTradeEngine()
+    notifier = TelegramNotifier()
+    try:
+        engine = AdaptiveTradeEngine()
+    except StateCorruptionError as e:
+        msg = f"🛑 <b>PulseAI HALTED</b>: state file unreadable and no valid backup.\n{str(e)[:400]}"
+        print(msg)
+        notifier.send_message(msg, force=True)
+        sys.exit(2)
+
     scanner = MarketDataScanner()
     sentiment_ai = FinBERTSentimentEngine()
-    notifier = TelegramNotifier()
     today_str = now_ist.strftime("%Y-%m-%d")
 
     if mode in ("autonomous_cycle", "live_manage", "intraday"):
@@ -335,8 +356,9 @@ def main():
 
         new_trades = []
         if mode != "morning_prep" and is_entry_window_open(now_ist):
+            allowed, _ = engine.entries_allowed(now_ist)
             perf = engine.get_performance_metrics()
-            if perf["available_cash"] >= 1000 and perf["open_trades"] < 5:
+            if allowed and perf["available_cash"] >= 1000 and perf["open_trades"] < 5:
                 new_trades = _record_and_notify_entries(engine, rec_df, notifier)
 
         log_research_cycle(

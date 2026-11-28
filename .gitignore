@@ -3,3 +3,12 @@ __pycache__/
 .env
 *.pyc
 .DS_Store
+# --- PulseAI runtime artefacts ---
+*.bak
+*.tmp
+*.corrupt-*
+HALT_TRADING
+pending_telegram_alerts.json
+state_archive/
+backtest_output/
+.pytest_cache/
