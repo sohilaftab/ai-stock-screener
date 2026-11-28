@@ -52,21 +52,56 @@ jobs:
       - name: Execute PulseAI Engine
         env:
           RUN_MODE: ${{ github.event.inputs.mode || 'autonomous_cycle' }}
+          DEFER_TELEGRAM_UNTIL_PUSH: "1"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python main.py "${RUN_MODE}"
 
-      - name: Commit & Sync Updated Portfolio State
+      - name: Commit & Push Updated Portfolio State
         run: |
           git config user.name "PulseAI Bot"
           git config user.email "actions@github.com"
-          git add portfolio_state.json trade_history.json model_weights.json morning_watchlist.json shadow_ledger.json sector_cache.json ml_feature_log.json ml_context_model.pkl ai_research_log.json sent_alerts_log.json || true
+
+          STATE_FILES=(
+            portfolio_state.json
+            trade_history.json
+            model_weights.json
+            morning_watchlist.json
+            shadow_ledger.json
+            sector_cache.json
+            ml_feature_log.json
+            ml_context_model.pkl
+            ai_research_log.json
+            sent_alerts_log.json
+          )
+
+          for f in "${STATE_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            fi
+          done
+
           if ! git diff --cached --quiet; then
             git commit -m "chore(pulseai): update portfolio, ledger, research audit & weights [${{ github.event.inputs.mode || 'autonomous_cycle' }}] [skip ci]"
             git pull --rebase origin main
             git push origin main
           else
             echo "No state changes to commit."
+          fi
+
+      - name: Flush Verified Telegram Alerts (Post-Push Only)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python audit_tracker.py --flush-alerts
+          if [ -f "sent_alerts_log.json" ]; then
+            git add sent_alerts_log.json
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(pulseai): log verified post-push Telegram alerts [skip ci]"
+              git pull --rebase origin main
+              git push origin main
+            fi
           fi

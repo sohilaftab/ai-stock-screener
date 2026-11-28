@@ -55,8 +55,13 @@ def is_premarket_window(now_ist: datetime) -> bool:
 
 def is_entry_window_open(now_ist: datetime) -> bool:
     mins = now_ist.hour * 60 + now_ist.minute
-    # Allow new entries strictly from 09:15 AM to 03:05 PM IST (10 min buffer before 15:15 square-off)
+    # New entries strictly from 09:15 AM to 03:05 PM IST (10 min buffer before 15:15 square-off)
     return (9 * 60 + 15) <= mins <= (15 * 60 + 5)
+
+
+def is_live_market_hours(now_ist: datetime) -> bool:
+    """Backward-compatible alias used by worker.py."""
+    return is_entry_window_open(now_ist)
 
 
 def _today_skip_reasons(engine: AdaptiveTradeEngine, today_str: str) -> dict[str, str]:
@@ -129,7 +134,7 @@ def _evaluate_positions_and_notify_exits(
     notifier: TelegramNotifier,
 ) -> dict:
     """
-    Evaluate open positions and dispatch Telegram EXIT alerts ONLY for trades
+    Evaluate open positions and queue/send Telegram EXIT alerts ONLY for trades
     verified as closed on disk in trade_history.json.
     """
     open_before = {
@@ -154,7 +159,7 @@ def _record_and_notify_entries(
     notifier: TelegramNotifier,
 ) -> list[dict]:
     """
-    Record qualifying recommendations into trade_history.json and dispatch Telegram
+    Record qualifying recommendations into trade_history.json and queue/send Telegram
     ENTRY alerts strictly for trades verified on disk.
     """
     before_len = len(engine.ledger or [])
@@ -173,14 +178,6 @@ def run_autonomous_cycle(
     sentiment_ai: FinBERTSentimentEngine,
     notifier: TelegramNotifier,
 ):
-    """
-    Unified AI Decision Loop:
-    1. Evaluates all OPEN positions against targets, stop-loss, giveback rules, and 15:15 IST square-off.
-    2. Pre-market (08:30-09:14 IST): updates watchlist + research log silently (no Telegram BUY/SELL spam).
-    3. Entry window (09:15-15:05 IST): scans market, logs ALL researched stocks to ai_research_log.json,
-       enters only approved trades, and notifies Telegram strictly on executed entries/exits.
-    4. Post-15:05 IST: manages/squares off open trades only and writes a clean heartbeat.
-    """
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%Y-%m-%d")
     print(f"[PULSEAI] Running autonomous cycle at {now_ist.strftime('%Y-%m-%d %I:%M:%S %p IST')}")

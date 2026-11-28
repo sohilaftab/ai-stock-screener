@@ -1,6 +1,6 @@
 """
 audit_tracker.py
-Research logger, executed-only Telegram guard, GitHub commit/sync checker,
+Research logger, post-push executed-only Telegram guard, GitHub commit/sync checker,
 and live NSE price auditor for PulseAI.
 """
 
@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import html
 import json
+import os
+import sys
 import urllib.request
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -21,6 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent
 RESEARCH_LOG_PATH = BASE_DIR / "ai_research_log.json"
 TRADE_HISTORY_PATH = BASE_DIR / "trade_history.json"
 SENT_ALERTS_PATH = BASE_DIR / "sent_alerts_log.json"
+PENDING_ALERTS_PATH = BASE_DIR / "pending_telegram_alerts.json"
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -206,41 +209,14 @@ def _trade_exists_in_ledger(
     return False
 
 
-def send_verified_trade_alert(
-    notifier: Any,
-    trade: dict,
-    event_type: str = "ENTRY",
-) -> bool:
-    """
-    Executed-Only Telegram Gate:
-    Sends a Telegram notification ONLY after verifying the trade exists in
-    trade_history.json on disk, with deduplication stored in sent_alerts_log.json.
-    """
-    if notifier is None or not isinstance(trade, dict):
-        return False
-
+def _build_alert_payload(trade: dict, event_type: str) -> dict:
     ev = event_type.upper()
-    if not _trade_exists_in_ledger(trade, expected_closed=(ev == "EXIT")):
-        print(f"[AUDIT GUARD] Blocked {ev} Telegram alert for {trade.get('symbol')}: not verified in trade_history.json")
-        return False
-
     sym = clean_symbol(trade.get("symbol"))
     t_date = str(trade.get("date") or datetime.now(IST).strftime("%Y-%m-%d"))[:10]
     entry_px = float(trade.get("entry_price") or 0.0)
     exit_px = float(trade.get("exit_price") or 0.0)
     t_id = str(trade.get("trade_id") or f"{t_date}_{sym}_{trade.get('action')}_{entry_px:.2f}")
     dedupe_key = f"{ev}::{t_id}"
-
-    sent_log = _read_json_safe(SENT_ALERTS_PATH, default=[])
-    if not isinstance(sent_log, list):
-        sent_log = []
-
-    existing_keys = {
-        (item.get("dedupe_key") if isinstance(item, dict) else str(item))
-        for item in sent_log
-    }
-    if dedupe_key in existing_keys:
-        return False
 
     action = html.escape(str(trade.get("action", "TRADE")).upper())
     qty = int(trade.get("qty") or 0)
@@ -273,31 +249,163 @@ def send_verified_trade_alert(
             f"🧾 <b>Ledger Ref:</b> <code>{safe_id}</code>"
         )
 
-    sent_ok = False
+    return {
+        "dedupe_key": dedupe_key,
+        "event": ev,
+        "date": t_date,
+        "symbol": sym,
+        "action": str(trade.get("action", "")).upper(),
+        "price": round(entry_px if ev == "ENTRY" else exit_px, 2),
+        "status": str(trade.get("status", "")).upper(),
+        "trade_snapshot": {
+            "trade_id": trade.get("trade_id"),
+            "date": t_date,
+            "symbol": sym,
+            "action": trade.get("action"),
+            "entry_price": entry_px,
+            "status": trade.get("status"),
+        },
+        "message": msg,
+    }
+
+
+def _dispatch_message(notifier: Any, msg: str) -> bool:
     try:
         if hasattr(notifier, "send_message"):
-            notifier.send_message(msg)
-            sent_ok = True
-        elif hasattr(notifier, "send_alert"):
+            try:
+                return bool(notifier.send_message(msg, force=True))
+            except TypeError:
+                return bool(notifier.send_message(msg))
+        if hasattr(notifier, "send_alert"):
             notifier.send_alert(msg)
-            sent_ok = True
+            return True
     except Exception as exc:
-        print(f"[AUDIT GUARD] Telegram dispatch failed for {sym}: {exc}")
+        print(f"[AUDIT GUARD] Telegram dispatch failed: {exc}")
+    return False
+
+
+def send_verified_trade_alert(
+    notifier: Any,
+    trade: dict,
+    event_type: str = "ENTRY",
+) -> bool:
+    """
+    Executed-Only Telegram Gate:
+    If DEFER_TELEGRAM_UNTIL_PUSH=1 (GitHub Actions), queues the verified alert into
+    pending_telegram_alerts.json so it is ONLY sent after `git push origin main` succeeds.
+    Otherwise sends immediately after verifying trade_history.json on disk.
+    """
+    if not isinstance(trade, dict):
         return False
 
-    if sent_ok:
+    ev = event_type.upper()
+    if not _trade_exists_in_ledger(trade, expected_closed=(ev == "EXIT")):
+        print(f"[AUDIT GUARD] Blocked {ev} Telegram alert for {trade.get('symbol')}: not verified in trade_history.json")
+        return False
+
+    payload = _build_alert_payload(trade, ev)
+    dedupe_key = payload["dedupe_key"]
+
+    sent_log = _read_json_safe(SENT_ALERTS_PATH, default=[])
+    if not isinstance(sent_log, list):
+        sent_log = []
+    sent_keys = {
+        (item.get("dedupe_key") if isinstance(item, dict) else str(item))
+        for item in sent_log
+    }
+    if dedupe_key in sent_keys:
+        return False
+
+    defer = os.getenv("DEFER_TELEGRAM_UNTIL_PUSH", "0").strip() == "1"
+    if defer:
+        pending = _read_json_safe(PENDING_ALERTS_PATH, default=[])
+        if not isinstance(pending, list):
+            pending = []
+        pending_keys = {str(p.get("dedupe_key")) for p in pending if isinstance(p, dict)}
+        if dedupe_key not in pending_keys:
+            pending.append(payload)
+            _atomic_write_json(PENDING_ALERTS_PATH, pending)
+            print(f"[AUDIT QUEUE] Staged {ev} alert for {payload['symbol']} (will send strictly after git push).")
+        return True
+
+    if notifier is None:
+        return False
+
+    if _dispatch_message(notifier, payload["message"]):
         sent_log.append({
             "timestamp_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-            "date": t_date,
-            "event": ev,
-            "symbol": sym,
-            "action": str(trade.get("action", "")).upper(),
-            "price": round(entry_px if ev == "ENTRY" else exit_px, 2),
-            "status": str(trade.get("status", "")).upper(),
+            "date": payload["date"],
+            "event": payload["event"],
+            "symbol": payload["symbol"],
+            "action": payload["action"],
+            "price": payload["price"],
+            "status": payload["status"],
             "dedupe_key": dedupe_key,
         })
         _atomic_write_json(SENT_ALERTS_PATH, sent_log[-500:])
-    return sent_ok
+        return True
+    return False
+
+
+def flush_pending_alerts() -> int:
+    """
+    Called ONLY after `git push origin main` succeeds in GitHub Actions.
+    Sends all queued verified trade alerts and records them in sent_alerts_log.json.
+    """
+    pending = _read_json_safe(PENDING_ALERTS_PATH, default=[])
+    if not isinstance(pending, list) or not pending:
+        print("[AUDIT FLUSH] No pending Telegram alerts to send.")
+        return 0
+
+    from telegram_notifier import TelegramNotifier
+
+    notifier = TelegramNotifier()
+    sent_log = _read_json_safe(SENT_ALERTS_PATH, default=[])
+    if not isinstance(sent_log, list):
+        sent_log = []
+    sent_keys = {
+        (item.get("dedupe_key") if isinstance(item, dict) else str(item))
+        for item in sent_log
+    }
+
+    sent_count = 0
+    for item in pending:
+        if not isinstance(item, dict):
+            continue
+        dedupe_key = str(item.get("dedupe_key") or "")
+        if not dedupe_key or dedupe_key in sent_keys:
+            continue
+
+        snap = item.get("trade_snapshot") or {}
+        ev = str(item.get("event") or "ENTRY").upper()
+        if not _trade_exists_in_ledger(snap, expected_closed=(ev == "EXIT")):
+            print(f"[AUDIT FLUSH] Skipped {dedupe_key}: missing from committed trade_history.json.")
+            continue
+
+        if _dispatch_message(notifier, str(item.get("message") or "")):
+            sent_log.append({
+                "timestamp_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                "date": item.get("date", ""),
+                "event": ev,
+                "symbol": item.get("symbol", ""),
+                "action": item.get("action", ""),
+                "price": item.get("price", 0.0),
+                "status": item.get("status", ""),
+                "dedupe_key": dedupe_key,
+            })
+            sent_keys.add(dedupe_key)
+            sent_count += 1
+
+    if sent_count > 0:
+        _atomic_write_json(SENT_ALERTS_PATH, sent_log[-500:])
+
+    try:
+        PENDING_ALERTS_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    print(f"[AUDIT FLUSH] Dispatched {sent_count} verified post-push Telegram alert(s).")
+    return sent_count
 
 
 def check_remote_ledger_sync(repo: str, local_count: int) -> dict:
@@ -369,7 +477,6 @@ def verify_trades_against_nse(
     """
     Verify entry_price and exit_price for all trades on target_date_str
     against real NSE High-Low market data via yfinance.
-    Uses 5m bars for recent dates (within 58 days) and 1d bars for older dates.
     """
     day_trades = [t for t in trades if str(t.get("date", ""))[:10] == target_date_str]
     if not day_trades:
@@ -455,3 +562,8 @@ def verify_trades_against_nse(
         })
 
     return results
+
+
+if __name__ == "__main__":
+    if "--flush-alerts" in sys.argv:
+        flush_pending_alerts()
