@@ -2,8 +2,8 @@
 audit_dashboard_panel.py
 All-in-one PulseAI Streamlit Audit Tab:
 1. Automation Heartbeat, 15:15 IST Hygiene & GitHub Commit Proof
-2. Full AI Research Feed (Executed vs. Researched/Skipped)
-3. Telegram Executed-Alert Audit (1-to-1 Ledger Match)
+2. Full AI Research Feed (Executed vs. Researched/Skipped & Auto-EOD)
+3. Telegram Executed-Alert Audit (1-to-1 Ledger Match + EOD Summary)
 4. Live NSE Market Price Verification (yfinance)
 """
 
@@ -108,7 +108,7 @@ def render_audit_tab(
     st.markdown("#### 🔬 1. AI Research Feed (Executed vs. Researched Only)")
     st.caption(
         "Every stock researched by PulseAI appears here with its exact decision and veto/skip reason. "
-        "Telegram only fires for EXECUTED trades committed to trade_history.json."
+        "Telegram only fires for EXECUTED trades committed to trade_history.json (plus the once-daily EOD summary)."
     )
 
     filter_choice = st.radio(
@@ -138,7 +138,7 @@ def render_audit_tab(
             continue
 
         if is_hb:
-            badge = "HEARTBEAT"
+            badge = "EOD COMPLETE" if str(item.get("mode", "")).lower() == "eod" else "HEARTBEAT"
         elif in_ledger:
             badge = "EXECUTED (In Ledger)"
         else:
@@ -172,14 +172,16 @@ def render_audit_tab(
             for a in reversed(sent_alerts[-60:]):
                 if not isinstance(a, dict):
                     continue
+                ev = str(a.get("event", "")).upper()
                 pair = (str(a.get("date", ""))[:10], clean_symbol(a.get("symbol")))
+                ledger_status = "EOD Summary" if ev == "EOD" else ("YES" if pair in ledger_pairs else "MISSING")
                 tg_rows.append({
                     "Time (IST)": a.get("timestamp_ist", ""),
-                    "Event": a.get("event", ""),
+                    "Event": ev,
                     "Stock": clean_symbol(a.get("symbol")),
                     "Action": a.get("action", ""),
                     "Price (₹)": a.get("price", 0.0),
-                    "In Dashboard Ledger?": "YES" if pair in ledger_pairs else "MISSING",
+                    "In Dashboard Ledger?": ledger_status,
                 })
             st.dataframe(pd.DataFrame(tg_rows), use_container_width=True, hide_index=True)
 

@@ -10,7 +10,9 @@ load_dotenv()
 
 from audit_tracker import (
     clean_symbol,
+    has_eod_completed_today,
     log_research_cycle,
+    send_verified_eod_summary,
     send_verified_trade_alert,
     trade_signature,
 )
@@ -48,6 +50,11 @@ def is_nse_open_day(now_ist: datetime) -> bool:
     return True
 
 
+def is_before_premarket(now_ist: datetime) -> bool:
+    mins = now_ist.hour * 60 + now_ist.minute
+    return mins < (8 * 60 + 30)
+
+
 def is_premarket_window(now_ist: datetime) -> bool:
     mins = now_ist.hour * 60 + now_ist.minute
     return (8 * 60 + 30) <= mins < (9 * 60 + 15)
@@ -57,6 +64,11 @@ def is_entry_window_open(now_ist: datetime) -> bool:
     mins = now_ist.hour * 60 + now_ist.minute
     # New entries strictly from 09:15 AM to 03:05 PM IST (10 min buffer before 15:15 square-off)
     return (9 * 60 + 15) <= mins <= (15 * 60 + 5)
+
+
+def is_eod_window(now_ist: datetime) -> bool:
+    mins = now_ist.hour * 60 + now_ist.minute
+    return mins >= (15 * 60 + 30)
 
 
 def is_live_market_hours(now_ist: datetime) -> bool:
@@ -172,6 +184,53 @@ def _record_and_notify_entries(
     return new_trades
 
 
+def run_eod_routine(
+    engine: AdaptiveTradeEngine,
+    notifier: TelegramNotifier,
+    today_str: str,
+    force_summary: bool = False,
+):
+    """
+    End-of-Day Routine (runs automatically once after 15:30 IST):
+    1. Final sweep to ensure zero open intraday positions remain.
+    2. Retrains Walk-Forward ML model on updated live + shadow ledgers.
+    3. Saves weights & EOD audit marker and queues the post-push daily summary.
+    """
+    result = _evaluate_positions_and_notify_exits(engine, notifier)
+    ml_info = engine.ml_model.train_walk_forward(engine.ledger, engine.shadow_ledger)
+    if hasattr(engine, "_save_weights"):
+        try:
+            engine._save_weights()
+        except Exception:
+            pass
+
+    perf = engine.get_performance_metrics()
+    samples_ct = ml_info.get("samples_count", 0)
+    min_req = ml_info.get("min_required", 60)
+    wf_auc = ml_info.get("wf_auc", 0.5)
+
+    log_research_cycle(
+        candidates=[],
+        cycle_mode="eod",
+        market_note=(
+            f"EOD settlement & ML training complete. Equity Rs.{perf['current_equity']:,.2f}, "
+            f"Open={perf['open_trades']}, ML samples={samples_ct}/{min_req} (AUC {wf_auc:.2f})."
+        ),
+    )
+
+    eod_msg = (
+        f"📊 <b>DAILY PORTFOLIO &amp; AI LEARNING SNAPSHOT</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 <b>Total Wallet Equity:</b> <b>₹{perf['current_equity']:,.2f}</b> ({perf['total_pnl_pct']:+.2f}%)\n"
+        f"💵 <b>Available Cash:</b> ₹{perf['available_cash']:,.2f} | <b>Open Positions:</b> {perf['open_trades']}\n"
+        f"🎯 <b>Win Rate:</b> {perf['win_rate']}% ({perf['settled_trades']} settled)\n"
+        f"🤖 <b>Walk-Forward ML:</b> {samples_ct}/{min_req} samples (AUC {wf_auc:.2f})\n"
+        f"🧠 <b>AI Evolution:</b> <i>{result['message']}</i>"
+    )
+    send_verified_eod_summary(notifier, eod_msg, today_str, force_resend=force_summary)
+    print(f"[PULSEAI] EOD complete for {today_str} | Equity Rs.{perf['current_equity']:,.2f} | ML {samples_ct}/{min_req}")
+
+
 def run_autonomous_cycle(
     engine: AdaptiveTradeEngine,
     scanner: MarketDataScanner,
@@ -180,6 +239,26 @@ def run_autonomous_cycle(
 ):
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%Y-%m-%d")
+    open_count = sum(1 for t in (engine.ledger or []) if str(t.get("status", "")).upper() == "OPEN")
+
+    # Skip delayed overnight crons before 08:30 IST if no open positions exist
+    if is_before_premarket(now_ist) and open_count == 0:
+        print(f"[PULSEAI] Pre-session hours ({now_ist.strftime('%H:%M IST')}) with 0 open trades. Exiting cleanly.")
+        return
+
+    # Auto-promote to EOD once per trading day at/after 15:30 IST
+    if is_eod_window(now_ist):
+        if not has_eod_completed_today(today_str):
+            print(f"[PULSEAI] 15:30+ IST reached — auto-running EOD settlement & walk-forward ML for {today_str}.")
+            run_eod_routine(engine, notifier, today_str, force_summary=False)
+            return
+        if open_count == 0:
+            print(f"[PULSEAI] EOD already completed for {today_str} with 0 open trades. Exiting cleanly.")
+            return
+        print(f"[PULSEAI] Post-EOD sweep: squaring off {open_count} remaining open position(s).")
+        _evaluate_positions_and_notify_exits(engine, notifier)
+        return
+
     print(f"[PULSEAI] Running autonomous cycle at {now_ist.strftime('%Y-%m-%d %I:%M:%S %p IST')}")
 
     eval_res = _evaluate_positions_and_notify_exits(engine, notifier)
@@ -225,7 +304,7 @@ def run_autonomous_cycle(
         print("[PULSEAI] Pre-market research updated in webapp (no unexecuted Telegram alerts sent).")
 
     else:
-        note = "Outside 09:15-15:05 IST entry window; managed/squared off open positions only."
+        note = "15:06-15:29 IST square-off window; managed/squared off open positions only."
         log_research_cycle(candidates=[], cycle_mode="manage_only", market_note=note)
         print(f"[PULSEAI] {note}")
 
@@ -270,23 +349,7 @@ def main():
         )
 
     elif mode == "eod":
-        result = _evaluate_positions_and_notify_exits(engine, notifier)
-        ml_info = engine.ml_model.train_walk_forward(engine.ledger, engine.shadow_ledger)
-        perf = engine.get_performance_metrics()
-        log_research_cycle(
-            candidates=[],
-            cycle_mode="eod",
-            market_note=f"EOD settlement complete. Equity Rs.{perf['current_equity']:,.2f}, Open={perf['open_trades']}.",
-        )
-        notifier.send_message(
-            f"📊 <b>DAILY PORTFOLIO &amp; AI LEARNING SNAPSHOT</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💼 <b>Total Wallet Equity:</b> <b>₹{perf['current_equity']:,.2f}</b> ({perf['total_pnl_pct']:+.2f}%)\n"
-            f"💵 <b>Available Cash:</b> ₹{perf['available_cash']:,.2f} | <b>Open Positions:</b> {perf['open_trades']}\n"
-            f"🎯 <b>Win Rate:</b> {perf['win_rate']}% ({perf['settled_trades']} settled)\n"
-            f"🤖 <b>Walk-Forward ML:</b> {ml_info.get('samples_count', 0)}/{ml_info.get('min_required', 60)} samples (AUC {ml_info.get('wf_auc', 0.5):.2f})\n"
-            f"🧠 <b>AI Evolution:</b> <i>{result['message']}</i>"
-        )
+        run_eod_routine(engine, notifier, today_str, force_summary=True)
 
     else:
         print(f"[WARN] Unknown mode '{mode}', defaulting to autonomous_cycle.")

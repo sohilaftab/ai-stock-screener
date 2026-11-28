@@ -1,7 +1,7 @@
 """
 audit_tracker.py
-Research logger, post-push executed-only Telegram guard, GitHub commit/sync checker,
-and live NSE price auditor for PulseAI.
+Research logger, post-push executed-only Telegram guard, once-daily EOD tracker,
+GitHub commit/sync checker, and live NSE price auditor for PulseAI.
 """
 
 from __future__ import annotations
@@ -71,6 +71,28 @@ def _df_or_list_to_records(obj: Any) -> list[dict]:
     return []
 
 
+def has_eod_completed_today(today_str: str) -> bool:
+    """Return True if EOD settlement + ML training has already completed for today_str."""
+    research_log = _read_json_safe(RESEARCH_LOG_PATH, default=[])
+    if isinstance(research_log, list):
+        for item in reversed(research_log):
+            if (
+                isinstance(item, dict)
+                and str(item.get("date", ""))[:10] == today_str
+                and str(item.get("mode", "")).lower() == "eod"
+            ):
+                return True
+
+    sent_log = _read_json_safe(SENT_ALERTS_PATH, default=[])
+    eod_key = f"EOD::{today_str}"
+    if isinstance(sent_log, list):
+        for item in reversed(sent_log):
+            key = item.get("dedupe_key") if isinstance(item, dict) else str(item)
+            if key == eod_key:
+                return True
+    return False
+
+
 def log_research_cycle(
     candidates: Any = None,
     rec_candidates: Any = None,
@@ -117,7 +139,7 @@ def log_research_cycle(
             "date": today_str,
             "mode": cycle_mode,
             "symbol": "HEARTBEAT",
-            "signal": "CYCLE_OK",
+            "signal": "EOD_DONE" if cycle_mode == "eod" else "CYCLE_OK",
             "ltp": 0.0,
             "conviction": 0.0,
             "sentiment": "NEUTRAL",
@@ -293,7 +315,6 @@ def send_verified_trade_alert(
     Executed-Only Telegram Gate:
     If DEFER_TELEGRAM_UNTIL_PUSH=1 (GitHub Actions), queues the verified alert into
     pending_telegram_alerts.json so it is ONLY sent after `git push origin main` succeeds.
-    Otherwise sends immediately after verifying trade_history.json on disk.
     """
     if not isinstance(trade, dict):
         return False
@@ -347,10 +368,75 @@ def send_verified_trade_alert(
     return False
 
 
+def send_verified_eod_summary(
+    notifier: Any,
+    msg: str,
+    today_str: str,
+    force_resend: bool = False,
+) -> bool:
+    """
+    Send or queue the once-daily EOD portfolio & walk-forward ML summary so it
+    dispatches strictly after `git push origin main` succeeds.
+    """
+    dedupe_key = f"EOD::{today_str}"
+    sent_log = _read_json_safe(SENT_ALERTS_PATH, default=[])
+    if not isinstance(sent_log, list):
+        sent_log = []
+    sent_keys = {
+        (item.get("dedupe_key") if isinstance(item, dict) else str(item))
+        for item in sent_log
+    }
+    if not force_resend and dedupe_key in sent_keys:
+        return False
+
+    payload = {
+        "dedupe_key": dedupe_key,
+        "event": "EOD",
+        "date": today_str,
+        "symbol": "PORTFOLIO",
+        "action": "EOD_SUMMARY",
+        "price": 0.0,
+        "status": "EOD",
+        "force_resend": bool(force_resend),
+        "trade_snapshot": {},
+        "message": msg,
+    }
+
+    defer = os.getenv("DEFER_TELEGRAM_UNTIL_PUSH", "0").strip() == "1"
+    if defer:
+        pending = _read_json_safe(PENDING_ALERTS_PATH, default=[])
+        if not isinstance(pending, list):
+            pending = []
+        pending_keys = {str(p.get("dedupe_key")) for p in pending if isinstance(p, dict)}
+        if dedupe_key not in pending_keys:
+            pending.append(payload)
+            _atomic_write_json(PENDING_ALERTS_PATH, pending)
+            print(f"[AUDIT QUEUE] Staged EOD summary for {today_str} (will send strictly after git push).")
+        return True
+
+    if notifier is None:
+        return False
+
+    if _dispatch_message(notifier, msg):
+        sent_log.append({
+            "timestamp_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+            "date": today_str,
+            "event": "EOD",
+            "symbol": "PORTFOLIO",
+            "action": "EOD_SUMMARY",
+            "price": 0.0,
+            "status": "EOD",
+            "dedupe_key": dedupe_key,
+        })
+        _atomic_write_json(SENT_ALERTS_PATH, sent_log[-500:])
+        return True
+    return False
+
+
 def flush_pending_alerts() -> int:
     """
     Called ONLY after `git push origin main` succeeds in GitHub Actions.
-    Sends all queued verified trade alerts and records them in sent_alerts_log.json.
+    Sends all queued verified trade alerts and EOD summaries, recording them in sent_alerts_log.json.
     """
     pending = _read_json_safe(PENDING_ALERTS_PATH, default=[])
     if not isinstance(pending, list) or not pending:
@@ -373,14 +459,20 @@ def flush_pending_alerts() -> int:
         if not isinstance(item, dict):
             continue
         dedupe_key = str(item.get("dedupe_key") or "")
-        if not dedupe_key or dedupe_key in sent_keys:
+        ev = str(item.get("event") or "ENTRY").upper()
+        force_resend = bool(item.get("force_resend", False))
+        if not dedupe_key or (dedupe_key in sent_keys and not force_resend):
             continue
 
-        snap = item.get("trade_snapshot") or {}
-        ev = str(item.get("event") or "ENTRY").upper()
-        if not _trade_exists_in_ledger(snap, expected_closed=(ev == "EXIT")):
-            print(f"[AUDIT FLUSH] Skipped {dedupe_key}: missing from committed trade_history.json.")
-            continue
+        if ev == "EOD":
+            if not has_eod_completed_today(str(item.get("date") or "")):
+                print(f"[AUDIT FLUSH] Skipped {dedupe_key}: EOD marker missing from ai_research_log.json.")
+                continue
+        else:
+            snap = item.get("trade_snapshot") or {}
+            if not _trade_exists_in_ledger(snap, expected_closed=(ev == "EXIT")):
+                print(f"[AUDIT FLUSH] Skipped {dedupe_key}: missing from committed trade_history.json.")
+                continue
 
         if _dispatch_message(notifier, str(item.get("message") or "")):
             sent_log.append({
