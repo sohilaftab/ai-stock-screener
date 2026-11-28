@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from state_store import atomic_write_json, safe_load_json
+
 try:
     from lightgbm import LGBMClassifier
     HAS_LGBM = True
@@ -74,19 +76,12 @@ class ContextualMLPredictor:
         return datetime.now(IST).strftime("%Y-%m-%d %I:%M %p IST")
 
     def _load_logs(self) -> list:
-        if os.path.exists(FEATURE_LOG_FILE):
-            try:
-                with open(FEATURE_LOG_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return data if isinstance(data, list) else []
-            except Exception:
-                return []
-        return []
+        # non-critical (it is training data, not money) but still quarantined/backed-up on corruption
+        return safe_load_json(FEATURE_LOG_FILE, [], list, critical=False)
 
     def _save_logs(self):
         try:
-            with open(FEATURE_LOG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.logs[-1500:], f, indent=2)
+            atomic_write_json(FEATURE_LOG_FILE, self.logs[-1500:])
         except Exception as e:
             print(f"[ML LOG WARN] Could not save {FEATURE_LOG_FILE}: {e}")
 
@@ -111,11 +106,19 @@ class ContextualMLPredictor:
         }
 
     def _save_artifact(self):
+        tmp = MODEL_ARTIFACT_FILE + ".tmp"
         try:
-            with open(MODEL_ARTIFACT_FILE, "wb") as f:
+            with open(tmp, "wb") as f:
                 pickle.dump(self.artifact, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, MODEL_ARTIFACT_FILE)      # atomic: never leaves a half-written model
         except Exception as e:
             print(f"[ML ARTIFACT WARN] Could not save {MODEL_ARTIFACT_FILE}: {e}")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     @staticmethod
     def _encode_features(record: dict) -> dict:

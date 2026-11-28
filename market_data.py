@@ -528,7 +528,7 @@ class MarketDataScanner:
     @staticmethod
     def fetch_fii_dii_activity() -> dict:
         data = _NSE_CLIENT.get_json("/api/fiidiiTradeReact")
-        result = {"fii_net_cr": 0.0, "dii_net_cr": 0.0, "date": ""}
+        result = {"fii_net_cr": 0.0, "dii_net_cr": 0.0, "date": "", "age_days": None}
         if not isinstance(data, list):
             return result
         for row in data:
@@ -537,6 +537,11 @@ class MarketDataScanner:
             if "FII" in cat or "FPI" in cat:
                 result["fii_net_cr"] = round(net_val, 2)
                 result["date"] = str(row.get("date", ""))
+                try:
+                    d = datetime.strptime(result["date"].strip(), "%d-%b-%Y").date()
+                    result["age_days"] = (datetime.now(IST).date() - d).days
+                except Exception:
+                    result["age_days"] = None
             elif "DII" in cat:
                 result["dii_net_cr"] = round(net_val, 2)
         return result
@@ -706,39 +711,147 @@ class MarketDataScanner:
             else:
                 missing.append(sym)
 
+        if missing:
+            cls._yf_snapshot_batch(missing, snapshots)
+
+        return snapshots
+
+    @classmethod
+    def _snapshot_from_df(cls, sym, df, source):
+        ltp = float(df["Close"].iloc[-1])
+        d_high = float(df["High"].max())
+        d_low = float(df["Low"].min())
+        tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+        vol_sum = float(df["Volume"].sum())
+        vwap = float((tp * df["Volume"]).sum() / vol_sum) if vol_sum > 0 else ltp
+        return {
+            "symbol": cls._clean_sym(sym),
+            "current_price": round(ltp, 2),
+            "day_high": round(d_high, 2),
+            "day_low": round(d_low, 2),
+            "intraday_vwap": round(vwap, 2),
+            "lower_cp": 0.0,
+            "upper_cp": 0.0,
+            "delivery_pct": 0.0,
+            "obi_ratio": 0.0,
+            "bid_ask_spread_pct": 0.0,
+            "source": source,
+        }
+
+    @classmethod
+    def _yf_snapshot_batch(cls, missing, snapshots):
+        """One batched yfinance call for every symbol NSE did not answer (was: one call per symbol)."""
+        ns_map = {s: (s if s.endswith(".NS") else f"{s}.NS") for s in missing}
+        frames = {}
+        try:
+            raw = yf.download(
+                tickers=sorted(set(ns_map.values())), period="1d", interval="5m",
+                group_by="ticker", threads=True, progress=False,
+            )
+            if raw is not None and not raw.empty:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    lvl0 = set(raw.columns.get_level_values(0))
+                    for sym, ns in ns_map.items():
+                        if ns in lvl0:
+                            frames[sym] = raw[ns].dropna(subset=["Close"])
+                elif len(ns_map) == 1:
+                    frames[next(iter(ns_map))] = raw.dropna(subset=["Close"])
+        except Exception as e:
+            print(f"[WARN] Batched yfinance snapshot failed: {e}")
+
         for sym in missing:
-            ns_sym = sym if sym.endswith(".NS") else f"{sym}.NS"
             try:
-                df = yf.Ticker(ns_sym).history(period="1d", interval="5m")
-                if df.empty:
-                    df = yf.Ticker(ns_sym).history(period="2d", interval="1d")
-                if df.empty:
+                df = frames.get(sym)
+                source = "YFINANCE_BATCH"
+                if df is None or df.empty:
+                    df = yf.Ticker(ns_map[sym]).history(period="2d", interval="1d")
+                    source = "YFINANCE_DAILY_FALLBACK"
+                if df is None or df.empty:
                     continue
-
-                ltp = float(df["Close"].iloc[-1])
-                d_high = float(df["High"].max())
-                d_low = float(df["Low"].min())
-                tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
-                vol_sum = float(df["Volume"].sum())
-                vwap = float((tp * df["Volume"]).sum() / vol_sum) if vol_sum > 0 else ltp
-
-                snapshots[sym] = {
-                    "symbol": cls._clean_sym(sym),
-                    "current_price": round(ltp, 2),
-                    "day_high": round(d_high, 2),
-                    "day_low": round(d_low, 2),
-                    "intraday_vwap": round(vwap, 2),
-                    "lower_cp": 0.0,
-                    "upper_cp": 0.0,
-                    "delivery_pct": 0.0,
-                    "obi_ratio": 0.0,
-                    "bid_ask_spread_pct": 0.0,
-                    "source": "YFINANCE_FALLBACK",
-                }
+                snapshots[sym] = cls._snapshot_from_df(sym, df, source)
             except Exception:
                 continue
 
-        return snapshots
+    @classmethod
+    def fetch_bars_since(cls, items: list) -> dict:
+        """
+        items: [(key, symbol, since_iso)].  Returns {key: [bar, ...]} where each bar is
+        {"ts","date","open","high","low","close","volume"} (5-minute bars, chronological)
+        whose START time is >= since_iso floored to a 5-minute boundary.
+
+        A key that is ABSENT means "unknown" (no data / network failure) - callers must not
+        treat absence as "price never touched the stop or target".
+        """
+        out = {}
+        if not items:
+            return out
+
+        now = datetime.now(IST)
+        parsed = []
+        for key, sym, since in items:
+            try:
+                dt = datetime.fromisoformat(str(since))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=IST)
+                dt = dt.astimezone(IST)
+                dt = dt.replace(minute=(dt.minute // 5) * 5, second=0, microsecond=0)
+                parsed.append((key, cls._clean_sym(sym), dt))
+            except Exception:
+                continue
+        if not parsed:
+            return out
+
+        oldest_days = max((now - dt).days for _, _, dt in parsed)
+        period = "5d" if oldest_days <= 3 else ("10d" if oldest_days <= 8 else "30d")
+        ns_map = {s: f"{s}.NS" for s in {p[1] for p in parsed}}
+
+        try:
+            raw = yf.download(
+                tickers=sorted(ns_map.values()), period=period, interval="5m",
+                group_by="ticker", threads=True, progress=False,
+            )
+        except Exception as e:
+            print(f"[WARN] fetch_bars_since download failed: {e}")
+            return out
+        if raw is None or raw.empty:
+            return out
+
+        multi = isinstance(raw.columns, pd.MultiIndex)
+        lvl0 = set(raw.columns.get_level_values(0)) if multi else set()
+        frames = {}
+        for sym, ns in ns_map.items():
+            try:
+                if multi:
+                    if ns not in lvl0:
+                        continue
+                    df = raw[ns]
+                elif len(ns_map) == 1:
+                    df = raw
+                else:
+                    continue
+                df = df.dropna(subset=["Open", "High", "Low", "Close"])
+                if df.empty:
+                    continue
+                idx = df.index.tz_localize(IST) if df.index.tz is None else df.index.tz_convert(IST)
+                frames[sym] = df.set_axis(idx)
+            except Exception:
+                continue
+
+        for key, sym, since_dt in parsed:
+            df = frames.get(sym)
+            if df is None:
+                continue
+            sub = df[df.index >= since_dt]
+            out[key] = [
+                {
+                    "ts": ts.isoformat(), "date": ts.strftime("%Y-%m-%d"),
+                    "open": float(r["Open"]), "high": float(r["High"]),
+                    "low": float(r["Low"]), "close": float(r["Close"]),
+                    "volume": float(r.get("Volume", 0.0) or 0.0),
+                }
+                for ts, r in sub.iterrows()
+            ]
+        return out
 
     def fetch_premarket_data(self) -> pd.DataFrame:
         raw = _NSE_CLIENT.get_json("/api/market-data-pre-open?key=NIFTY")

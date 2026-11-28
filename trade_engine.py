@@ -1,17 +1,22 @@
-import json
 import os
+import json
 import random
-import urllib.parse
+import time
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
 import pandas as pd
 import yfinance as yf
 from market_data import MarketDataScanner
 from ml_context_model import ContextualMLPredictor
 from telegram_notifier import TelegramNotifier
+from state_store import atomic_write_json, safe_load_json
+from lexicon import BULLISH_KEYWORDS, BEARISH_KEYWORDS
+from calendar_utils import expiry_status
+from exec_sim import resolve_barrier_outcome, worse_stop_fill, apply_slippage
+from health import is_halted
 
 try:
     from google import genai
@@ -33,16 +38,20 @@ INITIAL_CAPITAL = 150000.0
 MAX_POSITIONS_PER_SECTOR = 2
 MAX_SECTOR_EXPOSURE_PCT = 0.40
 
-BULLISH_KEYWORDS = {
-    "surge", "soar", "jump", "gain", "profit", "beat", "order", "win", "won",
-    "contract", "approval", "upgrade", "buy", "bullish", "growth", "expansion",
-    "dividend", "bonus", "acquisition", "partnership", "record", "strong", "rally"
-}
-BEARISH_KEYWORDS = {
-    "fall", "drop", "plunge", "slump", "loss", "miss", "downgrade", "sell",
-    "bearish", "fraud", "probe", "raid", "penalty", "fine", "ban", "recall",
-    "default", "debt", "resign", "cut", "weak", "crash", "warning", "lawsuit"
-}
+# ---- Risk & learning controls (edit here) -------------------------------------------
+EARLIEST_ENTRY_MIN = 9 * 60 + 30          # opening range (first 30 min) must be formed first
+LATEST_ENTRY_MIN = 14 * 60 + 30           # no new entries after 14:30 IST (square-off is 15:15)
+MAX_ENTRIES_PER_DAY = 8
+MAX_ENTRIES_PER_CYCLE = 2                 # stagger entries instead of opening 5 at once
+MAX_SAME_SIDE_POSITIONS = 3               # cap one-directional (all-long / all-short) exposure
+DAILY_LOSS_LIMIT_PCT = 1.5                # stop NEW entries once the day is down this much
+MAX_CONSECUTIVE_LOSSES_PER_DAY = 3
+MIN_TRADES_FOR_WEIGHT_LEARNING = 20       # parameters stay frozen below this many closed trades
+RECALIBRATE_EVERY_N_TRADES = 5            # intraday recalibration cadence (EOD still recalibrates)
+WEIGHT_SHRINKAGE_K = 30.0                 # learned adjustment is scaled by n / (n + K)
+MIN_TRADES_FOR_TICKER_MEMORY = 3
+REGIME_CACHE_TTL_SEC = 120
+# --------------------------------------------------------------------------------------
 
 
 class AdaptiveTradeEngine:
@@ -54,6 +63,24 @@ class AdaptiveTradeEngine:
         self.shadow_ledger = self._load_shadow_ledger()
         self.portfolio = self._load_portfolio()
         self.sector_cache = self._load_sector_cache()
+        self._enforce_warmup_priors()
+
+    def _enforce_warmup_priors(self):
+        """
+        Until MIN_TRADES_FOR_WEIGHT_LEARNING closed trades exist, every learned parameter is held at its prior.
+        This also neutralises values left in model_weights.json by the pre-fix code (e.g. a -6 short bias or a
+        0.72 stop multiplier learned from 5 trades) so they cannot leak into the new engine.
+        """
+        n = len([t for t in self.ledger if t.get("status") != "OPEN" and "factor_scores" in t])
+        if n >= MIN_TRADES_FOR_WEIGHT_LEARNING:
+            return
+        self.weights.update({
+            "volume_weight": 0.28, "sentiment_weight": 0.28, "premarket_weight": 0.22, "momentum_weight": 0.22,
+            "atr_sl_multiplier": 0.55, "atr_tp_multiplier": 1.60, "max_profit_giveback_pct": 45.0,
+            "learned_max_hold_mins": 180.0, "min_conviction_threshold": 52.0, "buy_rsi_ceiling": 72.0,
+            "risk_per_trade_pct": 1.0, "buy_bias_bonus": 0.0, "short_bias_bonus": 0.0,
+            "blacklisted_tickers": [], "preferred_tickers": [],
+        })
 
     @staticmethod
     def _now_ist():
@@ -256,8 +283,22 @@ class AdaptiveTradeEngine:
             return True
         return False
 
+    _REGIME_CACHE = {"ts": 0.0, "data": None}
+
     def _detect_market_regime(self):
+        """Cached wrapper (a cycle used to hit Yahoo + NSE for the same index data several times)."""
+        cache = AdaptiveTradeEngine._REGIME_CACHE
+        if cache["data"] is not None and (time.time() - cache["ts"]) < REGIME_CACHE_TTL_SEC:
+            self.weights["last_market_regime"] = cache["data"]
+            return cache["data"]
+        info = self._detect_market_regime_uncached()
+        if float(info.get("nifty_ltp", 0.0) or 0.0) > 0:
+            cache["ts"], cache["data"] = time.time(), info
+        return info
+
+    def _detect_market_regime_uncached(self):
         now_ist = self._now_ist()
+        expiry_info = self._expiry_today()
         macro_cues = MarketDataScanner.fetch_global_macro_cues()
         macro_buy_adj = float(macro_cues.get("macro_buy_adj", 0.0))
         macro_short_adj = float(macro_cues.get("macro_short_adj", 0.0))
@@ -268,7 +309,8 @@ class AdaptiveTradeEngine:
             "vix_ltp": 14.0, "vix_chg_pct": 0.0, "fii_net_cr": 0.0, "dii_net_cr": 0.0,
             "buy_adj": macro_buy_adj, "short_adj": macro_short_adj,
             "size_multiplier": round(macro_size_mult, 2), "sl_multiplier_adj": 1.0,
-            "global_macro": macro_cues, "updated_at": now_ist.strftime("%I:%M %p IST")
+            "global_macro": macro_cues, "updated_at": now_ist.strftime("%I:%M %p IST"),
+            "expiry_status": expiry_info,
         }
         try:
             nifty_df = yf.Ticker("^NSEI").history(period="5d", interval="15m")
@@ -276,6 +318,9 @@ class AdaptiveTradeEngine:
             fii_dii = MarketDataScanner.fetch_fii_dii_activity()
             fii_net = float(fii_dii.get("fii_net_cr", 0.0))
             dii_net = float(fii_dii.get("dii_net_cr", 0.0))
+            fii_age = fii_dii.get("age_days")
+            if fii_age is not None and fii_age > 4:      # stale NSE print: do not trade on it
+                fii_net, dii_net = 0.0, 0.0
 
             if nifty_df.empty:
                 self.weights["last_market_regime"] = default_regime
@@ -329,7 +374,8 @@ class AdaptiveTradeEngine:
                 "buy_adj": round(buy_adj, 1), "short_adj": round(short_adj, 1),
                 "size_multiplier": round(max(0.35, min(1.0, base_size_mult * macro_size_mult)), 2),
                 "sl_multiplier_adj": sl_adj, "global_macro": macro_cues,
-                "updated_at": now_ist.strftime("%I:%M %p IST")
+                "updated_at": now_ist.strftime("%I:%M %p IST"),
+                "expiry_status": expiry_info, "fii_data_age_days": fii_age,
             }
             self.weights["last_market_regime"] = info
             return info
@@ -438,20 +484,13 @@ class AdaptiveTradeEngine:
         return round(max(0.08, min(0.25, half_kelly)), 4), round(payoff_b, 2)
 
     def _load_shadow_ledger(self):
-        if os.path.exists(SHADOW_LEDGER_FILE):
-            try:
-                with open(SHADOW_LEDGER_FILE, "r") as f:
-                    return json.load(f)
-            except Exception:
-                return []
-        return []
+        return safe_load_json(SHADOW_LEDGER_FILE, [], list, critical=False)
 
     def _save_shadow_ledger(self):
         try:
-            with open(SHADOW_LEDGER_FILE, "w") as f:
-                json.dump(self.shadow_ledger[-150:], f, indent=2)
-        except Exception:
-            pass
+            atomic_write_json(SHADOW_LEDGER_FILE, self.shadow_ledger[-150:])
+        except Exception as e:
+            print(f"[WARN] Could not save shadow ledger: {e}")
 
     def _record_shadow_candidates(self, skipped_candidates):
         if not skipped_candidates:
@@ -476,6 +515,7 @@ class AdaptiveTradeEngine:
             rec = {
                 "shadow_id": shadow_id, "date": today_str, "entry_iso": entry_iso,
                 "entry_session": session_bucket, "symbol": sym, "action": item["action"],
+                "is_expiry_day": bool(item.get("is_expiry_day", False)),
                 "strategy_arm": item.get("strategy_arm", "MOMENTUM_BREAKOUT"),
                 "archetype": item.get("archetype", "MOMENTUM_MOVER"),
                 "rvol_normalized": float(item.get("rvol_normalized", 1.0)),
@@ -512,53 +552,83 @@ class AdaptiveTradeEngine:
             self._save_shadow_ledger()
 
     def _evaluate_shadow_trades(self):
+        """
+        Labels shadow (skipped) setups using the 5-minute bars AFTER the hypothetical entry,
+        walking bar by bar so stop-vs-target ordering is respected, and charging real costs.
+        (Previously: whole-day high/low, which included price action before the entry.)
+        """
         now_ist = self._now_ist()
         mins_now = now_ist.hour * 60 + now_ist.minute
         near_close = mins_now >= (15 * 60 + 10)
+        today = now_ist.strftime("%Y-%m-%d")
 
-        due_shadows = [
+        due = [
             s for s in self.shadow_ledger
             if s.get("status") == "SHADOW_OPEN"
-            and (self._calculate_hold_minutes(s) >= 75.0 or near_close or s.get("date") != now_ist.strftime("%Y-%m-%d"))
+            and (self._calculate_hold_minutes(s) >= 75.0 or near_close or s.get("date") != today)
         ]
-        if not due_shadows:
+        if not due:
             return 0
 
-        syms = list({s["symbol"] for s in due_shadows})
-        snaps = MarketDataScanner.fetch_live_intraday_snapshot(syms)
+        items = []
+        for s in due:
+            try:
+                items.append((s["shadow_id"], s["symbol"], self._next_bar_start_iso(s["entry_iso"])))
+            except Exception:
+                continue
+        bars_map = MarketDataScanner.fetch_bars_since(items)
         evaluated = 0
 
-        for s in due_shadows:
-            sym = s["symbol"]
-            snap = snaps.get(sym)
-            if not snap:
+        for s in due:
+            try:
+                entry_dt = datetime.fromisoformat(str(s["entry_iso"]))
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=IST)
+                horizon_end = entry_dt + timedelta(minutes=75)
+                bars = [
+                    b for b in (bars_map.get(s["shadow_id"]) or [])
+                    if b["date"] == s.get("date") and datetime.fromisoformat(b["ts"]) < horizon_end
+                ]
+            except Exception:
+                bars = []
+
+            if not bars:
+                # Unknown is not "no touch": retry next cycle, and void very old ones so they never linger.
+                try:
+                    age_days = (now_ist.date() - datetime.strptime(s["date"], "%Y-%m-%d").date()).days
+                except Exception:
+                    age_days = 99
+                if age_days >= 3:
+                    s["status"] = "SHADOW_VOID"
                 continue
 
-            ltp, d_high, d_low = float(snap["current_price"]), float(snap["day_high"]), float(snap["day_low"])
             entry, t1, sl = float(s["entry_price"]), float(s["target_1"]), float(s["stop_loss"])
             side = s["action"]
+            is_buy = str(side).upper().startswith("BUY")
+            outcome = resolve_barrier_outcome(is_buy, bars, sl, t1)
+            exit_px = outcome["exit_px"] if outcome["reason"] != "NONE" else float(bars[-1]["close"])
 
-            if side == "BUY":
-                exit_px = t1 if (d_high >= t1 and d_low > sl) else (sl if (d_low <= sl and d_high < t1) else ltp)
-                pnl_pct = ((exit_px - entry) / entry) * 100.0
-            else:
-                exit_px = t1 if (d_low <= t1 and d_high < sl) else (sl if (d_high >= sl and d_low > t1) else ltp)
-                pnl_pct = ((entry - exit_px) / entry) * 100.0
+            slip = self._get_archetype_slippage_pct(s.get("archetype", "MOMENTUM_MOVER"))
+            fill_in = apply_slippage(entry, is_buy, slip)
+            fill_out = apply_slippage(exit_px, not is_buy, slip)
+            pseudo_qty = max(1, int(20000.0 // max(entry, 1.0)))
+            gross = (fill_out - fill_in) * pseudo_qty if is_buy else (fill_in - fill_out) * pseudo_qty
+            charges = self._calculate_nse_intraday_charges("BUY" if is_buy else "SELL", pseudo_qty, fill_in, fill_out)
+            pseudo_pnl_inr = round(gross - charges, 2)
+            net_pnl_pct = round((pseudo_pnl_inr / max(pseudo_qty * entry, 1.0)) * 100.0, 3)
 
-            net_pnl_pct = round(pnl_pct - 0.08, 2)
-            pseudo_pnl_inr = round((net_pnl_pct / 100.0) * 20000.0, 2)
-
-            s["status"] = "SHADOW_WIN" if net_pnl_pct > 0 else "SHADOW_LOSS"
+            s["status"] = "SHADOW_WIN" if pseudo_pnl_inr > 0 else "SHADOW_LOSS"
             s["shadow_pnl_pct"] = net_pnl_pct
+            s["shadow_exit_reason"] = outcome["reason"]
 
             self._update_bandit_arm(s.get("strategy_arm", "MOMENTUM_BREAKOUT"), pseudo_pnl_inr, 300.0, weight_scale=0.35, count_as_real=False)
-            self._update_archetype_memory(s.get("archetype", "MOMENTUM_MOVER"), pseudo_pnl_inr, hit_sl=(exit_px == sl), weight_scale=0.35)
+            self._update_archetype_memory(s.get("archetype", "MOMENTUM_MOVER"), pseudo_pnl_inr, hit_sl=(outcome["reason"] == "SL"), weight_scale=0.35)
             evaluated += 1
 
         if evaluated > 0:
             self.weights["shadow_samples_learned"] = int(self.weights.get("shadow_samples_learned", 0)) + evaluated
-            self._save_shadow_ledger()
             self._save_weights()
+        self._save_shadow_ledger()
         return evaluated
 
     def _update_archetype_memory(self, archetype, pnl_inr, hit_sl=False, weight_scale=1.0):
@@ -584,18 +654,11 @@ class AdaptiveTradeEngine:
             rec["sl_mult_adj"] = 0.95
 
     def _load_sector_cache(self):
-        if os.path.exists(SECTOR_CACHE_FILE):
-            try:
-                with open(SECTOR_CACHE_FILE, "r") as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
+        return safe_load_json(SECTOR_CACHE_FILE, {}, dict, critical=False)
 
     def _save_sector_cache(self):
         try:
-            with open(SECTOR_CACHE_FILE, "w") as f:
-                json.dump(self.sector_cache, f, indent=2)
+            atomic_write_json(SECTOR_CACHE_FILE, self.sector_cache)
         except Exception:
             pass
 
@@ -658,6 +721,50 @@ class AdaptiveTradeEngine:
         except Exception:
             return {"emotion": "NEUTRAL", "score": 0.0, "top_headline": "News feed unavailable", "all_headlines": []}
 
+    def _expiry_today(self, dt=None):
+        d = (dt or self._now_ist()).date()
+        return expiry_status(d, MarketDataScanner.is_nse_trading_day)
+
+    @staticmethod
+    def _next_bar_start_iso(iso_str):
+        """Start of the first 5-minute bar strictly AFTER the timestamp (the entry bar is skipped,
+        so price action before the fill can never count as a stop/target touch)."""
+        dt = datetime.fromisoformat(str(iso_str))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        dt = dt.astimezone(IST)
+        floored = dt.replace(minute=(dt.minute // 5) * 5, second=0, microsecond=0)
+        return (floored + timedelta(minutes=5)).isoformat()
+
+    def entries_allowed(self, now_ist=None):
+        """Portfolio-level circuit breakers. Returns (allowed: bool, reason: str)."""
+        now_ist = now_ist or self._now_ist()
+        mins = now_ist.hour * 60 + now_ist.minute
+        if is_halted():
+            return False, "Kill switch active (HALT_TRADING file / PULSEAI_HALT env)"
+        if mins < EARLIEST_ENTRY_MIN:
+            return False, "Before 09:30 IST - opening range still forming"
+        if mins >= LATEST_ENTRY_MIN:
+            return False, "Past the 14:30 IST new-entry cutoff"
+
+        today = now_ist.strftime("%Y-%m-%d")
+        todays = [t for t in self.ledger if t.get("date") == today]
+        if len(todays) >= MAX_ENTRIES_PER_DAY:
+            return False, f"Daily entry cap reached ({MAX_ENTRIES_PER_DAY})"
+
+        closed = [t for t in todays if t.get("status") != "OPEN"]
+        open_t = [t for t in todays if t.get("status") == "OPEN"]
+        day_pnl = sum(float(t.get("pnl_inr", 0.0) or 0.0) for t in closed) + \
+            sum(float(t.get("unrealized_pnl_inr", 0.0) or 0.0) for t in open_t)
+        equity = float(self.portfolio.get("current_equity", INITIAL_CAPITAL) or INITIAL_CAPITAL)
+        if day_pnl <= -(equity * DAILY_LOSS_LIMIT_PCT / 100.0):
+            return False, f"Daily loss limit hit ({day_pnl:,.0f} INR <= -{DAILY_LOSS_LIMIT_PCT}% of equity)"
+
+        n = MAX_CONSECUTIVE_LOSSES_PER_DAY
+        if len(closed) >= n and all(float(t.get("pnl_inr", 0.0) or 0.0) <= 0 for t in closed[-n:]):
+            return False, f"{n} consecutive losses today - standing down"
+        return True, ""
+
     def _load_weights(self):
         default_weights = {
             "volume_weight": 0.28, "sentiment_weight": 0.28, "premarket_weight": 0.22, "momentum_weight": 0.22,
@@ -675,33 +782,22 @@ class AdaptiveTradeEngine:
             "last_updated": self._now_ist().strftime("%Y-%m-%d %H:%M"),
             "learning_notes": "Initialized Strict Cash Intraday PulseAI."
         }
-        if os.path.exists(WEIGHTS_FILE):
-            try:
-                with open(WEIGHTS_FILE, "r") as f:
-                    loaded = json.load(f)
-                    default_weights.update(loaded)
-                    if "bandit_arms" not in loaded:
-                        default_weights["bandit_arms"] = self._default_bandit_arms()
-            except Exception:
-                pass
+        loaded = safe_load_json(WEIGHTS_FILE, {}, dict, critical=False)
+        if loaded:
+            default_weights.update(loaded)
+            if "bandit_arms" not in loaded:
+                default_weights["bandit_arms"] = self._default_bandit_arms()
         return default_weights
 
     def _save_weights(self):
-        with open(WEIGHTS_FILE, "w") as f:
-            json.dump(self.weights, f, indent=2)
+        atomic_write_json(WEIGHTS_FILE, self.weights)
 
     def _load_ledger(self):
-        if os.path.exists(LEDGER_FILE):
-            try:
-                with open(LEDGER_FILE, "r") as f:
-                    return json.load(f)
-            except Exception:
-                return []
-        return []
+        # critical: an unreadable ledger must STOP the run, never silently become [] and get overwritten
+        return safe_load_json(LEDGER_FILE, [], list, critical=True)
 
     def _save_ledger(self):
-        with open(LEDGER_FILE, "w") as f:
-            json.dump(self.ledger, f, indent=2)
+        atomic_write_json(LEDGER_FILE, self.ledger)
 
     def _load_portfolio(self):
         today_str = self._now_ist().strftime("%Y-%m-%d")
@@ -713,12 +809,7 @@ class AdaptiveTradeEngine:
             "win_streak": 0, "loss_streak": 0, "mistakes_identified": [],
             "daily_equity_log": [{"date": today_str, "equity": INITIAL_CAPITAL, "pnl": 0.0}]
         }
-        if os.path.exists(PORTFOLIO_FILE):
-            try:
-                with open(PORTFOLIO_FILE, "r") as f:
-                    default_portfolio.update(json.load(f))
-            except Exception:
-                pass
+        default_portfolio.update(safe_load_json(PORTFOLIO_FILE, {}, dict, critical=True))
         self._recalculate_cash(default_portfolio)
         return default_portfolio
 
@@ -743,8 +834,7 @@ class AdaptiveTradeEngine:
 
     def _save_portfolio(self):
         self._recalculate_cash(self.portfolio)
-        with open(PORTFOLIO_FILE, "w") as f:
-            json.dump(self.portfolio, f, indent=2)
+        atomic_write_json(PORTFOLIO_FILE, self.portfolio)
 
     def add_manual_funds(self, amount, note="Manual user deposit", notify_telegram=True):
         amt = round(float(amount), 2)
@@ -757,15 +847,16 @@ class AdaptiveTradeEngine:
         self._save_portfolio()
         if notify_telegram:
             self.notifier.send_message(
-                f"💵 <b>Funds Added: +₹{amt:,.2f}</b>\n"
-                f"<b>Equity:</b> ₹{self.portfolio['current_equity']:,.0f} | <b>Cash:</b> ₹{self.portfolio['available_cash']:,.0f}"
+                f"💵 <b>MANUAL FUNDS ADDED BY USER</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"➕ <b>Amount Added:</b> +₹{amt:,.2f}\n📝 <b>Note:</b> {note}\n"
+                f"🏦 <b>New Total Equity:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
+                f"💰 <b>Available Cash to Trade:</b> <b>₹{self.portfolio['available_cash']:,.2f}</b>"
             )
         return self.portfolio
 
     def save_morning_watchlist(self, rec_df):
         records = rec_df.to_dict(orient="records") if not rec_df.empty else []
-        with open(MORNING_WATCHLIST_FILE, "w") as f:
-            json.dump({"date": self._now_ist().strftime("%Y-%m-%d"), "items": records}, f, indent=2)
+        atomic_write_json(MORNING_WATCHLIST_FILE, {"date": self._now_ist().strftime("%Y-%m-%d"), "items": records})
 
     def compare_with_morning_watchlist(self, new_rec_df):
         if not os.path.exists(MORNING_WATCHLIST_FILE) or new_rec_df.empty:
@@ -782,16 +873,16 @@ class AdaptiveTradeEngine:
         for _, row in new_rec_df.iterrows():
             sym = row["symbol"]
             if sym not in old_map:
-                changes.append(f"🆕 <b>{sym}</b> ({row['action']} @ ₹{row['entry_price']})")
+                changes.append(f"🆕 <b>NEW SETUP DETECTED: {sym}</b> ({row['action']} @ ₹{row['entry_price']}, Conv {row['conviction']}/100).")
             else:
                 old_item = old_map[sym]
                 if old_item["action"] != row["action"]:
-                    changes.append(f"🔄 <b>{sym}</b> flipped to <b>{row['action']}</b>")
+                    changes.append(f"🔄 <b>DIRECTION FLIP: {sym}</b> from {old_item['action']} to <b>{row['action']}</b>!")
                 elif abs(float(row["entry_price"]) - float(old_item["entry_price"])) / float(old_item["entry_price"]) > 0.01:
-                    changes.append(f"⚡ <b>{sym}</b> Entry ₹{row['entry_price']} | T1 ₹{row['target_1']} | SL ₹{row['stop_loss']}")
+                    changes.append(f"⚡ <b>LEVEL UPDATE: {sym}</b> Entry ₹{row['entry_price']} | Target ₹{row['target_1']} | SL ₹{row['stop_loss']}.")
         for old_sym in old_map:
             if old_sym not in new_symbols:
-                changes.append(f"❌ <b>{old_sym}</b> removed from watchlist")
+                changes.append(f"❌ <b>DROPPED: {old_sym}</b> removed.")
         return changes
 
     def generate_intraday_recommendations(self, enriched_df, premarket_df=None, top_k=5):
@@ -799,7 +890,8 @@ class AdaptiveTradeEngine:
             return pd.DataFrame()
 
         mins_now = self._now_ist().hour * 60 + self._now_ist().minute
-        if mins_now >= (15 * 60 + 5):
+        expiry_flag = bool(self._expiry_today()["is_expiry_day"])
+        if mins_now >= LATEST_ENTRY_MIN:
             return pd.DataFrame()
 
         self._recalculate_cash(self.portfolio)
@@ -987,7 +1079,7 @@ class AdaptiveTradeEngine:
             if sym in ticker_memory:
                 tm = ticker_memory[sym]
                 trades_n, win_r, net_pnl = tm.get("trades", 0), tm.get("win_rate", 50.0), tm.get("net_pnl_inr", 0.0)
-                if trades_n >= 1:
+                if trades_n >= MIN_TRADES_FOR_TICKER_MEMORY:
                     if win_r >= 60.0 and net_pnl > 0:
                         ticker_adj = min(8.0, 3.0 + (trades_n * 1.5))
                     elif win_r < 40.0 and net_pnl < 0:
@@ -1024,6 +1116,7 @@ class AdaptiveTradeEngine:
             calibrated_p = round(0.5 * posterior_prob + 0.5 * (conviction / 100.0), 4)
 
             cand_obj = {
+                "is_expiry_day": expiry_flag,
                 "symbol": sym, "action": side, "conviction": conviction, "calibrated_win_prob": calibrated_p,
                 "strategy_arm": strategy_arm, "archetype": archetype, "entry_session": current_session,
                 "clv": clv, "rvol_normalized": round(rvol_norm, 2), "vol_accel_5m": round(vol_accel_5m, 2),
@@ -1177,6 +1270,11 @@ class AdaptiveTradeEngine:
         if rec_df.empty:
             return 0
 
+        allowed, why = self.entries_allowed()
+        if not allowed:
+            print(f"[RISK GATE] No new entries: {why}")
+            return 0
+
         self._recalculate_cash(self.portfolio)
         avail_cash = float(self.portfolio["available_cash"])
         now_ist = self._now_ist()
@@ -1187,10 +1285,23 @@ class AdaptiveTradeEngine:
         sector_counts, _ = self._get_open_sector_exposure()
         fresh_ticks = MarketDataScanner.fetch_live_intraday_snapshot(rec_df["symbol"].tolist())
 
+        is_expiry_today = bool(self._expiry_today()["is_expiry_day"])
+        todays_count = sum(1 for t in self.ledger if t.get("date") == today_str)
+        entry_budget = max(0, min(MAX_ENTRIES_PER_CYCLE, MAX_ENTRIES_PER_DAY - todays_count))
+        side_counts = {"BUY": 0, "SELL": 0}
+        for t in self.ledger:
+            if t.get("status") == "OPEN":
+                side_counts["BUY" if str(t.get("action", "")).upper().startswith("BUY") else "SELL"] += 1
+
         added = 0
         for _, row in rec_df.iterrows():
+            if added >= entry_budget:
+                break
             sym = row["symbol"]
             if sym in open_symbols:
+                continue
+            side_key = "BUY" if str(row["action"]).upper().startswith("BUY") else "SELL"
+            if side_counts[side_key] >= MAX_SAME_SIDE_POSITIONS:
                 continue
             sec = row.get("sector") or self._get_stock_sector(sym)
             if sector_counts.get(sec, 0) >= MAX_POSITIONS_PER_SECTOR:
@@ -1200,7 +1311,8 @@ class AdaptiveTradeEngine:
             snap = fresh_ticks.get(sym, {})
             live_tick_p = snap.get("current_price", old_entry) or old_entry
             price_shift = live_tick_p - old_entry
-            entry_p = round(live_tick_p, 2)
+            slip_pct = self._get_archetype_slippage_pct(str(row.get("archetype", "MOMENTUM_MOVER")))
+            entry_p = round(apply_slippage(live_tick_p, side_key == "BUY", slip_pct), 2)   # realistic fill
 
             if avail_cash < entry_p:
                 continue
@@ -1216,6 +1328,8 @@ class AdaptiveTradeEngine:
             t1 = round(float(row["target_1"]) + price_shift, 2)
             t2 = round(float(row["target_2"]) + price_shift, 2)
             sl = round(float(row["stop_loss"]) + price_shift, 2)
+            max_loss = round(abs(entry_p - sl) * qty, 2)
+            exp_profit = round(abs(t1 - entry_p) * qty, 2)
 
             regime_tag = row.get("market_regime", self.weights.get("last_market_regime", {}).get("regime", "NEUTRAL"))
             macro_tag = str(row.get("macro_regime", "NEUTRAL"))
@@ -1244,6 +1358,9 @@ class AdaptiveTradeEngine:
                 "trade_id": f"{today_str}_{sym}_{now_ist.strftime('%H%M')}",
                 "date": today_str, "timestamp": now_time, "entry_iso": now_ist.isoformat(),
                 "entry_session": session_bucket, "market_regime": regime_tag,
+                "is_expiry_day": is_expiry_today, "entry_slippage_pct": slip_pct,
+                "signal_price": round(float(live_tick_p), 2),
+                "last_bar_check_iso": self._next_bar_start_iso(now_ist.isoformat()),
                 "vix_ltp": float(row.get("vix_ltp", 14.0) or 14.0),
                 "fii_net_cr": float(row.get("fii_net_cr", 0.0) or 0.0),
                 "macro_regime": macro_tag, "macro_sector_adj": macro_sec_adj,
@@ -1280,18 +1397,25 @@ class AdaptiveTradeEngine:
             self.ml_model.log_setup_observation(trade_record["trade_id"], "REAL_TRADE", trade_record)
             open_symbols.add(sym)
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            side_counts[side_key] += 1
             added += 1
 
             if notify_telegram:
-                self.notifier.send_entry_alert(
-                    symbol=sym,
-                    action=row["action"],
-                    qty=qty,
-                    entry_price=entry_p,
-                    stop_loss=sl,
-                    target_1=t1,
-                    cash_left=avail_cash,
-                    reason=str(row.get("headline", "")),
+                side_header = "🟢 <b>INTRADAY BUY ENTRY</b>" if row["action"] == "BUY" else "🔴 <b>INTRADAY SHORT ENTRY</b>"
+                self.notifier.send_message(
+                    f"{side_header}\n━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 <b>Stock:</b> <code>{sym}</code> ({row['action']}) | <b>Sector:</b> {sec} ({sec_idx})\n"
+                    f"🌍 <b>Macro:</b> <code>{macro_tag}</code> (Sec Adj {macro_sec_adj:+.1f})\n"
+                    f"📈 <b>Chart Flow:</b> 15m <code>{mtf_trend}</code> | <code>{orb_sig}</code> | VWAP Slope {vwap_slope:+.2f}%\n"
+                    f"📊 <b>RVOL:</b> {rvol_norm:.1f}x | <b>OBI:</b> {obi_val:+.2f} | <b>Deliv:</b> {deliv_pct:.1f}% | <b>Sec Alpha:</b> {sec_alpha:+.2f}%\n"
+                    f"🎰 <b>Arm:</b> <code>{arm_tag}</code> | <b>TRA:</b> <code>{arch_tag}</code> | <b>ML:</b> <code>{ml_status}</code>\n"
+                    f"📦 <b>Quantity:</b> <b>{qty} Shares</b> @ <b>₹{entry_p}</b> (Half-Kelly: {kelly_pct:.1f}%)\n"
+                    f"💰 <b>Wallet Used:</b> ₹{cap_needed:,.2f} <i>(Cash Left: ₹{avail_cash:,.2f})</i>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎯 <b>Target 1:</b> ₹{t1} <i>(+₹{exp_profit:,.0f})</i> | 🚀 <b>Target 2:</b> ₹{t2}\n"
+                    f"🛑 <b>Initial Stop-Loss:</b> ₹{sl} <i>(-₹{max_loss:,.0f} risk)</i>\n"
+                    f"⚖️ <b>Risk Debate:</b> <i>{debate_note}</i>\n"
+                    f"📰 <b>Catalyst ({row['sentiment']}):</b> {row['headline']}"
                 )
 
         if added > 0:
@@ -1312,6 +1436,16 @@ class AdaptiveTradeEngine:
         snapshots = MarketDataScanner.fetch_live_intraday_snapshot([t["symbol"] for t in open_trades])
         actions_taken = []
         now_ist = self._now_ist()
+        today_str_live = now_ist.strftime("%Y-%m-%d")
+
+        # 5-minute bars AFTER each entry: lets us catch a stop/target touched between polling cycles
+        # and judge them in order, instead of using the whole day's high/low (which includes pre-entry prices).
+        bar_items = []
+        for t in open_trades:
+            since = t.get("last_bar_check_iso") or (self._next_bar_start_iso(t["entry_iso"]) if t.get("entry_iso") else None)
+            if since:
+                bar_items.append((t.get("trade_id") or t["symbol"], t["symbol"], since))
+        bars_map = MarketDataScanner.fetch_bars_since(bar_items) if bar_items else {}
         now_time = now_ist.strftime("%I:%M:%S %p")
 
         giveback_limit_pct = float(self.weights.get("max_profit_giveback_pct", 45.0))
@@ -1362,9 +1496,24 @@ class AdaptiveTradeEngine:
 
             force_eod_close, eod_reason = self._should_square_off_intraday(trade)
 
+            is_buy_side = (side == "BUY")
+            stale_trade = trade.get("date") != today_str_live
+            t_bars = bars_map.get(trade.get("trade_id") or sym) or []
+            day_bars = [b for b in t_bars if b["date"] == trade.get("date")]
+            barrier = resolve_barrier_outcome(is_buy_side, day_bars, sl, t1) if day_bars else {"reason": "NONE", "exit_px": None}
+            bar_hit = barrier["reason"]
+
             exit_triggered, exit_status, raw_exit_price, exit_note = False, "", ltp, ""
 
-            if emotion_flipped:
+            if bar_hit == "SL":
+                is_be = (sl >= entry) if is_buy_side else (sl <= entry)
+                exit_triggered, exit_status, raw_exit_price = True, ("BREAKEVEN EXIT" if is_be else "LOSS (SL HIT)"), float(barrier["exit_px"])
+                exit_note = "Stop touched on 5m bars after entry" + (" (gapped through the stop)." if barrier.get("gap") else ".")
+            elif stale_trade and force_eod_close and bar_hit != "T1":
+                stale_px = float(day_bars[-1]["close"]) if day_bars else ltp
+                exit_triggered, exit_status, raw_exit_price = True, "INTRADAY SQUARE-OFF", stale_px
+                exit_note = f"{eod_reason} (marked at the {trade.get('date')} session close, not today's price)"
+            elif emotion_flipped:
                 exit_triggered, exit_status, raw_exit_price = True, "EMOTION SHIFT EXIT", ltp
                 exit_note = f"News emotion flipped to {live_news['emotion']}: {live_news['top_headline']}"
             elif force_eod_close:
@@ -1375,7 +1524,7 @@ class AdaptiveTradeEngine:
             ):
                 exit_triggered, exit_status, raw_exit_price = True, "DISTRIBUTION TRAP EXIT", ltp
                 exit_note = f"Bullish news failed to hold VWAP (₹{vwap}) with {live_alpha:+.2f}% Nifty alpha."
-            elif (side == "BUY" and (ltp >= t1 or d_high >= t1)) or (side.startswith("SELL") and (ltp <= t1 or d_low <= t1)):
+            elif (side == "BUY" and (ltp >= t1 or bar_hit == "T1")) or (side.startswith("SELL") and (ltp <= t1 or bar_hit == "T1")):
                 strong_momentum = ((ltp >= t1 and ltp > vwap and t1 < t2) if side == "BUY" else (ltp <= t1 and ltp < vwap and t1 > t2))
                 if strong_momentum:
                     new_sl = round(entry + (0.85 * risk_unit), 2) if side == "BUY" else round(entry - (0.85 * risk_unit), 2)
@@ -1387,7 +1536,7 @@ class AdaptiveTradeEngine:
                     exit_triggered, exit_status, raw_exit_price, exit_note = True, "WIN (TARGET HIT)", t1, "AI booked full target profit."
             elif (side == "BUY" and ltp <= sl) or (side.startswith("SELL") and ltp >= sl):
                 is_be = (sl >= entry) if side == "BUY" else (sl <= entry)
-                exit_triggered, exit_status, raw_exit_price, exit_note = True, ("BREAKEVEN EXIT" if is_be else "LOSS (SL HIT)"), sl, "Exited at dynamic Stop-Loss."
+                exit_triggered, exit_status, raw_exit_price, exit_note = True, ("BREAKEVEN EXIT" if is_be else "LOSS (SL HIT)"), worse_stop_fill(side == "BUY", sl, ltp), "Exited at dynamic Stop-Loss (filled at stop or worse)."
             elif peak_pnl >= (risk_unit * qty * 0.75) and unrealized_inr > 0:
                 giveback_pct = ((peak_pnl - unrealized_inr) / peak_pnl) * 100.0
                 if giveback_pct >= giveback_limit_pct:
@@ -1400,6 +1549,10 @@ class AdaptiveTradeEngine:
             elif r_multiple >= 0.80 and ((side == "BUY" and sl < entry) or (side.startswith("SELL") and sl > entry)):
                 trade["stop_loss"] = entry
                 trade["trade_management_note"] = f"SL trailed to breakeven ₹{entry}."
+
+            if not exit_triggered:
+                # next cycle only needs bars from here on (skip the partial bar, avoid re-judging with moved levels)
+                trade["last_bar_check_iso"] = self._next_bar_start_iso(now_ist.isoformat())
 
             if exit_triggered:
                 slip_pct = self._get_archetype_slippage_pct(arch_used) / 100.0
@@ -1425,15 +1578,16 @@ class AdaptiveTradeEngine:
 
                 actions_taken.append(f"{'✅' if net_pnl_inr >= 0 else '🛑'} <b>AI CLOSED {sym} ({exit_status}):</b> ₹{exit_price} | Net P&L: <b>₹{net_pnl_inr:+,.0f}</b>")
                 if notify_telegram:
-                    self.notifier.send_exit_alert(
-                        symbol=sym,
-                        action=side,
-                        status=exit_status,
-                        entry_price=entry,
-                        exit_price=exit_price,
-                        net_pnl_inr=net_pnl_inr,
-                        net_pnl_pct=net_pnl_pct,
-                        equity=float(self.portfolio.get("current_equity", 0.0)),
+                    header = "✅ <b>INTRADAY TRADE CLOSED — NET PROFIT</b>" if net_pnl_inr >= 0 else "🔴 <b>INTRADAY TRADE CLOSED — CUT & RESEARCHED</b>"
+                    self.notifier.send_message(
+                        f"{header}\n━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📌 <b>Stock:</b> <code>{sym}</code> ({side}) | <b>Arm:</b> <code>{arm_used}</code>\n"
+                        f"🏷️ <b>AI Decision:</b> {exit_status} ({hold_mins:.0f} mins)\n"
+                        f"🔢 <b>Entry:</b> ₹{entry} ➔ <b>Exit:</b> <b>₹{exit_price}</b>\n"
+                        f"🧾 <b>Gross P&L:</b> ₹{gross_pnl_inr:+,.2f} | <b>Intraday Taxes/Fees:</b> -₹{charges_inr:.2f}\n"
+                        f"💰 <b>Net Realized P&L:</b> <b>₹{net_pnl_inr:+,.2f} ({net_pnl_pct:+.2f}%)</b>\n"
+                        f"🏦 <b>Updated Wallet Equity:</b> <b>₹{self.portfolio['current_equity']:,.2f}</b>\n"
+                        f"🧠 <b>Post-Trade AI Research & Lesson:</b>\n<i>{lesson}</i>"
                     )
 
         self._save_ledger()
@@ -1482,7 +1636,7 @@ class AdaptiveTradeEngine:
             "emotion_at_exit": latest_emotion, "lesson": lesson
         })
         self.weights["trade_lessons_log"] = self.weights["trade_lessons_log"][:50]
-        self._optimize_weights_from_history(force_recalibrate=True)
+        self._optimize_weights_from_history(force_recalibrate=False)   # cadence-limited; EOD forces it
         return lesson
 
     def evaluate_open_trades_and_learn(self, notify_telegram=True):
@@ -1520,8 +1674,12 @@ class AdaptiveTradeEngine:
         settled = [t for t in self.ledger if t.get("status") != "OPEN" and "factor_scores" in t]
         if not settled:
             return "No settled trades yet to train the AI."
-        if not force_recalibrate and len(settled) == int(self.weights.get("last_evaluated_count", 0)):
+        n_settled = len(settled)
+        last_eval = int(self.weights.get("last_evaluated_count", 0))
+        if not force_recalibrate and (n_settled - last_eval) < RECALIBRATE_EVERY_N_TRADES:
             return self.weights.get("learning_notes", "Model up to date.")
+        learning_active = n_settled >= MIN_TRADES_FOR_WEIGHT_LEARNING
+        shrink = n_settled / (n_settled + WEIGHT_SHRINKAGE_K)
 
         base = {"volume": 0.28, "sentiment": 0.28, "premarket": 0.22, "momentum": 0.22}
         adjustments = {"volume": 0.0, "sentiment": 0.0, "premarket": 0.0, "momentum": 0.0}
@@ -1556,6 +1714,13 @@ class AdaptiveTradeEngine:
                 factor_strength = (float(t["factor_scores"].get(factor_key, 50.0)) - 50.0) / 100.0
                 adjustments[factor_key] += direction * magnitude * factor_strength * 0.018
 
+        # Statistical guard-rail: below MIN_TRADES the weights stay at their priors; above it the learned
+        # adjustment is shrunk toward the prior by n / (n + K).  (5 trades must not re-weight a model.)
+        if learning_active:
+            adjustments = {k: v * shrink for k, v in adjustments.items()}
+        else:
+            adjustments = {k: 0.0 for k in adjustments}
+
         raw_vol = max(0.12, min(0.50, base["volume"] + adjustments["volume"]))
         raw_sent = max(0.12, min(0.50, base["sentiment"] + adjustments["sentiment"]))
         raw_pre = max(0.12, min(0.50, base["premarket"] + adjustments["premarket"]))
@@ -1581,9 +1746,9 @@ class AdaptiveTradeEngine:
         blacklisted, preferred = [], []
         for sym, st_data in ticker_stats.items():
             st_data["win_rate"] = round((st_data["wins"] / st_data["trades"]) * 100.0, 1)
-            if st_data["trades"] >= 2 and st_data["win_rate"] < 35.0 and st_data["net_pnl_inr"] < -500:
+            if st_data["trades"] >= 4 and st_data["win_rate"] < 35.0 and st_data["net_pnl_inr"] < -500:
                 blacklisted.append(sym)
-            elif st_data["trades"] >= 1 and st_data["win_rate"] >= 65.0 and st_data["net_pnl_inr"] > 300:
+            elif st_data["trades"] >= 4 and st_data["win_rate"] >= 65.0 and st_data["net_pnl_inr"] > 300:
                 preferred.append(sym)
 
         self.weights["ticker_memory"], self.weights["blacklisted_tickers"], self.weights["preferred_tickers"] = ticker_stats, blacklisted, preferred
@@ -1600,32 +1765,40 @@ class AdaptiveTradeEngine:
         for sess, s_data in session_stats.items():
             wr = (s_data["wins"] / s_data["trades"]) * 100.0
             s_data["win_rate"] = round(wr, 1)
-            s_data["score_adj"] = round(max(-12.0, min(8.0, (wr - 50.0) * 0.25)), 1) if s_data["trades"] >= 2 else 0.0
+            s_data["score_adj"] = round(max(-12.0, min(8.0, (wr - 50.0) * 0.25)), 1) if s_data["trades"] >= 5 else 0.0
         self.weights["session_memory"] = session_stats
 
-        sl_rate = (sl_hits / len(recent)) * 100.0
-        tp_rate = (target_hits / len(recent)) * 100.0
-        self.weights["atr_sl_multiplier"] = round(min(0.72, 0.55 + ((sl_rate - 40.0) * 0.004)), 2) if sl_rate > 40.0 else (0.52 if sl_rate < 20.0 else 0.55)
-        self.weights["atr_tp_multiplier"] = 1.80 if tp_rate >= 45.0 else (1.40 if (tp_rate < 20.0 and len(recent) >= 5) else 1.60)
-        if giveback_losses >= 2:
-            self.weights["max_profit_giveback_pct"] = max(25.0, round(45.0 - (giveback_losses * 5.0), 1))
-        if winning_hold_times:
-            self.weights["learned_max_hold_mins"] = round(max(45.0, min(240.0, (sum(winning_hold_times) / len(winning_hold_times)) * 1.5)), 1)
-        if losing_convictions and winning_convictions:
-            avg_loss_conv, avg_win_conv = sum(losing_convictions) / len(losing_convictions), sum(winning_convictions) / len(winning_convictions)
-            if avg_win_conv > avg_loss_conv:
-                self.weights["min_conviction_threshold"] = round(max(50.0, min(68.0, (avg_loss_conv + avg_win_conv) / 2.0)), 1)
-        if losing_buy_rsis and len([r for r in losing_buy_rsis if r >= 67.0]) >= 2:
-            self.weights["buy_rsi_ceiling"] = 66.0
+        if learning_active:
+            sl_rate = (sl_hits / len(recent)) * 100.0
+            tp_rate = (target_hits / len(recent)) * 100.0
+            self.weights["atr_sl_multiplier"] = round(min(0.72, 0.55 + ((sl_rate - 40.0) * 0.004)), 2) if sl_rate > 40.0 else (0.52 if sl_rate < 20.0 else 0.55)
+            self.weights["atr_tp_multiplier"] = 1.80 if tp_rate >= 45.0 else (1.40 if (tp_rate < 20.0 and len(recent) >= 5) else 1.60)
+            if giveback_losses >= 2:
+                self.weights["max_profit_giveback_pct"] = max(25.0, round(45.0 - (giveback_losses * 5.0), 1))
+            if winning_hold_times:
+                self.weights["learned_max_hold_mins"] = round(max(45.0, min(240.0, (sum(winning_hold_times) / len(winning_hold_times)) * 1.5)), 1)
+            if losing_convictions and winning_convictions:
+                avg_loss_conv, avg_win_conv = sum(losing_convictions) / len(losing_convictions), sum(winning_convictions) / len(winning_convictions)
+                if avg_win_conv > avg_loss_conv:
+                    self.weights["min_conviction_threshold"] = round(max(50.0, min(68.0, (avg_loss_conv + avg_win_conv) / 2.0)), 1)
+            if losing_buy_rsis and len([r for r in losing_buy_rsis if r >= 67.0]) >= 2:
+                self.weights["buy_rsi_ceiling"] = 66.0
 
-        recent_win_rate = (wins_count / len(recent)) * 100.0
-        total_contrib = float(self.portfolio.get("total_capital_contributed", INITIAL_CAPITAL))
-        if recent_win_rate >= 60.0 and self.portfolio["current_equity"] >= total_contrib:
-            self.weights["risk_per_trade_pct"] = min(1.5, round(1.0 + ((recent_win_rate - 50.0) * 0.015), 2))
-        elif recent_win_rate < 45.0 or self.portfolio["current_equity"] < total_contrib:
-            self.weights["risk_per_trade_pct"] = max(0.6, round(1.0 - ((50.0 - recent_win_rate) * 0.015), 2))
+            recent_win_rate = (wins_count / len(recent)) * 100.0
+            total_contrib = float(self.portfolio.get("total_capital_contributed", INITIAL_CAPITAL))
+            if recent_win_rate >= 60.0 and self.portfolio["current_equity"] >= total_contrib:
+                self.weights["risk_per_trade_pct"] = min(1.5, round(1.0 + ((recent_win_rate - 50.0) * 0.015), 2))
+            elif recent_win_rate < 45.0 or self.portfolio["current_equity"] < total_contrib:
+                self.weights["risk_per_trade_pct"] = max(0.6, round(1.0 - ((50.0 - recent_win_rate) * 0.015), 2))
 
-        self.weights["generation"] = len(settled) + 1
+        else:
+            self.weights.update({
+                "atr_sl_multiplier": 0.55, "atr_tp_multiplier": 1.60, "max_profit_giveback_pct": 45.0,
+                "learned_max_hold_mins": 180.0, "min_conviction_threshold": 52.0,
+                "buy_rsi_ceiling": 72.0, "risk_per_trade_pct": 1.0,
+            })
+
+        self.weights["generation"] = int(self.weights.get("generation", 1)) + 1
         self.weights["last_evaluated_count"] = len(settled)
         self.weights["last_updated"] = self._now_ist().strftime("%Y-%m-%d %I:%M %p IST")
 
@@ -1634,7 +1807,8 @@ class AdaptiveTradeEngine:
         top_arm_prob = float(top_arm[1]["alpha"]) / (float(top_arm[1]["alpha"]) + float(top_arm[1]["beta"]))
         shadow_n = int(self.weights.get("shadow_samples_learned", 0))
 
-        note = f"Gen #{self.weights['generation']} ({len(settled)} real + {shadow_n} shadow): Top Arm={top_arm[0]} ({top_arm_prob:.0%}), Min Conv={self.weights['min_conviction_threshold']}"
+        mode = "LEARNING" if learning_active else f"WARM-UP {n_settled}/{MIN_TRADES_FOR_WEIGHT_LEARNING} (parameters frozen at priors)"
+        note = f"Gen #{self.weights['generation']} [{mode}] ({n_settled} real + {shadow_n} shadow): Top Arm={top_arm[0]} ({top_arm_prob:.0%}), Min Conv={self.weights['min_conviction_threshold']}"
         self.weights["learning_notes"] = note
         self._save_weights()
         return note
@@ -1650,7 +1824,27 @@ class AdaptiveTradeEngine:
         total_pnl_inr = round(sum(float(t.get("pnl_inr", 0)) for t in settled), 2)
         roi_pct = round((total_pnl_inr / total_contributed) * 100.0, 2) if total_contributed > 0 else 0.0
 
+        pnls = [float(t.get("pnl_inr", 0.0)) for t in settled]
+        gross_win = sum(x for x in pnls if x > 0)
+        gross_loss = -sum(x for x in pnls if x < 0)
+        profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (None if gross_win == 0 else 999.0)
+        expectancy = round(sum(pnls) / len(pnls), 2) if pnls else 0.0
+        peak = run = max_dd = 0.0
+        for x in pnls:
+            run += x
+            peak = max(peak, run)
+            max_dd = max(max_dd, peak - run)
+        max_dd_pct = round((max_dd / total_contributed) * 100.0, 2) if total_contributed > 0 else 0.0
+        if len(pnls) < 30:
+            confidence = f"Too few trades ({len(pnls)}) to say anything about edge"
+        elif len(pnls) < 100:
+            confidence = f"Early read only ({len(pnls)} trades) - aim for 100+ before trusting results"
+        else:
+            confidence = f"{len(pnls)} trades - sample is large enough to start judging expectancy"
+
         return {
+            "profit_factor": profit_factor, "expectancy_inr": expectancy,
+            "max_drawdown_inr": round(max_dd, 2), "max_drawdown_pct": max_dd_pct, "edge_confidence": confidence,
             "initial_capital": INITIAL_CAPITAL,
             "manual_deposits": self.portfolio.get("manual_deposits", 0.0),
             "total_capital_contributed": total_contributed,
