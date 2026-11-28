@@ -8,6 +8,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from audit_tracker import (
+    clean_symbol,
+    log_research_cycle,
+    send_verified_trade_alert,
+    trade_signature,
+)
 from market_data import MarketDataScanner
 from sentiment_engine import FinBERTSentimentEngine
 from telegram_notifier import TelegramNotifier
@@ -42,10 +48,25 @@ def is_nse_open_day(now_ist: datetime) -> bool:
     return True
 
 
-def is_live_market_hours(now_ist: datetime) -> bool:
+def is_premarket_window(now_ist: datetime) -> bool:
     mins = now_ist.hour * 60 + now_ist.minute
-    # NSE continuous trading session: 09:15 AM to 03:25 PM IST
-    return (9 * 60 + 15) <= mins <= (15 * 60 + 25)
+    return (8 * 60 + 30) <= mins < (9 * 60 + 15)
+
+
+def is_entry_window_open(now_ist: datetime) -> bool:
+    mins = now_ist.hour * 60 + now_ist.minute
+    # Allow new entries strictly from 09:15 AM to 03:05 PM IST (10 min buffer before 15:15 square-off)
+    return (9 * 60 + 15) <= mins <= (15 * 60 + 5)
+
+
+def _today_skip_reasons(engine: AdaptiveTradeEngine, today_str: str) -> dict[str, str]:
+    reasons: dict[str, str] = {}
+    for row in getattr(engine, "shadow_ledger", []) or []:
+        if str(row.get("date", ""))[:10] == today_str:
+            sym = clean_symbol(row.get("symbol"))
+            if sym:
+                reasons[sym] = str(row.get("skip_reason") or row.get("reason") or "Skipped by risk/conviction guard")
+    return reasons
 
 
 def scan_and_score_market(
@@ -103,6 +124,49 @@ def scan_and_score_market(
     return enriched_df, rec_df
 
 
+def _evaluate_positions_and_notify_exits(
+    engine: AdaptiveTradeEngine,
+    notifier: TelegramNotifier,
+) -> dict:
+    """
+    Evaluate open positions and dispatch Telegram EXIT alerts ONLY for trades
+    verified as closed on disk in trade_history.json.
+    """
+    open_before = {
+        trade_signature(t)
+        for t in (engine.ledger or [])
+        if str(t.get("status", "")).upper() == "OPEN"
+    }
+
+    eval_res = engine.evaluate_open_trades_and_learn(notify_telegram=False)
+
+    for trade in (engine.ledger or []):
+        sig = trade_signature(trade)
+        if sig in open_before and str(trade.get("status", "")).upper() != "OPEN":
+            send_verified_trade_alert(notifier, trade, event_type="EXIT")
+
+    return eval_res
+
+
+def _record_and_notify_entries(
+    engine: AdaptiveTradeEngine,
+    rec_df: pd.DataFrame,
+    notifier: TelegramNotifier,
+) -> list[dict]:
+    """
+    Record qualifying recommendations into trade_history.json and dispatch Telegram
+    ENTRY alerts strictly for trades verified on disk.
+    """
+    before_len = len(engine.ledger or [])
+    if rec_df is not None and not rec_df.empty:
+        engine.record_recommendations(rec_df, notify_telegram=False)
+
+    new_trades = (engine.ledger or [])[before_len:]
+    for trade in new_trades:
+        send_verified_trade_alert(notifier, trade, event_type="ENTRY")
+    return new_trades
+
+
 def run_autonomous_cycle(
     engine: AdaptiveTradeEngine,
     scanner: MarketDataScanner,
@@ -111,29 +175,62 @@ def run_autonomous_cycle(
 ):
     """
     Unified AI Decision Loop:
-    1. Evaluates all OPEN positions against live ticks, 15:15 IST square-off, news emotion shifts,
-       and profit-giveback rules; updates learning weights, walk-forward ML summary, and equity log.
-    2. During live market hours, scans for fresh setups and enters ONLY if conviction, risk,
-       microstructure, and session rules approve.
+    1. Evaluates all OPEN positions against targets, stop-loss, giveback rules, and 15:15 IST square-off.
+    2. Pre-market (08:30-09:14 IST): updates watchlist + research log silently (no Telegram BUY/SELL spam).
+    3. Entry window (09:15-15:05 IST): scans market, logs ALL researched stocks to ai_research_log.json,
+       enters only approved trades, and notifies Telegram strictly on executed entries/exits.
+    4. Post-15:05 IST: manages/squares off open trades only and writes a clean heartbeat.
     """
     now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
     print(f"[PULSEAI] Running autonomous cycle at {now_ist.strftime('%Y-%m-%d %I:%M:%S %p IST')}")
 
-    eval_res = engine.evaluate_open_trades_and_learn(notify_telegram=True)
+    eval_res = _evaluate_positions_and_notify_exits(engine, notifier)
     if eval_res.get("message"):
         print(f"[PULSEAI] Learning status: {eval_res['message']}")
 
-    if is_live_market_hours(now_ist):
+    if is_entry_window_open(now_ist):
         perf = engine.get_performance_metrics()
         if perf["available_cash"] >= 1000 and perf["open_trades"] < 5:
-            _, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
-            if rec_df is not None and not rec_df.empty:
-                added = engine.record_recommendations(rec_df, notify_telegram=True)
-                print(f"[PULSEAI] AI autonomously entered {added} new trade(s).")
-            else:
-                print("[PULSEAI] AI chose to wait — no setup met conviction/risk criteria.")
+            enriched_df, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
+            new_trades = _record_and_notify_entries(engine, rec_df, notifier)
+            executed_syms = {clean_symbol(t.get("symbol")) for t in new_trades}
+            skip_reasons = _today_skip_reasons(engine, today_str)
+
+            log_research_cycle(
+                candidates=enriched_df,
+                rec_candidates=rec_df,
+                executed_symbols=executed_syms,
+                skip_reasons=skip_reasons,
+                cycle_mode="autonomous_cycle",
+                market_note="Live scan completed inside 09:15-15:05 IST entry window.",
+            )
+            print(f"[PULSEAI] AI autonomously entered {len(new_trades)} verified trade(s).")
+        else:
+            note = (
+                f"Active cap reached ({perf['open_trades']}/5 open, "
+                f"free cash Rs.{perf['available_cash']:,.0f}); monitoring open positions."
+            )
+            log_research_cycle(candidates=[], cycle_mode="autonomous_cycle", market_note=note)
+            print(f"[PULSEAI] {note}")
+
+    elif is_premarket_window(now_ist):
+        enriched_df, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
+        engine.save_morning_watchlist(rec_df)
+        log_research_cycle(
+            candidates=enriched_df,
+            rec_candidates=rec_df,
+            executed_symbols=set(),
+            skip_reasons=_today_skip_reasons(engine, today_str),
+            cycle_mode="premarket_research",
+            market_note="Pre-market research saved to dashboard watchlist (Telegram stays silent until execution).",
+        )
+        print("[PULSEAI] Pre-market research updated in webapp (no unexecuted Telegram alerts sent).")
+
     else:
-        print("[PULSEAI] Outside live 09:15–15:25 IST trading window; skipping new entries.")
+        note = "Outside 09:15-15:05 IST entry window; managed/squared off open positions only."
+        log_research_cycle(candidates=[], cycle_mode="manage_only", market_note=note)
+        print(f"[PULSEAI] {note}")
 
 
 def main():
@@ -149,36 +246,43 @@ def main():
     scanner = MarketDataScanner()
     sentiment_ai = FinBERTSentimentEngine()
     notifier = TelegramNotifier()
+    today_str = now_ist.strftime("%Y-%m-%d")
 
     if mode in ("autonomous_cycle", "live_manage", "intraday"):
         run_autonomous_cycle(engine, scanner, sentiment_ai, notifier)
 
     elif mode in ("morning_prep", "premarket", "premarket_update"):
-        _, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
-        if mode == "morning_prep":
-            engine.save_morning_watchlist(rec_df)
-            if rec_df is not None and not rec_df.empty:
-                lines = [
-                    f"• <code>{r['symbol']}</code> ({r['action']}) — Conviction {r['conviction']}/100 @ ₹{r['entry_price']}"
-                    for _, r in rec_df.iterrows()
-                ]
-                notifier.send_message(
-                    "🌅 <b>PRE-MARKET AI RESEARCH WATCHLIST</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines)
-                )
-        else:
-            changes = engine.compare_with_morning_watchlist(rec_df)
-            engine.save_morning_watchlist(rec_df)
-            if changes:
-                notifier.send_message("⚡ <b>PRE-OPEN MARKET SHIFTS</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(changes))
-            if is_live_market_hours(now_ist) and rec_df is not None and not rec_df.empty:
-                engine.record_recommendations(rec_df, notify_telegram=True)
+        enriched_df, rec_df = scan_and_score_market(engine, scanner, sentiment_ai)
+        if mode != "morning_prep":
+            engine.compare_with_morning_watchlist(rec_df)
+        engine.save_morning_watchlist(rec_df)
+
+        new_trades = []
+        if mode != "morning_prep" and is_entry_window_open(now_ist):
+            perf = engine.get_performance_metrics()
+            if perf["available_cash"] >= 1000 and perf["open_trades"] < 5:
+                new_trades = _record_and_notify_entries(engine, rec_df, notifier)
+
+        log_research_cycle(
+            candidates=enriched_df,
+            rec_candidates=rec_df,
+            executed_symbols={clean_symbol(t.get("symbol")) for t in new_trades},
+            skip_reasons=_today_skip_reasons(engine, today_str),
+            cycle_mode=mode,
+            market_note=f"{mode} research logged to dashboard; Telegram alerts restricted to executed trades.",
+        )
 
     elif mode == "eod":
-        result = engine.evaluate_open_trades_and_learn(notify_telegram=True)
+        result = _evaluate_positions_and_notify_exits(engine, notifier)
         ml_info = engine.ml_model.train_walk_forward(engine.ledger, engine.shadow_ledger)
         perf = engine.get_performance_metrics()
+        log_research_cycle(
+            candidates=[],
+            cycle_mode="eod",
+            market_note=f"EOD settlement complete. Equity Rs.{perf['current_equity']:,.2f}, Open={perf['open_trades']}.",
+        )
         notifier.send_message(
-            f"📊 <b>DAILY PORTFOLIO & AI LEARNING SNAPSHOT</b>\n"
+            f"📊 <b>DAILY PORTFOLIO &amp; AI LEARNING SNAPSHOT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💼 <b>Total Wallet Equity:</b> <b>₹{perf['current_equity']:,.2f}</b> ({perf['total_pnl_pct']:+.2f}%)\n"
             f"💵 <b>Available Cash:</b> ₹{perf['available_cash']:,.2f} | <b>Open Positions:</b> {perf['open_trades']}\n"

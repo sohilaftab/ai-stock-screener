@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import altair as alt
 import pandas as pd
 import streamlit as st
+from audit_dashboard_panel import render_audit_tab
 from trade_engine import AdaptiveTradeEngine
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -831,12 +832,13 @@ def render_live_app():
     # ---------------------------------------------------------
     # PRIMARY APP TABS
     # ---------------------------------------------------------
-    t_positions, t_insights, t_ai, t_watchlist = st.tabs(
+    t_positions, t_insights, t_ai, t_watchlist, t_audit = st.tabs(
         [
             f"📱 Positions ({len(f_open)}/{len(f_closed)})",
             "📈 Performance",
             "🧠 AI Brain",
             f"🌅 Watchlist ({len(watchlist_data)})",
+            "🛡️ Audit & Live Check",
         ]
     )
 
@@ -1149,6 +1151,13 @@ def render_live_app():
                 wl_df = wl_df[wl_df["symbol"].astype(str).str.upper().str.contains(search_query, na=False)]
             st.dataframe(wl_df, hide_index=True)
 
+    with t_audit:
+        render_audit_tab(
+            trade_history=trades,
+            load_state_fn=_load_state_json,
+            repo_slug=_get_repo_slug(),
+        )
+
     # ---------------------------------------------------------
     # FOOTER
     # ---------------------------------------------------------
@@ -1156,7 +1165,7 @@ def render_live_app():
         f"""
         <div class="app-footer">
             <strong>PulseAI Mobile & Web Portfolio Studio</strong> • Synced with <code>{_get_repo_slug()}</code><br/>
-            NSE Equity Window: Mon–Fri, 09:15–15:25 IST (Auto square-off at 15:15 IST; closed on NSE holidays including 24 Nov 2026).<br/>
+            NSE Equity Window: Mon–Fri, 09:15–15:05 IST new entries (Auto square-off at 15:15 IST; closed on NSE holidays).<br/>
             <em>Educational & research simulation dashboard only — not SEBI-registered investment advice.</em>
         </div>
         """,
